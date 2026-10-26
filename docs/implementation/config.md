@@ -1,0 +1,303 @@
+# Configuration & Environments
+
+## Purpose
+
+The CLI uses four separate service URLs and supports three authentication modes. `GITHITS_ENV` selects coherent production or development defaults; individual URL overrides remain independent. Getting these wrong causes subtle failures — wrong URL means auth works but API calls fail, wrong auth mode means some tools work but others silently return errors. This document explains the configuration model so changes are made with full context.
+
+## Background
+
+GitHits separates its MCP server (which handles OAuth discovery and the MCP protocol), REST API (which this client uses for example search), account settings API, and package/source service. Each has an independent endpoint. The CLI and local MCP client use the production preset by default or select development defaults with `GITHITS_ENV=dev`; explicit URL overrides customize one service without changing the others.
+
+## URL Configuration
+
+| Service | `prod` default (also unset) | `dev` default | URL override | Used for |
+|---|---|---|---|---|
+| **MCP URL / OAuth namespace** | `https://mcp.githits.com` | `https://mcp-dev.githits.com` | `GITHITS_MCP_URL` | OAuth discovery (`.well-known`), DCR registration, auth flow, token and client storage key |
+| **REST API** | `https://api.githits.com` | `https://api-dev.githits.com` | `GITHITS_API_URL` | REST example search (`/search`) |
+| **Accounts API (CLI only)** | `https://accounts.githits.com` | `https://zcwquvryvmjuwckxdevg.supabase.co` | `GITHITS_ACCOUNTS_URL` | Self-scoped settings and Terms of Service acceptance |
+| **OSS package/source service** | `https://oss.githits.dev` | `https://oss-dev.githits.dev` | `GITHITS_CODE_NAV_URL` | Package/source service endpoint used by indexed `search` / `pkg` / `docs` / `code` tooling |
+
+`GITHITS_ENV` accepts exactly `prod` or `dev`. If unset, blank, or whitespace-only, it selects `prod`. Any other nonblank value is invalid when a network operation resolves configuration. The CLI and local MCP runtime plus the public `@githits/mcp/client` URL getters use these presets; a hosted MCP server and persistent remote plugin endpoints have their own configuration and are not changed by a local selector.
+
+> **The URL overrides are independent.** An override changes only its named service and takes precedence over that service's selected preset. `GITHITS_ENV=dev` selects the development default for each service without an override. A custom MCP URL does not infer custom API, accounts, or OSS URLs.
+
+Environment overrides must use HTTPS. Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`) so local backend development continues to work without permitting bearer tokens or OAuth credentials over remote cleartext connections. Present blank URL overrides are invalid; they do not select a preset default. The same HTTPS/loopback rule applies to OAuth registration/token endpoints returned by discovery.
+
+`PKGSEER_URL` is ignored. Move any existing package/source URL value from that variable to `GITHITS_CODE_NAV_URL`.
+
+Compact `read` calls use `ReadServiceImpl` against the configured package/source
+endpoint selected by `GITHITS_ENV` or overridden with `GITHITS_CODE_NAV_URL`,
+and send one `Query.read` request. The top-level `list` command uses
+`ListServiceImpl` against the same endpoint and sends one `Query.list` request;
+package/repository and explicit `site:` inventories remain separate. A custom
+`GITHITS_CODE_NAV_URL` endpoint serving compact reads must implement
+`Query.read` with both `CodeContextResult` and `GetDocPageResult` union branches
+and the selected minimum fields required by the client; serving `list` also
+requires `Query.list`. There is no schema fallback for either compact command.
+Deprecated compatibility commands may continue to use the legacy
+`fetchCodeContext`, `getDocPage`, and `listRepoFiles` roots, but those roots are
+not fallback paths for compact reads or lists.
+
+Network URL validation is deferred until a network-capable path resolves or uses the endpoint. Local-only recovery paths such as help, version output, `doctor`, uninstall, auth metadata cleanup, and `logout` remain available when an endpoint override or `GITHITS_ENV` is malformed. `doctor` reports an invalid selector; auth composition rejects it before discovery, registration, exchange, or refresh requests. Storage-only local inspection and cleanup do not validate the selector or URLs. If the selector is invalid and no `GITHITS_MCP_URL` override is set, those recovery paths use the production MCP storage namespace; this fallback cannot route a network request. A bad network setting must not prevent diagnostics or credential removal.
+
+The selected MCP URL is also used as the storage key for tokens and client registrations (trailing slashes are stripped for consistent key matching). Start the CLI or local MCP process with `GITHITS_ENV=dev` to use the separate dev namespace; run `githits login` when no dev credentials exist. Returning to `prod` or leaving the selector unset finds the existing production credentials without migration. An explicit `GITHITS_MCP_URL` selects that service URL and namespace only.
+
+## Environment adoption evidence
+
+Service presets merged in PR [#426](https://github.com/githits-com/githits-cli/pull/426)
+on 2026-09-28. Authenticated development CLI and MCP smoke suites and a targeted
+Codex package-intelligence eval completed successfully. Initial dev request
+latency varied; its cause is unproven and no timeout or retry workaround was added.
+Strict CI package builds and outside-workspace consumers verify declaration and
+runtime compatibility. Keep configuration exports explicitly typed for isolated
+declaration emission; an inferred private Zod enum previously failed strict CI.
+
+The separately owned hosted resolver uses its own endpoint configuration and
+`GITHITS_ENVIRONMENT=production|development` contract. Package upgrades alone do
+not migrate that resolver to branded OSS defaults; any hosted endpoint migration
+belongs to `remote-mcp` and its separately approved deployment.
+
+## Authentication Modes
+
+The container (`src/container.ts`) resolves authentication in priority order:
+
+1. **`GITHITS_API_TOKEN`** — If set, uses this token directly. No OAuth flow needed. Quick to set up for CI and automation environments.
+
+2. **Stored OAuth JWT** — Loaded from the configured auth store. If expired, the container automatically attempts a refresh using the stored refresh token. Transient failures retain credentials for a later retry; classified terminal failures clear the active credential state.
+
+3. **Unauthenticated** — No token available. Auth-required CLI commands fail on use, and the MCP server can start but every authenticated tool call will fail. Commands like `auth status` and `doctor` still work to help the user diagnose the issue.
+
+### Auth Mode Capabilities
+
+| Endpoint | OAuth JWT | API Token (`ghi-*`) | Unauthenticated |
+|---|---|---|---|
+| `/search` | Full access | Full access | Blocked |
+| `/functions/v1/settings/me` | Full access | Full access | Blocked |
+
+Package/source access uses the OSS service URL selected by `GITHITS_ENV` unless `GITHITS_CODE_NAV_URL` overrides it. MCP registration for `search`, `search_status`, `list`, `read`, `grep`, and `pkg_*` is always on; CLI registration for top-level `search` / `search-status` / `read` / `list` / `grep` plus the legacy-compatible `githits code`, `githits pkg`, and `githits docs` groups is also always on.
+
+## Environment Variables
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `GITHITS_ENV` | Select service defaults (`prod` or `dev`; unset/blank selects `prod`) | `dev` |
+| `GITHITS_MCP_URL` | Override MCP server URL | `http://localhost:7071/mcp` |
+| `GITHITS_API_URL` | Override REST API URL | `http://localhost:8000` |
+| `GITHITS_CODE_NAV_URL` | Override package/source service URL | `http://localhost:4000` |
+| `GITHITS_ACCOUNTS_URL` | Override account settings origin | `https://accounts.example.test` |
+| `GITHITS_API_TOKEN` | API token for authentication | `ghi-abc123...` |
+| `GITHITS_AUTH_STORAGE` | Override OAuth credential storage for the current process (`keychain` or `file`) | `file` |
+| `GITHITS_DISABLE_SKILL_UPDATE` | Disable local MCP skill maintenance when non-empty | `1` |
+| `GITHITS_SESSION_ID` | Override automatic session detection (`[A-Za-z0-9_-]{1,64}`) | `factory_run-42_agent-a` |
+| `GITHITS_TELEMETRY` | Emit end-of-run timing spans to stderr for local profiling | `1` |
+| `GITHITS_DISABLE_UPDATE_CHECK` | Disable npm latest-version update notices | `1` |
+
+### Request session identifiers
+
+`packages/core-internal/src/shared/request-headers.ts` owns session resolution
+for the CLI, local stdio MCP, and the public `@githits/mcp/client` header builder.
+`GITHITS_SESSION_ID` takes precedence over detected terminal, IDE, shell, and SSH
+identifiers. If provided, its entire value must match `[A-Za-z0-9_-]{1,64}`:
+1-64 ASCII letters, digits, underscores, or hyphens. Empty values, whitespace,
+other punctuation, Unicode, and longer values are invalid. Values are never
+trimmed or repaired. Unset the variable to retain automatic detection, followed
+by the parent PID and then a random UUID when no valid parent PID is available.
+
+A valid explicit identifier is sent unchanged as `x-githits-session-id`, without
+hashing, so factories can query analytics by their own session labels.
+Automatically detected identifiers continue to be hashed with SHA-256 and
+truncated to 16 hex characters, rather than sending terminal details verbatim.
+`getEnvSessionId()` owns validation and throws `SessionIdConfigError` without
+including the supplied value in the message. Both helpers are also exported
+through `@githits/mcp/client` for runtime hosts.
+
+Local MCP command startup validates the override before constructing dependencies
+or connecting stdio; invalid values cause `githits mcp start` and noninteractive
+`githits mcp` to exit with status 1. CLI help and local-only commands do not
+eagerly validate this request configuration. Header builders validate on use;
+CLI requests propagate the configuration error (JSON code `INVALID_ARGUMENT`)
+instead of silently dropping the session ID or reporting a network failure.
+Other unexpected metadata errors retain the existing best-effort handling.
+
+The default process session is cached after its first resolution, so set the
+variable before starting the CLI or local MCP server. A factory can reuse one
+identifier across related invocations to group them, even across parent
+processes, and choose a different identifier for each independent session:
+
+```bash
+GITHITS_SESSION_ID='factory_run-42_agent-a' githits pkg info npm:express
+```
+
+Local environment variables do not configure an already hosted remote MCP
+connection; a remote server controls its own request-header environment.
+
+## Local Storage
+
+GitHits config uses the platform config directory:
+
+```toml
+# ~/.config/githits/config.toml on macOS/Linux
+[auth]
+storage = "keychain"
+```
+
+| `auth.storage` | Meaning |
+|---|---|
+| `keychain` | Default. Store OAuth tokens and DCR client secrets in the system keychain only. |
+| `file` | Store OAuth tokens and DCR client secrets as plaintext JSON under the platform config auth path. |
+
+Invalid `GITHITS_AUTH_STORAGE` or `auth.storage` values fail fast with a message that includes the expected values. Runtime keychain-unavailable errors include the exact config file path and the `[auth] storage = "file"` snippet, plus a plaintext-storage warning.
+
+Auto-login startup checks use non-secret metadata before touching the credential store. This avoids keychain reads during ordinary command startup when the local metadata was updated recently and says an unexpired session exists. Missing, stale, expired, or malformed metadata falls back to the credential store so existing users recover after the next successful keychain/file read.
+
+When file mode is enabled, storage uses restrictive POSIX file modes but is not encrypted:
+
+```text
+~/.config/githits/          (0700 on Unix-like platforms)
+  config.toml              (0600 when written by GitHits)
+  auth/                    (0700)
+    auth.json              (0600) — OAuth tokens keyed by MCP URL
+    client.json            (0600) — DCR client registrations keyed by MCP URL
+    metadata.json          (0600) — non-secret session expiry metadata keyed by MCP URL
+    diagnostics.json       (0600) — non-secret last-clear breadcrumb keyed by MCP URL
+```
+
+The four files under `auth/` are capped at the listed mode for new files and successful rewrites on POSIX; existing more-restrictive files are not broadened. A new `config.toml` uses 0600, while later config rewrites preserve its existing mode. Directory modes apply when GitHits creates the directory and do not repair a pre-existing permissive directory. Windows mode bits are not an ACL guarantee.
+
+Platform roots:
+
+| Platform | Config root |
+|---|---|
+| Linux/Unix | `$XDG_CONFIG_HOME/githits`, or `~/.config/githits` |
+| macOS | `$XDG_CONFIG_HOME/githits`, or `~/.config/githits` |
+| Windows | `%APPDATA%\githits`, or `~/AppData/Roaming/githits` |
+
+Legacy `~/.githits/auth.json`, `~/.githits/client.json`, and the old macOS `~/Library/Application Support/githits` auth/config paths are still read for migration and cleared by logout where applicable, but new plaintext writes use the canonical config auth path.
+
+When writing config or auth files, use `FileSystemService` rather than `node:fs` directly — this enables testing via mock implementations from `src/services/test-helpers.ts`. Auth-associated rewrites must pass a 0600 maximum to `atomicWriteFile()` to avoid preserving permissive modes and to prevent readers from observing truncated JSON.
+
+## Experimental Tools Policy
+
+The same canonical `config.toml` also holds the local stdio MCP experimental
+policy:
+
+```toml
+[experimental]
+tools = true
+```
+
+`experimental.tools` is a strict boolean and defaults to `false` when absent.
+The retired `report_tool_issues` key is ignored as an unknown key in valid TOML;
+existing files do not need rewriting. GitHits no longer exposes feedback or
+feedback-submission guidance.
+
+Auth and experimental settings share TOML discovery/parsing and the canonical
+platform path above, including the existing macOS legacy fallback, but validate
+their own subsections independently. Unknown keys remain accepted. With the
+host policy enabled, local MCP registers `LOCAL_EXPERIMENTAL_TOOL_DEFINITIONS`,
+which is currently empty, so the setting changes nothing. CLI commands never read
+it. `research`, `resolve` and `code diff` (MCP `research`, `resolve_target` and
+`code_diff`) are stable and independent of this setting.
+
+The hidden `githits mcp start --experimental-tools` option is for isolated
+evaluation/development only. It enables local experimental tools (currently
+none) for that process without
+writing or inheriting the host experimental policy; valid
+host auth settings still apply, and malformed shared TOML can still prevent
+auth startup.
+
+## Local MCP Skill Update Policy
+
+The shared config also controls automatic maintenance of the installed
+`githits-mcp` skill by local CLI MCP startup:
+
+```toml
+[skills]
+auto_update = false
+```
+
+`skills.auto_update` is a strict boolean and defaults to `true` when absent.
+`GITHITS_DISABLE_SKILL_UPDATE` takes precedence: any non-empty value disables
+maintenance, while an empty or unset value defers to config. An invalid setting
+or policy-read failure skips maintenance with a sanitized stderr warning; it
+does not add a startup failure to paths that previously bypassed TOML parsing.
+Existing auth and experimental TOML errors keep their prior startup behavior.
+Explicit `githits init` remains available regardless of this startup-only
+policy. See the [MCP skill lifecycle](init-guidance-and-expanded-agent-support.md#installed-mcp-skill-lifecycle)
+for the installed marker and update eligibility rules.
+
+Non-secret update-check state uses the XDG config location:
+
+```
+~/.config/githits/update-check.json
+```
+
+If `XDG_CONFIG_HOME` is set, the update-check cache lives under
+`$XDG_CONFIG_HOME/githits/update-check.json`. See
+`docs/implementation/update-check.md` for the update-check cache contract and
+eligibility rules.
+
+## How Config Flows Through the System
+
+```
+Environment variables + config.toml
+  ├─ packages/core-internal/src/services/config.ts (preset, URL, and token resolution)
+  ├─ src/services/settings-service.ts (CLI accounts URL selection)
+  ├─ src/services/app-config.ts (shared TOML discovery/parsing)
+  │    ├─ src/services/auth-config.ts → auth storage mode
+  │    ├─ src/services/experimental-config.ts → local tools policy
+  │    └─ src/services/skill-config.ts → local MCP skill update policy
+  └─ src/container.ts (createContainer)
+       ├─ mcpUrl → selected preset or override, passed to auth commands and used as storage key
+       ├─ apiUrl → passed to GitHitsServiceImpl constructor
+       ├─ codeNavigationUrl → passed to CodeNavigationServiceImpl, PackageIntelligenceServiceImpl, ReadServiceImpl, and ListServiceImpl
+       ├─ auth.storage → controls OAuth credential persistence
+       ├─ experimental.tools → local MCP experimental seam (no tools)
+       ├─ apiToken → resolved from env var or OAuth storage
+       └─ hasValidToken → gates authenticated commands
+```
+
+Commands receive the full `Dependencies` object. Services receive only what they need (e.g., `GitHitsServiceImpl` gets `apiUrl` and `token`).
+
+## Troubleshooting
+
+- **"Authentication required" despite having a token** — Token may be expired and refresh failed. Run `githits login` to re-authenticate.
+- **Custom environment not working** — Set `GITHITS_ENV=dev` to select development defaults for all services. Each URL override changes only its own service, so set `GITHITS_MCP_URL`, `GITHITS_API_URL`, `GITHITS_ACCOUNTS_URL`, or `GITHITS_CODE_NAV_URL` only for endpoints that need a custom URL.
+- **Invalid backend selector** — Use exactly `prod` or `dev`. An unset or blank selector means `prod`. `doctor` reports invalid values; network auth requests stop before sending a request. For local recovery, an invalid selector without `GITHITS_MCP_URL` uses the production credential namespace.
+- **Legacy OSS URL no longer applies** — `PKGSEER_URL` is ignored. Move the value to `GITHITS_CODE_NAV_URL`.
+- **Endpoint override rejected** — Use HTTPS for remote services. HTTP is supported only for exact loopback development hosts. A blank override is invalid rather than falling back to a preset.
+- **Tokens from wrong environment** — Tokens are stored per MCP URL. `GITHITS_ENV=dev` uses a separate namespace and requires a dev login; returning to `prod` or leaving the selector unset uses the existing production namespace. An explicit `GITHITS_MCP_URL` also selects a separate namespace.
+- **System keychain unavailable** — Default keychain mode fails rather than writing plaintext OAuth credentials. Use `GITHITS_API_TOKEN`, fix/unlock the keychain, or set `auth.storage = "file"` / `GITHITS_AUTH_STORAGE=file` if unencrypted file storage is acceptable.
+- **Environment-specific failures** — Run `githits doctor --json` in each terminal or agent and compare `runtime`, `environment`, `services`, `config`, and `auth` fields. The report redacts token and secret values.
+
+### Init config parsing behavior
+
+`githits init` and the canonical `githits uninstall` command accept both strict
+JSON and JSONC-style config files when reading agent MCP config files (for
+example files containing comments or trailing commas). `githits init uninstall`
+remains a compatibility alias for `githits uninstall`.
+
+- Parsing flow first attempts strict JSON, then falls back to JSONC parsing.
+- If parsing still fails, setup reports a parse error and leaves the file unchanged.
+- Successful setup and uninstall writes are still emitted as canonical JSON with 2-space indentation and a trailing newline.
+- Uninstall removes only GitHits/case-variant server entries and leaves other MCP servers, config files, and directories in place.
+
+## Key Reference Files
+
+| File | What it demonstrates |
+|---|---|
+| `packages/core-internal/src/services/config.ts` | URL and token resolution plus HTTPS/loopback enforcement |
+| `src/services/settings-service.ts` | CLI-only accounts URL selection and settings requests |
+| `src/services/auth-config.ts` | `config.toml` and `GITHITS_AUTH_STORAGE` auth storage mode parsing |
+| `src/services/app-config.ts` | Shared canonical/legacy TOML discovery and parsing |
+| `src/services/experimental-config.ts` | Typed local MCP experimental tools policy |
+| `src/services/skill-config.ts` | Typed local MCP skill update policy |
+| `src/services/mcp-skill-update.ts` | Non-fatal installed skill maintenance at local MCP startup |
+| `src/services/app-config-paths.ts` | Platform config path resolution |
+| `src/container.ts` | Auth priority logic and dependency wiring |
+| `src/services/auth-storage.ts` | File-based token storage with secure permissions |
+| `src/services/filesystem-service.ts` | File system abstraction for testable storage |
+| `src/services/update-check-service.ts` | Non-secret update-check cache and npm latest lookup |
+| `src/commands/auth-status.ts` | Diagnosing current auth state (reached via `githits auth status`) |
+| `src/commands/doctor.ts` | Redacted diagnostics for runtime, environment, config, and auth storage |
+| `src/commands/mcp.ts` | MCP tool registration and deferred-auth startup behavior |

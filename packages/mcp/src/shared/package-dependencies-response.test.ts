@@ -1,0 +1,2176 @@
+import { describe, expect, it } from "bun:test";
+import type { DependencyReport } from "@githits/core-internal";
+import {
+  cratesFeatureDependencyReport,
+  defaultDependencyReport,
+  zeroDepDependencyReport,
+} from "../services/test-helpers.js";
+import {
+  buildPackageDependenciesSuccessPayload,
+  formatPackageDependenciesTerminal,
+} from "./package-dependencies-response.js";
+import { terminalWidth as measureTerminalWidth } from "./terminal-width.js";
+
+const ESC = String.fromCharCode(27);
+const ANSI_SGR_PATTERN = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function requireItem<T>(items: T[], index: number): T {
+  const item = items[index];
+  if (item === undefined) throw new Error(`missing fixture item at ${index}`);
+  return item;
+}
+
+function dependencyIssueReport(): DependencyReport {
+  const graph = {
+    formatVersion: 4,
+    nodes: [
+      { registry: "NPM", name: "express", version: "5.2.1" },
+      { registry: "NPM", name: "importer", version: "1.0.0" },
+      { registry: "NPM", name: "shared", version: "1.0.0" },
+    ],
+    edges: [
+      { toIndex: 2, constraint: "^1.0.0", dependencyType: "runtime" },
+      {
+        fromIndex: 1,
+        toIndex: 2,
+        constraint: "^1.0.0",
+        dependencyType: "peer",
+      },
+    ],
+  };
+  const conflictingEdges = [
+    { toIndex: 2, versionConstraint: "^1.0.0", dependencyType: "runtime" },
+    {
+      fromIndex: 1,
+      toIndex: 2,
+      versionConstraint: "^1.0.0",
+      dependencyType: "peer",
+    },
+  ];
+  return {
+    package: { name: "express", registry: "NPM", version: "5.2.1" },
+    dependencies: {
+      direct: [{ name: "runtime-dep", versionConstraint: "^1.0.0" }],
+      transitive: {
+        dependencyGraph: graph,
+        dependencyIssues: {
+          totalCount: 16,
+          deprecatedCount: 4,
+          outdatedCount: 4,
+          duplicateCount: 4,
+          conflictCount: 4,
+          deprecatedPackages: [
+            {
+              registry: "NPM",
+              name: "zeta-deprecated",
+              versions: ["1.0.0"],
+              reasons: [{ version: "1.0.0", reason: "Use replacement" }],
+            },
+            {
+              registry: "NPM",
+              name: "alpha-deprecated",
+              versions: ["2.0.0"],
+              reasons: [{ version: "2.0.0" }],
+            },
+            {
+              registry: "NPM",
+              name: "beta-deprecated",
+              versions: ["3.0.0"],
+              reasons: [],
+            },
+            {
+              registry: "NPM",
+              name: "gamma-deprecated",
+              versions: ["4.0.0"],
+              reasons: [],
+            },
+          ],
+          outdatedPackages: [
+            {
+              registry: "NPM",
+              name: "zeta-outdated",
+              latestVersion: "9.0.0",
+              severity: "LOW",
+              versions: [{ version: "1.0.0", severity: "LOW" }],
+            },
+            {
+              registry: "NPM",
+              name: "alpha-outdated",
+              severity: "HIGH",
+              versions: [{ version: "2.0.0", severity: "HIGH" }],
+            },
+            {
+              registry: "NPM",
+              name: "beta-outdated",
+              severity: "MEDIUM",
+              versions: [{ version: "3.0.0", severity: "MEDIUM" }],
+            },
+            {
+              registry: "NPM",
+              name: "gamma-outdated",
+              severity: "UNKNOWN",
+              versions: [{ version: "4.0.0", severity: "UNKNOWN" }],
+            },
+          ],
+          duplicatePackages: [
+            { registry: "NPM", name: "zeta-duplicate", versions: ["1.0.0"] },
+            { registry: "NPM", name: "alpha-duplicate", versions: ["2.0.0"] },
+            { registry: "NPM", name: "beta-duplicate", versions: ["3.0.0"] },
+            { registry: "NPM", name: "gamma-duplicate", versions: ["4.0.0"] },
+          ],
+          conflicts: [
+            {
+              registry: "NPM",
+              name: "zeta-conflict",
+              versions: ["1.0.0", "2.0.0"],
+              requiredVersions: ["^1.0.0"],
+              conflictingEdges,
+            },
+            {
+              registry: "NPM",
+              name: "alpha-conflict",
+              versions: ["1.0.0", "2.0.0"],
+              requiredVersions: ["^1.0.0"],
+              conflictingEdges,
+            },
+            {
+              registry: "NPM",
+              name: "beta-conflict",
+              versions: ["1.0.0", "2.0.0"],
+              requiredVersions: ["^1.0.0"],
+              conflictingEdges,
+            },
+            {
+              registry: "NPM",
+              name: "gamma-conflict",
+              versions: ["1.0.0", "2.0.0"],
+              requiredVersions: ["^1.0.0"],
+              conflictingEdges,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+function longIssueDependencyReport(): DependencyReport {
+  const fixture = dependencyIssueReport();
+  const transitive = fixture.dependencies?.transitive;
+  const graph = transitive?.dependencyGraph;
+  const issues = transitive?.dependencyIssues;
+  if (!transitive || !graph || !issues) {
+    throw new Error("expected dependency issue fixture");
+  }
+
+  const deprecationReason =
+    "This module is not supported, and leaks memory. Do not use it. Check out lru-cache for a good and tested replacement.";
+  graph.nodes[1] = {
+    registry: "NPM",
+    name: "a-very-long-importer-package-name",
+    version: "1.0.0",
+  };
+  graph.nodes[2] = {
+    registry: "NPM",
+    name: "a-very-long-conflicting-package-name",
+    version: "1.0.0",
+  };
+  issues.deprecatedPackages[0] = {
+    registry: "NPM",
+    name: "inflight",
+    versions: ["1.0.6", "1.0.7"],
+    reasons: [
+      { version: "1.0.6", reason: deprecationReason },
+      { version: "1.0.7", reason: deprecationReason },
+    ],
+  };
+  issues.deprecatedPackages[1] = {
+    ...requireItem(issues.deprecatedPackages, 1),
+    name: "zeta-deprecated-1",
+  };
+  issues.deprecatedPackages[2] = {
+    ...requireItem(issues.deprecatedPackages, 2),
+    name: "zeta-deprecated-2",
+  };
+  issues.deprecatedPackages[3] = {
+    ...requireItem(issues.deprecatedPackages, 3),
+    name: "zeta-deprecated-3",
+  };
+  issues.outdatedPackages[0] = {
+    registry: "NPM",
+    name: "glob",
+    latestVersion: "11.0.0",
+    severity: "HIGH",
+    versions: [
+      { version: "10.4.5", severity: "HIGH" },
+      { version: "10.4.6", severity: "HIGH" },
+    ],
+  };
+  issues.outdatedPackages[1] = {
+    ...requireItem(issues.outdatedPackages, 1),
+    name: "zeta-outdated-1",
+  };
+  issues.outdatedPackages[2] = {
+    ...requireItem(issues.outdatedPackages, 2),
+    name: "zeta-outdated-2",
+  };
+  issues.outdatedPackages[3] = {
+    ...requireItem(issues.outdatedPackages, 3),
+    name: "zeta-outdated-3",
+  };
+  issues.duplicatePackages[0] = {
+    registry: "NPM",
+    name: "a-very-long-duplicate-package-name",
+    versions: ["1.0.0", "2.0.0", "3.0.0"],
+  };
+  issues.conflicts[0] = {
+    registry: "NPM",
+    name: "a-very-long-conflicting-package-name",
+    versions: ["1.0.0", "2.0.0"],
+    requiredVersions: ["^1.0.0", "^2.0.0"],
+    conflictingEdges: [
+      {
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 1,
+        toIndex: 2,
+        versionConstraint: "^2.0.0",
+        dependencyType: "peer",
+      },
+    ],
+  };
+  return fixture;
+}
+
+describe("buildPackageDependenciesSuccessPayload — runtime block", () => {
+  it("emits runtime block with client-computed count when backend returned direct[]", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+    );
+    expect(payload.runtime?.count).toBe(3);
+    expect(payload.runtime?.items.length).toBe(3);
+    expect(payload.runtime?.count).toBe(payload.runtime?.items.length);
+  });
+
+  it("emits runtime block with count:0 when direct[] is empty", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      zeroDepDependencyReport,
+    );
+    expect(payload.runtime).toEqual({ count: 0, items: [] });
+  });
+
+  it("omits runtime block entirely when dependencies is absent", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture);
+    expect(payload.runtime).toBeUndefined();
+  });
+
+  it("omits runtime block when direct is undefined", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencies: {},
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture);
+    expect(payload.runtime).toBeUndefined();
+  });
+});
+
+describe("buildPackageDependenciesSuccessPayload — groups block", () => {
+  it("omits groups block by default even when backend returned dependencyGroups", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+    );
+    expect(payload.groups).toBeUndefined();
+  });
+
+  it("emits all groups when lifecycle=all was requested", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+      { canonicalLifecycles: ["all"] },
+    );
+    expect(payload.groups?.items.length).toBe(2);
+    expect(payload.groups?.items[0]?.name).toBe("runtime");
+    expect(payload.groups?.items[1]?.name).toBe("development");
+  });
+
+  it("emits only matching groups when a concrete lifecycle was requested", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+      { canonicalLifecycles: ["development"] },
+    );
+    expect(payload.groups?.items.map((entry) => entry.lifecycle)).toEqual([
+      "development",
+    ]);
+  });
+
+  it("omits groups block when dependencyGroups is absent", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      zeroDepDependencyReport,
+    );
+    expect(payload.groups).toBeUndefined();
+  });
+
+  it("emits groups.items:[] when backend returned non-null groups with zero items (filter-matched-nothing)", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: { groups: [] },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      canonicalLifecycles: ["development"],
+    });
+    expect(payload.groups).toEqual({ items: [] });
+  });
+
+  it("sorts groups: runtime first, then development, build, peer, optional (by defaultEnabled desc, name asc within optional)", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "zeta",
+            lifecycle: "optional",
+            conditionType: "feature",
+            selectionMode: "additive",
+            defaultEnabled: false,
+            dependencies: [],
+          },
+          {
+            name: "alpha",
+            lifecycle: "optional",
+            conditionType: "feature",
+            selectionMode: "additive",
+            defaultEnabled: true,
+            dependencies: [],
+          },
+          {
+            name: "peer",
+            lifecycle: "peer",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [],
+          },
+          {
+            name: "dev",
+            lifecycle: "development",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [],
+          },
+          {
+            name: "runtime",
+            lifecycle: "runtime",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [],
+          },
+        ],
+      },
+    };
+    const names = buildPackageDependenciesSuccessPayload(fixture, {
+      canonicalLifecycles: ["all"],
+    }).groups?.items.map((g) => g.name);
+    expect(names).toEqual(["runtime", "dev", "peer", "alpha", "zeta"]);
+  });
+
+  it("preserves duplicate {name, constraint} entries verbatim (dedup is terminal-only)", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      cratesFeatureDependencyReport,
+      { canonicalLifecycles: ["all"] },
+    );
+    const netGroup = payload.groups?.items.find((g) => g.name === "net");
+    expect(netGroup?.items.length).toBe(3); // libc, libc, mio — not deduped
+    expect(netGroup?.items.filter((i) => i.name === "libc").length).toBe(2);
+  });
+});
+
+describe("buildPackageDependenciesSuccessPayload — transitive block", () => {
+  it("omits transitive entirely when not requested", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: { totalEdges: 80, uniquePackagesCount: 45 },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: false,
+    });
+    expect(payload.transitive).toBeUndefined();
+  });
+
+  it("emits transitive block with preprocessed `packages[]` (drops graph + uniqueDependencies)", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 80,
+        uniquePackagesCount: 45,
+        uniqueDependencies: ["accepts@2.0.0", "body-parser@2.2.2"],
+        dependencyGraph: {
+          formatVersion: 4,
+          nodes: [
+            { registry: "npm", name: "express", version: "5.2.1" },
+            { registry: "npm", name: "accepts", version: "2.0.0" },
+            { registry: "npm", name: "body-parser", version: "2.2.2" },
+          ],
+          edges: [
+            {
+              fromIndex: 0,
+              toIndex: 1,
+              constraint: "^2.0.0",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 0,
+              toIndex: 2,
+              constraint: "^2.2.1",
+              dependencyType: "runtime",
+            },
+          ],
+        },
+      },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: true,
+      includeImporters: true,
+    });
+    expect(payload.transitive?.edges).toBe(80);
+    expect(payload.transitive?.uniquePackages).toBe(45);
+    expect(payload.transitive?.packages).toEqual([
+      {
+        name: "accepts",
+        version: "2.0.0",
+        importers: [
+          { name: "express", version: "5.2.1", constraint: "^2.0.0" },
+        ],
+      },
+      {
+        name: "body-parser",
+        version: "2.2.2",
+        importers: [
+          { name: "express", version: "5.2.1", constraint: "^2.2.1" },
+        ],
+      },
+    ]);
+    // `dependencyGraph` stays on the service-level result for a
+    // future `pkg deps-dag` command; this tool's envelope doesn't
+    // surface it. `uniqueDependencies` is subsumed by `packages[]`.
+    expect(
+      (payload.transitive as unknown as Record<string, unknown>)
+        .dependencyGraph,
+    ).toBeUndefined();
+    expect(
+      (payload.transitive as unknown as Record<string, unknown>)
+        .uniqueDependencies,
+    ).toBeUndefined();
+  });
+
+  it("omits empty dependencyConflicts / circularDependencyCycles arrays", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 1,
+        uniquePackagesCount: 1,
+        dependencyConflicts: [],
+        circularDependencyCycles: [],
+      },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: true,
+    });
+    expect(payload.transitive?.conflicts).toBeUndefined();
+    expect(payload.transitive?.circularDependencies).toBeUndefined();
+  });
+
+  it("maps typed conflicts / cycles straight to envelope (no raw passthrough)", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: [],
+      transitive: {
+        totalEdges: 0,
+        uniquePackagesCount: 0,
+        dependencyConflicts: [
+          {
+            packageName: "lodash",
+            requiredVersions: ["^4", "^5"],
+            conflictingEdges: [],
+          },
+        ],
+        circularDependencyCycles: [
+          {
+            cycleStart: "a",
+            circularPath: ["a", "b", "a"],
+            displayChain: "a → b → a",
+          },
+        ],
+      },
+    };
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: true,
+    });
+    expect(payload.transitive?.conflicts).toEqual([
+      { name: "lodash", requiredVersions: ["^4", "^5"], requirements: [] },
+    ]);
+    expect(payload.transitive?.circularDependencies).toEqual([
+      { cycle: ["a", "b", "a"] },
+    ]);
+  });
+});
+
+describe("buildPackageDependenciesSuccessPayload — filter echo", () => {
+  it("omits filter when no canonical lifecycles", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+    );
+    expect(payload.filter).toBeUndefined();
+  });
+
+  it("emits filter.lifecycles verbatim from canonical list", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+      { canonicalLifecycles: ["runtime", "optional"] },
+    );
+    expect(payload.filter).toEqual({ lifecycles: ["runtime", "optional"] });
+  });
+});
+
+describe("buildPackageDependenciesSuccessPayload — version echo", () => {
+  it("omits requestedVersion on exact match", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+      { requestedVersion: "5.2.1" },
+    );
+    expect(payload.requestedVersion).toBeUndefined();
+  });
+
+  it("surfaces requestedVersion on any non-empty divergence", () => {
+    const payload = buildPackageDependenciesSuccessPayload(
+      defaultDependencyReport,
+      { requestedVersion: "5.2" },
+    );
+    expect(payload.requestedVersion).toBe("5.2");
+  });
+});
+
+describe("buildPackageDependenciesSuccessPayload — dependency issues", () => {
+  it("emits the complete issue envelope with depth scope and lossless conflict requirements", () => {
+    const fixture: DependencyReport = {
+      package: { name: "express", registry: "NPM", version: "5.2.1" },
+      dependencies: {
+        direct: [],
+        transitive: {
+          dependencyGraph: {
+            formatVersion: 4,
+            nodes: [
+              { registry: "NPM", name: "express", version: "5.2.1" },
+              { registry: "NPM", name: "importer-a", version: "1.0.0" },
+              { registry: "NPM", name: "shared", version: "1.0.0" },
+              { registry: "NPM", name: "importer-b", version: "2.0.0" },
+              { registry: "NPM", name: "shared", version: "2.0.0" },
+            ],
+            edges: [
+              {
+                toIndex: 2,
+                constraint: "^1.0.0",
+                dependencyType: "runtime",
+              },
+              {
+                fromIndex: 1,
+                toIndex: 2,
+                constraint: "^1.0.0",
+                dependencyType: "runtime",
+              },
+              {
+                fromIndex: 3,
+                toIndex: 4,
+                constraint: "^2.0.0",
+                dependencyType: "optional",
+              },
+              {
+                fromIndex: 1,
+                toIndex: 4,
+                constraint: "^2.0.0",
+                dependencyType: "peer",
+              },
+            ],
+          },
+          dependencyConflicts: [
+            {
+              packageName: "shared",
+              requiredVersions: ["^1.0.0", "^2.0.0"],
+              conflictingEdges: [
+                {
+                  toIndex: 2,
+                  versionConstraint: "^1.0.0",
+                  dependencyType: "runtime",
+                },
+                {
+                  fromIndex: 1,
+                  toIndex: 2,
+                  versionConstraint: "^1.0.0",
+                  dependencyType: "runtime",
+                },
+              ],
+            },
+          ],
+          dependencyIssues: {
+            totalCount: 4,
+            deprecatedCount: 1,
+            outdatedCount: 1,
+            duplicateCount: 1,
+            conflictCount: 1,
+            deprecatedPackages: [
+              {
+                registry: "NPM",
+                name: "old-package",
+                versions: ["1.0.0", "1.1.0"],
+                reasons: [
+                  { version: "1.0.0", reason: "Use new-package" },
+                  { version: "1.1.0" },
+                ],
+              },
+            ],
+            outdatedPackages: [
+              {
+                registry: "NPM",
+                name: "stale-package",
+                severity: "HIGH",
+                versions: [
+                  { version: "1.0.0", severity: "HIGH" },
+                  { version: "1.1.0", severity: "MEDIUM" },
+                ],
+              },
+            ],
+            duplicatePackages: [
+              {
+                name: "duplicate-package",
+                versions: ["1.0.0", "2.0.0"],
+              },
+            ],
+            conflicts: [
+              {
+                name: "shared",
+                versions: ["1.0.0", "2.0.0"],
+                requiredVersions: ["^1.0.0", "^2.0.0"],
+                conflictingEdges: [
+                  {
+                    toIndex: 2,
+                    versionConstraint: "^1.0.0",
+                    dependencyType: "runtime",
+                  },
+                  {
+                    fromIndex: 1,
+                    toIndex: 2,
+                    versionConstraint: "^1.0.0",
+                    dependencyType: "runtime",
+                  },
+                  {
+                    fromIndex: 3,
+                    toIndex: 4,
+                    versionConstraint: "^2.0.0",
+                    dependencyType: "optional",
+                  },
+                  {
+                    fromIndex: 1,
+                    toIndex: 4,
+                    versionConstraint: "^2.0.0",
+                    dependencyType: "peer",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    };
+
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: true,
+      includeIssues: true,
+      maxDepth: 3,
+    });
+
+    expect(payload.issues).toEqual({
+      total: 4,
+      scope: { mode: "depth_limited", maxDepth: 3 },
+      deprecated: {
+        count: 1,
+        items: [
+          {
+            registry: "npm",
+            name: "old-package",
+            versions: ["1.0.0", "1.1.0"],
+            reasons: [
+              { version: "1.0.0", reason: "Use new-package" },
+              { version: "1.1.0" },
+            ],
+          },
+        ],
+      },
+      outdated: {
+        count: 1,
+        items: [
+          {
+            registry: "npm",
+            name: "stale-package",
+            severity: "HIGH",
+            versions: [
+              { version: "1.0.0", severity: "HIGH" },
+              { version: "1.1.0", severity: "MEDIUM" },
+            ],
+          },
+        ],
+      },
+      duplicates: {
+        count: 1,
+        items: [
+          {
+            name: "duplicate-package",
+            versions: ["1.0.0", "2.0.0"],
+          },
+        ],
+      },
+      conflicts: {
+        count: 1,
+        items: [
+          {
+            name: "shared",
+            versions: ["1.0.0", "2.0.0"],
+            requiredVersions: ["^1.0.0", "^2.0.0"],
+            requirements: [
+              {
+                constraint: "^1.0.0",
+                dependencyType: "runtime",
+                importer: {
+                  registry: "npm",
+                  name: "express",
+                  version: "5.2.1",
+                  root: true,
+                },
+                target: {
+                  registry: "npm",
+                  name: "shared",
+                  version: "1.0.0",
+                },
+              },
+              {
+                constraint: "^1.0.0",
+                dependencyType: "runtime",
+                importer: {
+                  registry: "npm",
+                  name: "importer-a",
+                  version: "1.0.0",
+                },
+                target: {
+                  registry: "npm",
+                  name: "shared",
+                  version: "1.0.0",
+                },
+              },
+              {
+                constraint: "^2.0.0",
+                dependencyType: "optional",
+                importer: {
+                  registry: "npm",
+                  name: "importer-b",
+                  version: "2.0.0",
+                },
+                target: {
+                  registry: "npm",
+                  name: "shared",
+                  version: "2.0.0",
+                },
+              },
+              {
+                constraint: "^2.0.0",
+                dependencyType: "peer",
+                importer: {
+                  registry: "npm",
+                  name: "importer-a",
+                  version: "1.0.0",
+                },
+                target: {
+                  registry: "npm",
+                  name: "shared",
+                  version: "2.0.0",
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(payload.transitive?.conflicts).toEqual([
+      {
+        name: "shared",
+        requiredVersions: ["^1.0.0", "^2.0.0"],
+        requirements: [
+          {
+            constraint: "^1.0.0",
+            dependencyType: "runtime",
+            importer: {
+              registry: "npm",
+              name: "express",
+              version: "5.2.1",
+              root: true,
+            },
+            target: {
+              registry: "npm",
+              name: "shared",
+              version: "1.0.0",
+            },
+          },
+          {
+            constraint: "^1.0.0",
+            dependencyType: "runtime",
+            importer: {
+              registry: "npm",
+              name: "importer-a",
+              version: "1.0.0",
+            },
+            target: {
+              registry: "npm",
+              name: "shared",
+              version: "1.0.0",
+            },
+          },
+        ],
+      },
+    ]);
+
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain("fromIndex");
+    expect(serialized).not.toContain("toIndex");
+    expect(serialized).not.toContain("dependencyGraph");
+  });
+
+  it("emits verified zero issue categories and full scope", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", registry: "NPM", version: "1.0.0" },
+      dependencies: {
+        transitive: {
+          dependencyIssues: {
+            totalCount: 0,
+            deprecatedCount: 0,
+            outdatedCount: 0,
+            duplicateCount: 0,
+            conflictCount: 0,
+            deprecatedPackages: [],
+            outdatedPackages: [],
+            duplicatePackages: [],
+            conflicts: [],
+          },
+        },
+      },
+    };
+
+    expect(
+      buildPackageDependenciesSuccessPayload(fixture, {
+        includeIssues: true,
+      }).issues,
+    ).toEqual({
+      total: 0,
+      scope: { mode: "full" },
+      deprecated: { count: 0, items: [] },
+      outdated: { count: 0, items: [] },
+      duplicates: { count: 0, items: [] },
+      conflicts: { count: 0, items: [] },
+    });
+  });
+
+  it("omits issue data by default while keeping the graph internal", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", registry: "NPM", version: "1.0.0" },
+      dependencies: {
+        transitive: {
+          dependencyGraph: {
+            formatVersion: 4,
+            nodes: [{ registry: "NPM", name: "x", version: "1.0.0" }],
+            edges: [],
+          },
+          dependencyIssues: {
+            totalCount: 0,
+            deprecatedCount: 0,
+            outdatedCount: 0,
+            duplicateCount: 0,
+            conflictCount: 0,
+            deprecatedPackages: [],
+            outdatedPackages: [],
+            duplicatePackages: [],
+            conflicts: [],
+          },
+        },
+      },
+    };
+
+    const payload = buildPackageDependenciesSuccessPayload(fixture, {
+      includeTransitive: true,
+    });
+    expect(payload.issues).toBeUndefined();
+    expect(payload.transitive).toEqual({});
+  });
+});
+
+describe("formatPackageDependenciesTerminal — dependency issues", () => {
+  it("renders bounded deterministic compact examples with one detail hint", () => {
+    const hint = "Use --json for complete dependency issue details.";
+    const output = formatPackageDependenciesTerminal(dependencyIssueReport(), {
+      includeIssues: true,
+      issuesDetailHint: hint,
+      useColors: false,
+      maxDepth: 3,
+    });
+
+    expect(output).toContain("Dependency issues: 16 (max depth 3)");
+    expect(output).toContain(
+      "  Deprecated 4 | Outdated 4 | Duplicates 4 | Conflicts 4",
+    );
+    const summaryLines = output
+      .trimEnd()
+      .split("\n")
+      .filter(
+        (line) =>
+          line.startsWith("Dependency issues:") ||
+          line.startsWith("  Deprecated "),
+      );
+    expect(summaryLines).toHaveLength(2);
+    expect(summaryLines.every((line) => line.length <= 80)).toBe(true);
+    expect(output).toContain("alpha-deprecated");
+    expect(output).toContain("beta-deprecated");
+    expect(output).toContain("gamma-deprecated");
+    expect(output).not.toContain("zeta-deprecated");
+    expect(output).toContain("alpha-outdated");
+    expect(output).toContain("alpha-duplicate");
+    expect(output).toContain("alpha-conflict");
+    expect(output).not.toContain("zeta-conflict");
+    expect(output.split(hint).length - 1).toBe(1);
+  });
+
+  it("bounds realistic compact issue evidence by terminal cells and dedups reasons", () => {
+    const fixture = longIssueDependencyReport();
+    const hint = "Use --json for complete dependency issue details.";
+    const before = buildPackageDependenciesSuccessPayload(fixture, {
+      includeIssues: true,
+    });
+
+    for (const width of [80, 36]) {
+      const output = formatPackageDependenciesTerminal(fixture, {
+        includeIssues: true,
+        issuesDetailHint: hint,
+        terminalWidth: width,
+        useColors: false,
+      });
+      const issueLines = output
+        .slice(output.indexOf("Dependency issues"))
+        .trimEnd()
+        .split("\n");
+      expect(
+        issueLines.every((line) => measureTerminalWidth(line) <= width),
+      ).toBe(true);
+      expect(output.replace(/\s+/g, " ").split(hint).length - 1).toBe(1);
+    }
+
+    const compact = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      issuesDetailHint: hint,
+      terminalWidth: 80,
+      useColors: false,
+    });
+    expect(compact).toContain("inflight [1.0.6, 1.0.7]");
+    expect(compact).toContain("1.0.6, 1.0.7: This module is not supported");
+    expect(compact.match(/This module is not supported/g)).toHaveLength(1);
+    expect(compact).toContain("glob [10.4.5 (HIGH), 10.4.6 (HIGH)]");
+    expect(compact).toContain("a-very-long-conflicting-package-name");
+
+    const after = buildPackageDependenciesSuccessPayload(fixture, {
+      includeIssues: true,
+    });
+    expect(after).toEqual(before);
+  });
+
+  it("wraps verbose issue prose and requirements without dropping evidence", () => {
+    const fixture = longIssueDependencyReport();
+    const output = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      issuesDetailHint: "Use --json for complete dependency issue details.",
+      terminalWidth: 36,
+      useColors: false,
+      verbose: true,
+    });
+    const issueLines = output
+      .slice(output.indexOf("Dependency issues"))
+      .trimEnd()
+      .split("\n");
+    expect(issueLines.every((line) => measureTerminalWidth(line) <= 36)).toBe(
+      true,
+    );
+    expect(output.replace(/\s+/g, " ")).toContain(
+      "Deprecated 4 | Outdated 4 | Duplicates 4 | Conflicts 4",
+    );
+    expect(output.replace(/\s+/g, " ")).toContain(
+      "This module is not supported, and leaks memory. Do not use it.",
+    );
+    expect(output).toContain("^1.0.0 required by express@5.2.1");
+    expect(output.replace(/\s+/g, "")).toContain(
+      "^2.0.0 required by a-very-long-importer-package-name@1.0.0".replace(
+        /\s/g,
+        "",
+      ),
+    );
+    expect(output).not.toContain(
+      "Use --json for complete dependency issue details.",
+    );
+  });
+
+  it("keeps long verbose issue tokens' bullets and hint text intact", () => {
+    const fixture = longIssueDependencyReport();
+    const hint = "Use --json for complete dependency issue details.";
+    const output = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      issuesDetailHint: hint,
+      terminalWidth: 36,
+      useColors: false,
+      verbose: true,
+    });
+    const issueLines = output
+      .slice(output.indexOf("Dependency issues"))
+      .trimEnd()
+      .split("\n");
+    const longTokenLine = issueLines.find((line) =>
+      line.startsWith("  - a-very-long-"),
+    );
+    expect(longTokenLine?.startsWith("  - ")).toBe(true);
+    expect(output.replace(/\s+/g, "")).toContain(
+      "a-very-long-duplicate-package-name",
+    );
+  });
+
+  it("renders all issue rows, reasons, latest evidence, and conflict requirements in verbose mode", () => {
+    const hint = "Use --json for complete dependency issue details.";
+    const output = formatPackageDependenciesTerminal(dependencyIssueReport(), {
+      includeIssues: true,
+      issuesDetailHint: hint,
+      useColors: false,
+      verbose: true,
+    });
+
+    expect(output).toContain("Dependency issues: 16 (full graph)");
+    expect(output).toContain("zeta-deprecated");
+    expect(output).toContain("Use replacement");
+    expect(output).toContain("zeta-outdated");
+    expect(output).toContain("latest 9.0.0");
+    expect(output).toContain("zeta-duplicate");
+    expect(output).toContain("zeta-conflict [1.0.0, 2.0.0]: ^1.0.0");
+    expect(output).toContain(
+      "- ^1.0.0 required by express@5.2.1 (runtime), importer@1.0.0 (peer)",
+    );
+    expect(output).not.toContain(hint);
+  });
+
+  it("keeps the existing verbose transitive conflict section actionable", () => {
+    const fixture = dependencyIssueReport();
+    if (!fixture.dependencies?.transitive) {
+      throw new Error("expected transitive fixture");
+    }
+    fixture.dependencies.transitive.dependencyConflicts = [
+      {
+        packageName: "shared",
+        requiredVersions: ["^2.0.0", "^1.0.0"],
+        conflictingEdges: [
+          {
+            toIndex: 2,
+            versionConstraint: "^1.0.0",
+            dependencyType: "runtime",
+          },
+          {
+            fromIndex: 1,
+            toIndex: 2,
+            versionConstraint: "^1.0.0",
+            dependencyType: "peer",
+          },
+        ],
+      },
+    ];
+
+    const graph = fixture.dependencies.transitive.dependencyGraph;
+    const conflict = fixture.dependencies.transitive.dependencyConflicts[0];
+    if (!graph || !conflict) throw new Error("expected conflict fixture");
+    for (let index = 3; index <= 12; index += 1) {
+      graph.nodes.push({
+        registry: "NPM",
+        name: `importer-${index}`,
+        version: "1.0.0",
+      });
+      conflict.conflictingEdges.push({
+        fromIndex: index,
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      });
+    }
+
+    for (const width of [80, 36]) {
+      const output = formatPackageDependenciesTerminal(fixture, {
+        includeTransitive: true,
+        terminalWidth: width,
+        useColors: false,
+        verbose: true,
+      });
+      const conflictLines = output
+        .slice(output.indexOf("Conflicts (1):"))
+        .trimEnd()
+        .split("\n");
+      expect(
+        conflictLines.every((line) => measureTerminalWidth(line) <= width),
+      ).toBe(true);
+      expect(output.replace(/\s+/g, " ")).toContain("shared: ^1.0.0, ^2.0.0");
+      for (const importer of [
+        "express@5.2.1",
+        "importer@1.0.0",
+        "importer-12@1.0.0",
+      ]) {
+        expect(output.replace(/\s+/g, " ")).toContain(importer);
+      }
+    }
+  });
+
+  it("renders zero issues as a scoped positive acknowledgement", () => {
+    const fixture = dependencyIssueReport();
+    if (!fixture.dependencies?.transitive?.dependencyIssues) {
+      throw new Error("expected issue fixture");
+    }
+    fixture.dependencies.transitive.dependencyIssues = {
+      totalCount: 0,
+      deprecatedCount: 0,
+      outdatedCount: 0,
+      duplicateCount: 0,
+      conflictCount: 0,
+      deprecatedPackages: [],
+      outdatedPackages: [],
+      duplicatePackages: [],
+      conflicts: [],
+    };
+
+    const output = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      useColors: false,
+    });
+
+    expect(output).toContain("Dependency issues: 0 (full graph)");
+    expect(output).toContain(
+      "  Deprecated 0 | Outdated 0 | Duplicates 0 | Conflicts 0",
+    );
+    expect(output).toContain("No dependency issues detected.");
+  });
+
+  it("renders explicit category count labels", () => {
+    const fixture = dependencyIssueReport();
+    if (!fixture.dependencies?.transitive?.dependencyIssues) {
+      throw new Error("expected issue fixture");
+    }
+    const issues = fixture.dependencies.transitive.dependencyIssues;
+    issues.totalCount = 4;
+    issues.deprecatedCount = 1;
+    issues.outdatedCount = 1;
+    issues.duplicateCount = 1;
+    issues.conflictCount = 1;
+    issues.deprecatedPackages = issues.deprecatedPackages.slice(0, 1);
+    issues.outdatedPackages = issues.outdatedPackages.slice(0, 1);
+    issues.duplicatePackages = issues.duplicatePackages.slice(0, 1);
+    issues.conflicts = issues.conflicts.slice(0, 1);
+
+    const output = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      useColors: false,
+    });
+
+    expect(output).toContain(
+      "  Deprecated 1 | Outdated 1 | Duplicates 1 | Conflicts 1",
+    );
+  });
+
+  it("caps compact conflict requirements by constraint group and importer labels", () => {
+    const fixture = dependencyIssueReport();
+    const transitive = fixture.dependencies?.transitive;
+    const graph = transitive?.dependencyGraph;
+    const issue = transitive?.dependencyIssues?.conflicts.find(
+      (conflict) => conflict.name === "alpha-conflict",
+    );
+    if (!transitive || !graph || !issue) {
+      throw new Error("expected issue fixture");
+    }
+    graph.nodes.push(
+      { registry: "NPM", name: "importer-a", version: "1.0.0" },
+      { registry: "NPM", name: "importer-b", version: "1.0.0" },
+      { registry: "NPM", name: "importer-c", version: "1.0.0" },
+      { registry: "NPM", name: "importer-d", version: "1.0.0" },
+    );
+    issue.conflictingEdges = [
+      { toIndex: 2, versionConstraint: "^1.0.0", dependencyType: "runtime" },
+      {
+        fromIndex: 1,
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 3,
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 4,
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 5,
+        toIndex: 2,
+        versionConstraint: "^1.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 6,
+        toIndex: 2,
+        versionConstraint: "^2.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 3,
+        toIndex: 2,
+        versionConstraint: "^3.0.0",
+        dependencyType: "runtime",
+      },
+      {
+        fromIndex: 4,
+        toIndex: 2,
+        versionConstraint: "^4.0.0",
+        dependencyType: "runtime",
+      },
+    ];
+    const hint = "Use --json for complete dependency issue details.";
+    const output = formatPackageDependenciesTerminal(fixture, {
+      includeIssues: true,
+      issuesDetailHint: hint,
+      useColors: false,
+    });
+
+    expect(output).toContain(
+      "^1.0.0 required by express@5.2.1, importer-a@1.0.0, importer-b@1.0.0",
+    );
+    expect(output).toContain("^2.0.0 required by importer-d@1.0.0");
+    expect(output).toContain("^3.0.0 required by importer-a@1.0.0");
+    expect(output).not.toContain("^4.0.0 required by importer-a@1.0.0");
+    expect(output).not.toContain("importer-c@1.0.0");
+    expect(output.split(hint).length - 1).toBe(1);
+  });
+
+  it("keeps ANSI optional and semantically redundant for issue output", () => {
+    const colored = formatPackageDependenciesTerminal(dependencyIssueReport(), {
+      includeIssues: true,
+      useColors: true,
+    });
+    const plain = formatPackageDependenciesTerminal(dependencyIssueReport(), {
+      includeIssues: true,
+      useColors: false,
+    });
+    const withoutAnsi = colored.replace(ANSI_SGR_PATTERN, "");
+    expect(withoutAnsi).toBe(plain);
+  });
+});
+
+describe("formatPackageDependenciesTerminal — runtime view", () => {
+  it("renders summary row + direct deps list + hidden-groups mention by name", () => {
+    const output = formatPackageDependenciesTerminal(defaultDependencyReport, {
+      useColors: false,
+    });
+    expect(output).toContain("express @ 5.2.1 | npm");
+    expect(output).toContain("3 direct runtime dependencies");
+    expect(output).toContain("Runtime dependencies:");
+    expect(output).toContain("accepts");
+    expect(output).toContain("^2.0.0");
+    expect(output).toContain(
+      "Hidden groups: development - use --lifecycle all.",
+    );
+  });
+
+  it("renders zero-dep hot path under 3 lines", () => {
+    const output = formatPackageDependenciesTerminal(zeroDepDependencyReport, {
+      useColors: false,
+    });
+    const lines = output.trimEnd().split("\n");
+    expect(lines.length).toBeLessThanOrEqual(3);
+    expect(output).toContain("No direct runtime dependencies");
+  });
+
+  it("pluralises vocabulary correctly for 1 dep", () => {
+    const fixture = clone(defaultDependencyReport);
+    if (fixture.dependencies?.direct) {
+      fixture.dependencies.direct = fixture.dependencies.direct.slice(0, 1);
+    }
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+    });
+    expect(output).toContain("1 direct runtime dependency");
+  });
+
+  it("suppresses hidden-groups hint when only runtime group exists", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencies: { direct: [{ name: "a", versionConstraint: "^1" }] },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "runtime",
+            lifecycle: "runtime",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [{ name: "a", constraint: "^1" }],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+    });
+    expect(output).not.toContain("hidden - use --lifecycle all");
+  });
+});
+
+describe("formatPackageDependenciesTerminal — groups view", () => {
+  it("renders groups with lifecycle summary header", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toContain("tokio @ 1.52.1 | crates");
+    expect(output).toContain("Dependency groups:");
+    expect(output).toContain("3 groups");
+    expect(output).toContain("1 runtime, 2 optional");
+  });
+
+  it("collapses heading to `name` for always-typed groups", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toMatch(/^\s+runtime\s*$/m);
+  });
+
+  it("renders `name (lifecycle, conditionType)` when conditionValue === name", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toContain("full (optional, feature)");
+    expect(output).toContain("net (optional, feature)");
+  });
+
+  it("renders `name (lifecycle, conditionType: conditionValue)` when they diverge", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "group-alias",
+            lifecycle: "optional",
+            conditionType: "feature",
+            conditionValue: "the-feature-name",
+            selectionMode: "additive",
+            defaultEnabled: false,
+            dependencies: [{ name: "dep", constraint: "^1" }],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).toContain(
+      "group-alias (optional, feature: the-feature-name)",
+    );
+  });
+
+  it("dedups duplicate {name, constraint} entries in terminal rendering", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    const libcLines = output.split("\n").filter((l) => /^\s+libc\b/.test(l));
+    expect(libcLines.length).toBe(1);
+  });
+
+  it("shows conditionType/selectionMode under --verbose", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        verbose: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toContain("selectionMode:");
+    expect(output).toContain("defaultEnabled:");
+  });
+
+  it("renders environmentMarkers block under --verbose when backend provides them", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: {
+        environmentMarkers: [
+          { type: "extra", value: "async", raw: 'extra == "async"' },
+          {
+            type: "python_version",
+            value: ">= 3.8",
+            raw: 'python_version >= "3.8"',
+          },
+        ],
+        groups: [
+          {
+            name: "runtime",
+            lifecycle: "runtime",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [{ name: "a", constraint: "^1" }],
+          },
+        ],
+      },
+    };
+    const verbose = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      verbose: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(verbose).toContain("environmentMarkers (2):");
+    // Typed rendering — type: value per line, no JSON blob.
+    expect(verbose).toContain("extra: async");
+    expect(verbose).toContain("python_version: >= 3.8");
+    expect(verbose).not.toContain('{"type":');
+
+    const nonVerbose = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      verbose: false,
+      canonicalLifecycles: ["all"],
+    });
+    expect(nonVerbose).not.toContain("environmentMarkers");
+  });
+
+  it("renders the filter-matched-nothing case with a helpful message", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: { groups: [] },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["build"],
+    });
+    expect(output).toContain(
+      "No dependency groups matched lifecycle filter: build.",
+    );
+  });
+});
+
+describe("formatPackageDependenciesTerminal — transitive view", () => {
+  it("promotes edges + unique packages + depth into the summary line and flags no-conflicts case", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 80,
+        uniquePackagesCount: 45,
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      maxDepth: 3,
+    });
+    expect(output).toContain(
+      "3 direct runtime dependencies | 80 transitive edges | 45 unique packages (max depth 3)",
+    );
+    expect(output).toContain("No version conflicts or circular dependencies");
+  });
+
+  it("omits depth from summary line when caller did not cap depth (MCP default path)", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 80,
+        uniquePackagesCount: 45,
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    expect(output).toContain(
+      "3 direct runtime dependencies | 80 transitive edges | 45 unique packages",
+    );
+    expect(output).not.toContain("depth");
+  });
+
+  it("replaces direct list with full transitive list (alphabetical, no truncation)", () => {
+    const names = Array.from({ length: 25 }, (_, i) => `pkg-${i + 1}@1.0.0`);
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 25,
+        uniquePackagesCount: 25,
+        uniqueDependencies: names,
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    // Every transitive entry renders, no truncation hint, no "use -v".
+    for (let i = 1; i <= 25; i++) {
+      expect(output).toContain(`pkg-${i}@1.0.0`);
+    }
+    expect(output).not.toContain("use -v");
+    expect(output).not.toContain("more");
+    // Direct runtime list (accepts, body-parser, cookie) is absent —
+    // Transitive output replaces it.
+    expect(output).not.toMatch(/^\s\saccepts\s+\^2\.0\.0/m);
+  });
+
+  it("sorts transitive list alphabetically regardless of backend order", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 3,
+        uniquePackagesCount: 3,
+        uniqueDependencies: ["zulu@1.0.0", "alpha@2.0.0", "mike@3.0.0"],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    const depLines = output.split("\n").filter((l) => /^\s\s[a-z]/.test(l));
+    expect(depLines.map((l) => l.trim().split(/@/)[0])).toEqual([
+      "alpha",
+      "mike",
+      "zulu",
+    ]);
+  });
+
+  it("adds multi-line `- constraint required by importer@version` provenance under transitive verbose output", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 3,
+        uniquePackagesCount: 3,
+        uniqueDependencies: ["accepts@2.0.0", "bytes@3.1.2"],
+        dependencyGraph: {
+          formatVersion: 4,
+          nodes: [
+            { registry: "npm", name: "express", version: "5.2.1" },
+            { registry: "npm", name: "accepts", version: "2.0.0" },
+            { registry: "npm", name: "bytes", version: "3.1.2" },
+            { registry: "npm", name: "body-parser", version: "2.2.2" },
+          ],
+          edges: [
+            {
+              fromIndex: 0,
+              toIndex: 1,
+              constraint: "^2.0.0",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 0,
+              toIndex: 3,
+              constraint: "^2.2.1",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 3,
+              toIndex: 2,
+              constraint: "^3.0.0",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 0,
+              toIndex: 2,
+              constraint: "^3.1.0",
+              dependencyType: "runtime",
+            },
+          ],
+        },
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      verbose: true,
+    });
+    expect(output).toContain("accepts@2.0.0");
+    expect(output).toContain("- ^2.0.0 required by express@5.2.1");
+    expect(output).toContain("bytes@3.1.2");
+    // bytes has two importers with different constraints — one
+    // bullet per unique constraint.
+    expect(output).toContain("- ^3.0.0 required by body-parser@2.2.2");
+    expect(output).toContain("- ^3.1.0 required by express@5.2.1");
+  });
+
+  it("collapses multiple importers with the same constraint onto one bullet", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 5,
+        uniquePackagesCount: 5,
+        uniqueDependencies: ["leaf@1.0.0"],
+        dependencyGraph: {
+          formatVersion: 4,
+          nodes: [
+            { registry: "npm", name: "root", version: "1.0.0" },
+            { registry: "npm", name: "a", version: "1.0.0" },
+            { registry: "npm", name: "b", version: "1.0.0" },
+            { registry: "npm", name: "c", version: "1.0.0" },
+            { registry: "npm", name: "leaf", version: "1.0.0" },
+          ],
+          edges: [
+            {
+              fromIndex: 0,
+              toIndex: 1,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 0,
+              toIndex: 2,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 0,
+              toIndex: 3,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+            // Three importers all expressing ^1 for leaf — group them.
+            {
+              fromIndex: 1,
+              toIndex: 4,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 2,
+              toIndex: 4,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+            {
+              fromIndex: 3,
+              toIndex: 4,
+              constraint: "^1",
+              dependencyType: "runtime",
+            },
+          ],
+        },
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      verbose: true,
+    });
+    expect(output).toContain("    - ^1 required by a@1.0.0, b@1.0.0, c@1.0.0");
+    // Not 3 separate bullets.
+    expect(
+      output.split("\n").filter((l) => l.includes("^1 required by")).length,
+    ).toBe(1);
+  });
+
+  it("summary row combines counts + hidden-groups on one block", () => {
+    const output = formatPackageDependenciesTerminal(defaultDependencyReport, {
+      useColors: false,
+    });
+    // Both lines in the header block: count line then hidden-groups line.
+    expect(output).toMatch(
+      /3 direct runtime dependencies\nHidden groups: development - use --lifecycle all\./,
+    );
+  });
+
+  it("omits hidden-groups line when lifecycle=all is active (nothing is hidden)", () => {
+    const output = formatPackageDependenciesTerminal(defaultDependencyReport, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).not.toContain("Hidden groups");
+  });
+
+  it("lists hidden groups by name across many lifecycles (no aggregate rollup)", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      { useColors: false },
+    );
+    // Tokio has one `full` group + one `net` group under optional —
+    // both names appear in the hidden-groups line.
+    expect(output).toContain("Hidden groups:");
+    expect(output).toContain("full");
+    expect(output).toContain("net");
+  });
+
+  it("groups view replaces the duplicated direct deps list", () => {
+    const output = formatPackageDependenciesTerminal(defaultDependencyReport, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    const directIdx = output.indexOf("Runtime dependencies:");
+    const groupsHeadingIdx = output.indexOf("2 groups");
+    expect(directIdx).toBe(-1);
+    expect(groupsHeadingIdx).toBeGreaterThan(0);
+    expect(output).toContain("accepts      ^2.0.0");
+    expect(output).not.toContain("accepts@2.0.0");
+  });
+
+  it("enriches runtime group rows with resolved versions when available", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      ...fixture.dependencies,
+      transitive: {
+        totalEdges: 3,
+        uniquePackagesCount: 3,
+        dependencyGraph: {
+          formatVersion: 1,
+          nodes: [
+            { registry: "npm", name: "express", version: "5.2.1" },
+            { registry: "npm", name: "accepts", version: "2.0.0" },
+            { registry: "npm", name: "body-parser", version: "2.2.1" },
+            { registry: "npm", name: "cookie", version: "0.7.1" },
+          ],
+          edges: [
+            { fromIndex: 0, toIndex: 1, constraint: "^2.0.0" },
+            { fromIndex: 0, toIndex: 2, constraint: "^2.2.1" },
+            { fromIndex: 0, toIndex: 3, constraint: "^0.7.1" },
+          ],
+        },
+      },
+    };
+
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).toContain("accepts@2.0.0  ^2.0.0");
+  });
+
+  it("groups block composes beneath transitive list under transitive lifecycle output", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 3,
+        uniquePackagesCount: 3,
+        uniqueDependencies: ["alpha@1", "beta@2", "gamma@3"],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      includeTransitive: true,
+      canonicalLifecycles: ["all"],
+    });
+    const transitiveIdx = output.indexOf("alpha@1");
+    const groupsHeadingIdx = output.indexOf("2 groups");
+    expect(transitiveIdx).toBeGreaterThan(0);
+    expect(groupsHeadingIdx).toBeGreaterThan(transitiveIdx);
+  });
+
+  it("silently omits provenance when the dependency graph isn't fetched", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 1,
+        uniquePackagesCount: 1,
+        uniqueDependencies: ["accepts@2.0.0"],
+        // No dependencyGraph — importers block degrades cleanly.
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      verbose: true,
+    });
+    expect(output).toContain("accepts@2.0.0");
+    expect(output).not.toContain("required by");
+  });
+
+  it("omits the uniqueDependencies block when backend returned none", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 0,
+        uniquePackagesCount: 0,
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    expect(output).not.toContain("Unique transitive packages");
+    // Still surfaces the no-conflicts acknowledgement.
+    expect(output).toContain(
+      "No version conflicts or circular dependencies detected.",
+    );
+  });
+
+  it("surfaces conflict + cycle counts on the summary row when > 0", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 2,
+        uniquePackagesCount: 2,
+        dependencyConflicts: [
+          {
+            packageName: "lodash",
+            requiredVersions: ["^4", "^5"],
+            conflictingEdges: [],
+          },
+        ],
+        circularDependencyCycles: [
+          {
+            cycleStart: "a",
+            circularPath: ["a", "b", "a"],
+            displayChain: "a → b → a",
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    expect(output).toMatch(/1 conflict\b/);
+    expect(output).toMatch(/1 cycle\b/);
+    // Compact mode — counts on summary, no listing, no hint.
+    expect(output).not.toContain("Conflicts (1):");
+    expect(output).not.toContain("Circular dependencies (1):");
+    expect(output).not.toContain("use --verbose");
+  });
+
+  it("pluralises conflict/cycle nouns on the summary row", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 5,
+        uniquePackagesCount: 5,
+        dependencyConflicts: [
+          {
+            packageName: "a",
+            requiredVersions: ["1", "2"],
+            conflictingEdges: [],
+          },
+          {
+            packageName: "b",
+            requiredVersions: ["1", "2"],
+            conflictingEdges: [],
+          },
+          {
+            packageName: "c",
+            requiredVersions: ["1", "2"],
+            conflictingEdges: [],
+          },
+        ],
+        circularDependencyCycles: [
+          { cycleStart: "x", circularPath: ["x"], displayChain: "x" },
+          { cycleStart: "y", circularPath: ["y"], displayChain: "y" },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    expect(output).toMatch(/3 conflicts\b/);
+    expect(output).toMatch(/2 cycles\b/);
+  });
+
+  it("renders typed conflicts with `name: range1, range2, …` under --verbose", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 2,
+        uniquePackagesCount: 2,
+        dependencyConflicts: [
+          {
+            packageName: "string-width",
+            requiredVersions: [
+              "^4.2.3",
+              "^4.2.0",
+              "^4.1.0",
+              "^5.1.2",
+              "^5.0.1",
+            ],
+            conflictingEdges: [],
+          },
+          {
+            packageName: "emoji-regex",
+            requiredVersions: ["^8.0.0", "^9.2.2"],
+            conflictingEdges: [],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      verbose: true,
+    });
+    expect(output).toContain("Conflicts (2):");
+    // Alphabetical by name; ranges sorted.
+    expect(output).toMatch(/emoji-regex:\s+\^8\.0\.0, \^9\.2\.2/);
+    expect(output).toMatch(
+      /string-width:\s+\^4\.1\.0, \^4\.2\.0, \^4\.2\.3, \^5\.0\.1, \^5\.1\.2/,
+    );
+  });
+
+  it("renders typed circular dependencies as `a -> b -> a` arrow chain under --verbose", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 3,
+        uniquePackagesCount: 3,
+        circularDependencyCycles: [
+          {
+            cycleStart: "a",
+            circularPath: ["a", "b", "a"],
+            displayChain: "a → b → a",
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+      verbose: true,
+    });
+    expect(output).toContain("Circular dependencies (1):");
+    expect(output).toContain("a -> b -> a");
+  });
+
+  it("keeps the zero-ack line when neither conflicts nor cycles are present", () => {
+    const fixture = clone(defaultDependencyReport);
+    fixture.dependencies = {
+      direct: fixture.dependencies?.direct,
+      transitive: {
+        totalEdges: 1,
+        uniquePackagesCount: 1,
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      includeTransitive: true,
+    });
+    expect(output).toContain(
+      "No version conflicts or circular dependencies detected.",
+    );
+    // Summary has no conflict / cycle counts.
+    expect(output).not.toMatch(/\bconflicts?\b.*direct runtime/);
+  });
+});
+
+describe("formatPackageDependenciesTerminal — no-color", () => {
+  it("sorts runtime items alphabetically regardless of backend order", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencies: {
+        direct: [
+          { name: "zeta", versionConstraint: "^1", type: "runtime" },
+          { name: "alpha", versionConstraint: "^2", type: "runtime" },
+          { name: "mid", versionConstraint: "^3", type: "runtime" },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+    });
+    const depLines = output.split("\n").filter((l) => /^\s\s[a-z]/.test(l));
+    expect(depLines.map((l) => l.trim().split(/\s+/)[0])).toEqual([
+      "alpha",
+      "mid",
+      "zeta",
+    ]);
+  });
+
+  it("sorts group dependencies alphabetically regardless of backend order", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "NPM" },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "runtime",
+            lifecycle: "runtime",
+            conditionType: "always",
+            selectionMode: "required",
+            dependencies: [
+              { name: "zulu", constraint: "^1" },
+              { name: "alpha", constraint: "^2" },
+              { name: "mike", constraint: "^3" },
+            ],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    const depLines = output.split("\n").filter((l) => /^\s{4}[a-z]/.test(l));
+    expect(depLines.map((l) => l.trim().split(/\s+/)[0])).toEqual([
+      "alpha",
+      "mike",
+      "zulu",
+    ]);
+  });
+
+  it("renames feature → extra in PyPI group headings (ecosystem vocabulary)", () => {
+    const fixture: DependencyReport = {
+      package: { name: "django", version: "6.0.4", registry: "PYPI" },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "argon2",
+            lifecycle: "optional",
+            conditionType: "feature",
+            conditionValue: "argon2",
+            selectionMode: "additive",
+            defaultEnabled: false,
+            dependencies: [{ name: "argon2-cffi", constraint: ">=23.1.0" }],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).toContain("argon2 (optional, extra)");
+    expect(output).not.toContain("(optional, feature)");
+  });
+
+  it("keeps `feature` vocabulary for Crates packages (Cargo's native term)", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toContain("(optional, feature)");
+    expect(output).not.toContain("(optional, extra)");
+  });
+
+  it("suppresses `selectionMode: required` in verbose mode (default-noise reduction)", () => {
+    const output = formatPackageDependenciesTerminal(defaultDependencyReport, {
+      useColors: false,
+      showGroups: true,
+      verbose: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).not.toContain("selectionMode: required");
+  });
+
+  it("shows `selectionMode: additive` in verbose mode (load-bearing signal)", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        verbose: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).toContain("selectionMode: additive");
+  });
+
+  it("collapses group heading when conditionValue differs only in case", () => {
+    const fixture: DependencyReport = {
+      package: { name: "x", version: "1.0.0", registry: "CRATES" },
+      dependencyGroups: {
+        groups: [
+          {
+            name: "full",
+            lifecycle: "optional",
+            conditionType: "feature",
+            conditionValue: "Full",
+            selectionMode: "additive",
+            defaultEnabled: false,
+            dependencies: [{ name: "parking_lot", constraint: "^0.12.0" }],
+          },
+        ],
+      },
+    };
+    const output = formatPackageDependenciesTerminal(fixture, {
+      useColors: false,
+      showGroups: true,
+      canonicalLifecycles: ["all"],
+    });
+    expect(output).toContain("full (optional, feature)");
+    expect(output).not.toContain("feature: Full");
+  });
+
+  it("contains no ANSI escape sequences when useColors is false", () => {
+    const output = formatPackageDependenciesTerminal(
+      cratesFeatureDependencyReport,
+      {
+        useColors: false,
+        showGroups: true,
+        verbose: true,
+        canonicalLifecycles: ["all"],
+      },
+    );
+    expect(output).not.toContain("\u001b[");
+  });
+});

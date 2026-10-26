@@ -1,0 +1,116 @@
+import type { CodeNavigationService } from "@githits/core-internal";
+import { z } from "zod";
+import {
+  DEFAULT_WAIT_TIMEOUT_MS,
+  MAX_DISCOVERY_WAIT_TIMEOUT_MS,
+} from "../shared/code-navigation-defaults.js";
+import type { MappedError } from "../shared/mapped-error.js";
+import { withIndexingRetryAction } from "../shared/mapped-error-text.js";
+import {
+  buildUnifiedSearchErrorPayload,
+  buildUnifiedSearchStatusPayload,
+  projectUnifiedSearchStatusPayload,
+} from "../shared/unified-search-response.js";
+import { renderUnifiedSearchStatusText } from "../shared/unified-search-status-text.js";
+import { renderUnifiedSearchError } from "../shared/unified-search-text.js";
+import { addLocalMcpAuthAction, throwIfCallerCancellation } from "./shared.js";
+import {
+  errorResult,
+  OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
+  type ToolDefinition,
+  textResult,
+  type ZodRawShape,
+} from "./types.js";
+
+export interface SearchStatusArgs {
+  search_ref: string;
+  wait_timeout_ms?: number;
+  format?: "text" | "json";
+}
+
+const schema: ZodRawShape = {
+  search_ref: z
+    .string()
+    .min(1)
+    .describe(
+      "The `searchRef` field from a prior `search` response (camelCase in the response, snake_case as this parameter). Pass it through unchanged.",
+    ),
+  wait_timeout_ms: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_DISCOVERY_WAIT_TIMEOUT_MS)
+    .optional()
+    .describe(
+      `Time to wait for results in ms. Default ${DEFAULT_WAIT_TIMEOUT_MS}, max ${MAX_DISCOVERY_WAIT_TIMEOUT_MS}.`,
+    ),
+  format: z
+    .enum(["text", "json"])
+    .default("text")
+    .describe(
+      "Omit `format` to use token-efficient text when the model reads the result or chooses follow-up tools. Set `json` only when code consumes the raw response instead of the model, or a required field is absent from text.",
+    ),
+};
+
+const DESCRIPTION =
+  "Continue an explicit search reference for progress and results. Call this only after a prior `search` response explicitly supplies both a `searchRef` and a `search_status` action; otherwise the initial result is complete or has its own recovery guidance. " +
+  "Pass that response's `searchRef` as `search_ref` here (response field is camelCase; this parameter is snake_case), only for active `PENDING`, `INDEXING`, or `SEARCHING` progress when updated results matter. Visible hits can be used for lookup while indexing continues. Fetch partial hits from a serveable subset when the original request allowed partial results (the default; set `allow_partial_results: false` to require all runnable pairs). `COMPLETED`, `DEFERRED`, `TIMEOUT`, and `FAILED` are terminal; unrecognized statuses are not polled. Preserve any disclosed evidence from those stopped references and follow the rendered new-search action.";
+
+export function createSearchStatusTool(
+  service: CodeNavigationService,
+): ToolDefinition<SearchStatusArgs, typeof schema> {
+  return {
+    name: "search_status",
+    description: DESCRIPTION,
+    schema,
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
+    handler: async (args, context) => {
+      try {
+        const outcome = await service.searchStatus(
+          args.search_ref,
+          args.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
+          {
+            signal: context?.signal,
+          },
+        );
+        const payload = buildUnifiedSearchStatusPayload(outcome);
+        if (isTextFormat(args.format)) {
+          return textResult(renderUnifiedSearchStatusText(payload));
+        }
+        return textResult(
+          JSON.stringify(projectUnifiedSearchStatusPayload(payload)),
+        );
+      } catch (error) {
+        throwIfCallerCancellation(error, context?.signal);
+        const basePayload = buildUnifiedSearchErrorPayload(error);
+        const mapped = withIndexingRetryAction(
+          {
+            code: basePayload.code as MappedError["code"],
+            message: basePayload.error,
+            retryable: basePayload.retryable,
+            details: basePayload.details as MappedError["details"],
+          },
+          "search",
+          "mcp",
+        );
+        const payload = addLocalMcpAuthAction(
+          {
+            ...basePayload,
+            ...(mapped.details
+              ? { details: mapped.details as Record<string, unknown> }
+              : {}),
+          },
+          context,
+        );
+        if (isTextFormat(args.format)) {
+          return errorResult(renderUnifiedSearchError(payload));
+        }
+        return errorResult(JSON.stringify(payload));
+      }
+    },
+  };
+}
+
+function isTextFormat(format: SearchStatusArgs["format"]): boolean {
+  return format === undefined || format === "text";
+}

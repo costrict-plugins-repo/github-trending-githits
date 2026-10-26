@@ -1,0 +1,1100 @@
+import { describe, expect, it, mock } from "bun:test";
+import { TermsAcceptanceRequiredError } from "../shared/terms-acceptance.js";
+import {
+  AGENTIC_ASK_DAILY_LIMIT_MESSAGE,
+  AGENTIC_ASK_MAX_RESPONSE_BYTES,
+  AGENTIC_ASK_REQUEST_RATE_LIMIT_MESSAGE,
+  AgenticAskConnectionError,
+  AgenticAskHttpError,
+  AgenticAskRequestTimeoutError,
+  type AgenticAskResponse,
+  AgenticAskResponseTooLargeError,
+  AgenticAskServiceImpl,
+  normalizeAgenticAskThreadId,
+  readAgenticAskResponseId,
+} from "./agentic-ask-service.js";
+import displayContract from "./fixtures/ask-display-contract.json";
+import { createMockTokenProvider } from "./test-helpers.js";
+
+const TOOL_CALL_ID = "018f47a6-7b32-7a1e-8f45-6a2d39c81720";
+const THREAD_ID = "018f47a6-7b32-7b1e-8f45-6a2d39c81720";
+
+function responseBody(overrides: Record<string, unknown> = {}) {
+  return { ...displayContract.cli, ...overrides };
+}
+function mcpResponseBody(overrides: Record<string, unknown> = {}) {
+  return { ...displayContract.mcp, ...overrides };
+}
+function urlResponseBody(overrides: Record<string, unknown> = {}) {
+  return { ...displayContract.url, ...overrides };
+}
+
+function jsonResponse(
+  body: unknown = responseBody(),
+  init: ResponseInit = {},
+): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+}
+
+function createService(
+  fetchFn: typeof fetch,
+  options: {
+    tokenProvider?: ReturnType<typeof createMockTokenProvider>;
+    timeoutMs?: number;
+  } = {},
+): AgenticAskServiceImpl {
+  return new AgenticAskServiceImpl(
+    "https://api.githits.test/",
+    options.tokenProvider ?? createMockTokenProvider(),
+    fetchFn,
+    {
+      clientHeaders: () => ({
+        "x-githits-client-name": "githits-cli",
+        "x-githits-client-version": "1.2.3",
+        "x-githits-session-id": "session-id",
+      }),
+      userAgent: "githits-cli/1.2.3",
+      timeoutMs: options.timeoutMs,
+    },
+  );
+}
+
+function clarificationFetch(body: unknown): typeof fetch {
+  return Object.assign(async () => Response.json(body), {
+    preconnect: () => undefined,
+  });
+}
+
+describe("AgenticAskServiceImpl", () => {
+  it.each(Object.entries(displayContract))(
+    "preserves backend contract fixture %s",
+    async (_name, wire) => {
+      const result = await createService(clarificationFetch(wire)).ask({
+        question: "How?",
+      });
+      expect(result).toEqual(wire);
+    },
+  );
+
+  it("preserves evolving clarification candidates without validation", async () => {
+    const body = {
+      ...displayContract.clarification,
+      resolution: {
+        ...{},
+        targets: [{ canonicalKey: "github:openai/codex", future_field: true }],
+        future_metadata: { confidence: 0.9 },
+      },
+    };
+    await expect(
+      createService(clarificationFetch(body)).ask({ question: "How?" }),
+    ).resolves.toEqual<unknown>(body);
+  });
+
+  it.each([
+    "https://docs.example/page?lang=en&view=full#section",
+    "repo-doc:sha:pinned",
+    "docs:example:guide",
+  ])("preserves emitted CLI documentation read targets: %s", async (target) => {
+    const body: AgenticAskResponse = {
+      ...responseBody(),
+      source_format: "cli",
+      sources: [
+        {
+          command: "npx",
+          arguments: ["githits@latest", "read", "--lines", "3-8", "--", target],
+        },
+      ],
+    };
+    const fetchFn = mock(() =>
+      Promise.resolve(jsonResponse(body)),
+    ) as unknown as typeof fetch;
+
+    const result = await createService(fetchFn).ask({
+      question: "How does Express routing work?",
+    });
+
+    expect(result).toEqual(body);
+  });
+
+  it.each([
+    "https://docs.example/page?lang=en&view=full#section",
+    "repo-doc:sha:pinned",
+    "docs:example:guide",
+  ])("preserves emitted MCP documentation read targets: %s", async (target) => {
+    const body: AgenticAskResponse = {
+      ...mcpResponseBody(),
+      source_format: "mcp",
+      sources: [
+        {
+          name: "read",
+          arguments: { target: target, start_line: 3, end_line: 8 },
+        },
+      ],
+    };
+    const fetchFn = mock(() =>
+      Promise.resolve(jsonResponse(body)),
+    ) as unknown as typeof fetch;
+
+    const result = await createService(fetchFn).ask({
+      target: "npm:express",
+      question: "How does routing work?",
+      sourceFormat: "mcp",
+    });
+
+    expect(result).toEqual(body);
+  });
+
+  it.each([
+    {
+      subject: {},
+      message:
+        "GitHits could not answer this question for a supported target. Clarify the question or specify a public package or repository.",
+    },
+    {
+      subject: { target: "npm:example" },
+      message:
+        "GitHits could not validate this Research request or its target. Check the question and use a repository such as github:owner/repo@ref or a package such as npm:prisma@version. To correct a follow-up, keep thread_id and name the exact project or version in the question.",
+    },
+    {
+      subject: { threadId: THREAD_ID },
+      message:
+        "GitHits could not validate this Research request or its target. Check the question and use a repository such as github:owner/repo@ref or a package such as npm:prisma@version. To correct a follow-up, keep thread_id and name the exact project or version in the question.",
+    },
+  ])(
+    "keeps 400 guidance accurate for the supplied subject: %j",
+    async ({ subject, message }) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          jsonResponse({ detail: "private provider detail" }, { status: 400 }),
+        ),
+      ) as unknown as typeof fetch;
+      await expect(
+        createService(fetchFn).ask({ ...subject, question: "How?" }),
+      ).rejects.toMatchObject({
+        code: "INVALID_TARGET",
+        status: 400,
+        message,
+        retryable: false,
+      });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["cli", "url"] as const)(
+    "omits target and thread_id for a question-only %s request",
+    async (sourceFormat) => {
+      let capturedInit: RequestInit | undefined;
+      const fetchFn = mock(
+        (_url: string | URL | Request, init?: RequestInit) => {
+          capturedInit = init;
+          return Promise.resolve(
+            jsonResponse(
+              sourceFormat === "url" ? urlResponseBody() : responseBody(),
+            ),
+          );
+        },
+      ) as unknown as typeof fetch;
+
+      const service = createService(fetchFn);
+      const question = "How does Express routing work?";
+      if (sourceFormat === "url") {
+        await service.ask({ question, sourceFormat });
+      } else {
+        await service.ask({ question });
+      }
+      expect(JSON.parse(String(capturedInit?.body))).toEqual({
+        question,
+        source_format: sourceFormat,
+      });
+    },
+  );
+
+  it("sends the CLI source format with standard identity headers", async () => {
+    let capturedUrl: string | undefined;
+    let capturedInit: RequestInit | undefined;
+    const fetchFn = mock((url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = String(url);
+      capturedInit = init;
+      return Promise.resolve(jsonResponse());
+    }) as unknown as typeof fetch;
+
+    const result = await createService(fetchFn).ask({
+      target: "npm:example",
+      question: "How is the client created?",
+    });
+
+    expect(result).toEqual(responseBody() as unknown as AgenticAskResponse);
+    expect(capturedUrl).toBe("https://api.githits.test/ask");
+    expect(capturedInit?.method).toBe("POST");
+    expect(capturedInit?.signal).toBeInstanceOf(AbortSignal);
+    expect(capturedInit?.headers).toEqual({
+      Authorization: "Bearer mock-access-token",
+      "Content-Type": "application/json",
+      "User-Agent": "githits-cli/1.2.3",
+      "x-githits-client-name": "githits-cli",
+      "x-githits-client-version": "1.2.3",
+      "x-githits-session-id": "session-id",
+    });
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      target: "npm:example",
+      question: "How is the client created?",
+      source_format: "cli",
+    });
+  });
+
+  it("requests MCP citation display and preserves its envelope", async () => {
+    let capturedInit: RequestInit | undefined;
+    const fetchFn = mock((_url: string | URL | Request, init?: RequestInit) => {
+      capturedInit = init;
+      return Promise.resolve(jsonResponse(mcpResponseBody()));
+    }) as unknown as typeof fetch;
+
+    const result = await createService(fetchFn).ask({
+      target: "npm:example",
+      question: "How is the client created?",
+      sourceFormat: "mcp",
+    });
+
+    expect(result).toEqual(mcpResponseBody() as unknown as AgenticAskResponse);
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      target: "npm:example",
+      question: "How is the client created?",
+      source_format: "mcp",
+    });
+  });
+
+  it("continues a thread without resending its target", async () => {
+    let capturedInit: RequestInit | undefined;
+    const fetchFn = mock((_url: string | URL | Request, init?: RequestInit) => {
+      capturedInit = init;
+      return Promise.resolve(jsonResponse());
+    }) as unknown as typeof fetch;
+
+    await createService(fetchFn).ask({
+      threadId: THREAD_ID,
+      question: "Where is that choice checked?",
+    });
+
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      thread_id: THREAD_ID,
+      question: "Where is that choice checked?",
+      source_format: "cli",
+    });
+  });
+
+  it("requests and preserves upstream URLs when selected by the caller", async () => {
+    let capturedInit: RequestInit | undefined;
+    const fetchFn = mock((_url: string | URL | Request, init?: RequestInit) => {
+      capturedInit = init;
+      return Promise.resolve(
+        jsonResponse(
+          urlResponseBody({
+            usage: { input_tokens: 1 },
+            future_field: true,
+          }),
+        ),
+      );
+    }) as unknown as typeof fetch;
+
+    const result = await createService(fetchFn).ask({
+      target: "npm:example",
+      question: "How is the client created?",
+      sourceFormat: "url",
+    });
+
+    expect(result).toEqual<unknown>(
+      urlResponseBody({ usage: { input_tokens: 1 }, future_field: true }),
+    );
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      target: "npm:example",
+      question: "How is the client created?",
+      source_format: "url",
+    });
+  });
+
+  it("passes through URL sources and response formats without validation", async () => {
+    const bodies = [
+      responseBody(),
+      urlResponseBody({ sources: [{ url: "javascript:alert(1)" }] }),
+      urlResponseBody({ sources: [{ url: "not a URL" }] }),
+      urlResponseBody({ sources: [{ url: " https://example.com/source" }] }),
+      urlResponseBody({ sources: [{ url: "https://example.com/source " }] }),
+      urlResponseBody({ sources: [{ url: "https://example.com/a\nb" }] }),
+      urlResponseBody({ sources: [{ url: "https://example.com/a\tb" }] }),
+      urlResponseBody({ sources: [{ href: "https://example.com" }] }),
+    ];
+
+    for (const body of bodies) {
+      const service = createService(
+        mock(() =>
+          Promise.resolve(jsonResponse(body)),
+        ) as unknown as typeof fetch,
+      );
+      await expect(
+        service.ask({
+          target: "npm:example",
+          question: "How?",
+          sourceFormat: "url",
+        }),
+      ).resolves.toEqual<unknown>(body);
+    }
+  });
+
+  it("passes through MCP calls and response formats without validation", async () => {
+    const bodies = [
+      responseBody(),
+      mcpResponseBody({
+        sources: [
+          {
+            name: "read",
+            arguments: {
+              target: "npm:example",
+              path: "src/index.ts",
+              start_line: 0,
+              end_line: 20,
+            },
+          },
+        ],
+      }),
+      mcpResponseBody({ sources: [{ name: "shell", arguments: {} }] }),
+    ];
+
+    for (const body of bodies) {
+      const service = createService(
+        mock(() =>
+          Promise.resolve(jsonResponse(body)),
+        ) as unknown as typeof fetch,
+      );
+      await expect(
+        service.ask({
+          target: "npm:example",
+          question: "How?",
+          sourceFormat: "mcp",
+        }),
+      ).resolves.toEqual<unknown>(body);
+    }
+  });
+
+  it("accepts both OAuth JWT and opaque API-token credentials", async () => {
+    for (const token of ["header.payload.signature", "ghi-static-token"]) {
+      let authorization: string | undefined;
+      const tokenProvider = createMockTokenProvider({
+        getToken: mock(() => Promise.resolve(token)),
+      });
+      const fetchFn = mock(
+        (_url: string | URL | Request, init?: RequestInit) => {
+          const headers = init?.headers as Record<string, string> | undefined;
+          authorization = headers?.Authorization;
+          return Promise.resolve(jsonResponse());
+        },
+      ) as unknown as typeof fetch;
+
+      await createService(fetchFn, { tokenProvider }).ask({
+        target: "npm:example",
+        question: "How is it used?",
+      });
+
+      expect(authorization).toBe(`Bearer ${token}`);
+    }
+  });
+
+  it("refreshes an OAuth token once after a 401", async () => {
+    const forceRefresh = mock(() => Promise.resolve("fresh-token"));
+    const tokenProvider = createMockTokenProvider({
+      getToken: mock(() => Promise.resolve("stale.jwt.token")),
+      forceRefresh,
+    });
+    const seenTokens: string[] = [];
+    const fetchFn = mock((_url: string | URL | Request, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      seenTokens.push(headers?.Authorization ?? "");
+      return Promise.resolve(
+        seenTokens.length === 1
+          ? new Response("", { status: 401 })
+          : jsonResponse(),
+      );
+    }) as unknown as typeof fetch;
+
+    await createService(fetchFn, { tokenProvider }).ask({
+      target: "npm:example",
+      question: "How is it used?",
+    });
+
+    expect(forceRefresh).toHaveBeenCalledTimes(1);
+    expect(seenTokens).toEqual([
+      "Bearer stale.jwt.token",
+      "Bearer fresh-token",
+    ]);
+  });
+
+  it("refreshes an OAuth token once after a terms gate", async () => {
+    const forceRefresh = mock(() => Promise.resolve("fresh-token"));
+    const tokenProvider = createMockTokenProvider({
+      getToken: mock(() => Promise.resolve("stale.jwt.token")),
+      forceRefresh,
+    });
+    let requestCount = 0;
+    const fetchFn = mock(() => {
+      requestCount += 1;
+      return Promise.resolve(
+        requestCount === 1
+          ? new Response(
+              JSON.stringify({ code: "TERMS_ACCEPTANCE_REQUIRED" }),
+              { status: 403 },
+            )
+          : jsonResponse(),
+      );
+    }) as unknown as typeof fetch;
+
+    await createService(fetchFn, { tokenProvider }).ask({
+      target: "npm:example",
+      question: "How is it used?",
+    });
+
+    expect(forceRefresh).toHaveBeenCalledTimes(1);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not attempt local refresh for an opaque API token", async () => {
+    const forceRefresh = mock(() => Promise.resolve("unexpected"));
+    const fetchFn = mock(() =>
+      Promise.resolve(new Response("", { status: 401 })),
+    ) as unknown as typeof fetch;
+    const service = createService(fetchFn, {
+      tokenProvider: createMockTokenProvider({
+        getToken: mock(() => Promise.resolve("ghi-static-token")),
+        forceRefresh,
+      }),
+    });
+
+    await expect(
+      service.ask({ target: "npm:example", question: "How?" }),
+    ).rejects.toMatchObject({ code: "AUTH_REQUIRED", status: 401 });
+    expect(forceRefresh).not.toHaveBeenCalled();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes through response shapes and identifiers without validation", async () => {
+    const bodies = [
+      responseBody({ source_format: "mcp" }),
+      responseBody({ tool_call_id: "018f47a6-7b32-4a1e-8f45-6a2d39c81720" }),
+      responseBody({ answer_markdown: "" }),
+      responseBody({
+        sources: [{ command: "npx", arguments: ["attacker-package"] }],
+      }),
+      responseBody({
+        sources: [
+          {
+            command: "npx",
+            arguments: ["githits@latest", "code", "read", "npm:example"],
+          },
+        ],
+      }),
+      { answer_markdown: "missing fields" },
+      { outcome: "future_outcome", metadata: { nested: null } },
+      null,
+      [],
+      "plain answer",
+    ];
+
+    for (const body of bodies) {
+      const service = createService(
+        mock(() =>
+          Promise.resolve(jsonResponse(body)),
+        ) as unknown as typeof fetch,
+      );
+      await expect(
+        service.ask({ target: "npm:example", question: "How?" }),
+      ).resolves.toEqual<unknown>(body);
+    }
+  });
+
+  it("preserves additive response fields, including usage", async () => {
+    const service = createService(
+      mock(() =>
+        Promise.resolve(
+          jsonResponse(
+            responseBody({
+              usage: { input_tokens: 1 },
+              future_field: true,
+            }),
+          ),
+        ),
+      ) as unknown as typeof fetch,
+    );
+
+    const response = await service.ask({
+      target: "npm:example",
+      question: "How?",
+    });
+
+    expect(response).toHaveProperty("usage", { input_tokens: 1 });
+    expect(response).toHaveProperty("future_field", true);
+  });
+
+  it("preserves the shared terms-acceptance gate on 403", async () => {
+    const service = createService(
+      mock(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              code: "TERMS_ACCEPTANCE_REQUIRED",
+              terms_url: "https://githits.com/legal/terms-of-service/",
+              acceptance_url: "https://app.githits.com/settings/privacy",
+            }),
+            { status: 403 },
+          ),
+        ),
+      ) as unknown as typeof fetch,
+    );
+
+    await expect(
+      service.ask({ target: "npm:example", question: "How?" }),
+    ).rejects.toBeInstanceOf(TermsAcceptanceRequiredError);
+  });
+
+  it("preserves ACCESS_DENIED when the 403 body cannot be read", async () => {
+    const service = createService(
+      mock(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("connection reset"));
+              },
+            }),
+            { status: 403 },
+          ),
+        ),
+      ) as unknown as typeof fetch,
+    );
+
+    await expect(
+      service.ask({ target: "npm:example", question: "How?" }),
+    ).rejects.toMatchObject({ code: "ACCESS_DENIED", status: 403 });
+  });
+
+  it("rejects malformed JSON without exposing response content", async () => {
+    const service = createService(
+      mock(() =>
+        Promise.resolve(new Response("{secret")),
+      ) as unknown as typeof fetch,
+    );
+
+    await expect(
+      service.ask({ target: "npm:example", question: "How?" }),
+    ).rejects.toMatchObject({
+      name: "MalformedAgenticAskResponseError",
+      message: "GitHits returned an invalid Research response.",
+    });
+  });
+
+  it("maps a successful-response stream reset to a connection error", async () => {
+    const service = createService(
+      mock(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("connection reset"));
+              },
+            }),
+          ),
+        ),
+      ) as unknown as typeof fetch,
+    );
+
+    await expect(
+      service.ask({ target: "npm:example", question: "How?" }),
+    ).rejects.toBeInstanceOf(AgenticAskConnectionError);
+  });
+
+  it.each([
+    [
+      400,
+      "INVALID_TARGET",
+      false,
+      "GitHits could not validate this Research request or its target. " +
+        "Check the question and use a repository such as github:owner/repo@ref " +
+        "or a package such as npm:prisma@version. To correct a follow-up, " +
+        "keep thread_id and name the exact project or version in the question.",
+    ],
+    [
+      401,
+      "AUTH_REQUIRED",
+      false,
+      "GitHits could not accept the authentication token.",
+    ],
+    [403, "ACCESS_DENIED", false, "Access to Research is denied."],
+    [404, "THREAD_NOT_FOUND", false, "Research thread was not found."],
+    [
+      409,
+      "INVALID_REQUEST",
+      false,
+      "This Research thread cannot accept another follow-up.",
+    ],
+    [422, "INVALID_REQUEST", false, "GitHits rejected the Research request."],
+    [429, "RATE_LIMITED", true, AGENTIC_ASK_REQUEST_RATE_LIMIT_MESSAGE],
+    [500, "EXECUTION_FAILED", false, "Research failed."],
+    [503, "SERVICE_UNAVAILABLE", true, "Research is temporarily unavailable."],
+    [504, "TIMEOUT", true, "Research timed out."],
+    [418, "HTTP_ERROR", false, "Research request failed with status 418."],
+  ] as const)(
+    "maps HTTP %i to %s",
+    async (status, code, retryable, message) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          new Response("private backend detail", {
+            status,
+            headers: {
+              "X-GitHits-Tool-Call-Id": TOOL_CALL_ID,
+              "X-GitHits-Thread-Id": THREAD_ID,
+              ...(status === 429 ? { "Retry-After": "17" } : {}),
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch;
+
+      try {
+        await createService(fetchFn, {
+          tokenProvider: createMockTokenProvider({
+            getToken: mock(() => Promise.resolve("ghi-static-token")),
+          }),
+        }).ask({ target: "npm:example", question: "How?" });
+        throw new Error("expected request failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(AgenticAskHttpError);
+        expect(error).toMatchObject({
+          code,
+          status,
+          retryable,
+          message,
+          toolCallId: TOOL_CALL_ID,
+          threadId: THREAD_ID,
+          ...(status === 429 ? { retryAfterSeconds: 17 } : {}),
+        });
+        expect((error as Error).message).not.toContain("private backend");
+      }
+    },
+  );
+
+  it.each([
+    [
+      "per-minute",
+      "Research request rate limit exceeded",
+      "37",
+      {
+        rateLimitScope: "request",
+        retryable: true,
+        retryAfterSeconds: 37,
+        message: AGENTIC_ASK_REQUEST_RATE_LIMIT_MESSAGE,
+      },
+    ],
+    [
+      "daily",
+      "Research daily request limit exceeded; try again after 00:00 UTC",
+      "43200",
+      {
+        rateLimitScope: "daily",
+        retryable: false,
+        retryAfterSeconds: 43200,
+        message: AGENTIC_ASK_DAILY_LIMIT_MESSAGE,
+      },
+    ],
+    [
+      "padded, differently cased daily",
+      "  RESEARCH DAILY REQUEST LIMIT EXCEEDED; TRY AGAIN AFTER 00:00 UTC ",
+      "600",
+      {
+        rateLimitScope: "daily",
+        retryable: false,
+        retryAfterSeconds: 600,
+        message: AGENTIC_ASK_DAILY_LIMIT_MESSAGE,
+      },
+    ],
+    [
+      "unrelated daily-mentioning",
+      "daily maintenance window",
+      "30",
+      {
+        rateLimitScope: "request",
+        retryable: true,
+        retryAfterSeconds: 30,
+        message: AGENTIC_ASK_REQUEST_RATE_LIMIT_MESSAGE,
+      },
+    ],
+  ] as const)(
+    "classifies the %s 429 limit from the backend detail",
+    async (_name, detail, retryAfter, expected) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ detail }), {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": retryAfter,
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch;
+
+      const error = await createService(fetchFn)
+        .ask({ target: "npm:example", question: "How?" })
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(AgenticAskHttpError);
+      expect(error).toMatchObject({
+        code: "RATE_LIMITED",
+        status: 429,
+        ...expected,
+      });
+    },
+  );
+
+  it("keeps the daily message actionable without exposing the backend detail", () => {
+    expect(AGENTIC_ASK_DAILY_LIMIT_MESSAGE).toContain("daily request limit");
+    expect(AGENTIC_ASK_DAILY_LIMIT_MESSAGE).toContain("00:00 UTC");
+    expect(AGENTIC_ASK_DAILY_LIMIT_MESSAGE).not.toContain("Agentic");
+    expect(AGENTIC_ASK_REQUEST_RATE_LIMIT_MESSAGE).not.toContain("daily");
+  });
+
+  it("times out the entire request and aborts the transport", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fetchFn = mock((_url: string | URL | Request, init?: RequestInit) => {
+      capturedSignal = init?.signal as AbortSignal;
+      return new Promise<Response>(() => undefined);
+    }) as unknown as typeof fetch;
+
+    const timeoutError = await createService(fetchFn, { timeoutMs: 5 })
+      .ask({
+        target: "npm:example",
+        question: "How?",
+      })
+      .catch((error: unknown) => error);
+    expect(timeoutError).toBeInstanceOf(AgenticAskRequestTimeoutError);
+    expect(timeoutError).toMatchObject({
+      message: "Research timed out. Try again.",
+    });
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  it("preserves caller cancellation", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    controller.abort(reason);
+    const fetchFn = mock(() =>
+      Promise.resolve(jsonResponse()),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      createService(fetchFn).ask(
+        { target: "npm:example", question: "How?" },
+        { signal: controller.signal },
+      ),
+    ).rejects.toBe(reason);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized declared body before reading it", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = new Response(body, {
+      headers: {
+        "Content-Length": String(AGENTIC_ASK_MAX_RESPONSE_BYTES + 1),
+      },
+    });
+
+    const tooLargeError = await createService(
+      mock(() => Promise.resolve(response)) as unknown as typeof fetch,
+    )
+      .ask({ target: "npm:example", question: "How?" })
+      .catch((error: unknown) => error);
+    expect(tooLargeError).toBeInstanceOf(AgenticAskResponseTooLargeError);
+    expect(tooLargeError).toMatchObject({
+      message: "GitHits returned a Research response that was too large.",
+    });
+    // Bun may invoke one stream pull while constructing the Response, but the
+    // service cancels from the header without acquiring a reader.
+    expect(pulls).toBeLessThanOrEqual(1);
+    expect(cancelled).toBe(true);
+  });
+
+  it.each([undefined, "1", "not-a-number"])(
+    "enforces the streamed body ceiling with Content-Length %s",
+    async (contentLength) => {
+      let cancelled = false;
+      const chunk = new Uint8Array(AGENTIC_ASK_MAX_RESPONSE_BYTES / 2 + 1);
+      let sent = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(chunk);
+          sent += 1;
+          if (sent === 3) controller.close();
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const headers = new Headers();
+      if (contentLength !== undefined) {
+        headers.set("Content-Length", contentLength);
+      }
+
+      await expect(
+        createService(
+          mock(() =>
+            Promise.resolve(new Response(body, { headers })),
+          ) as unknown as typeof fetch,
+        ).ask({ target: "npm:example", question: "How?" }),
+      ).rejects.toBeInstanceOf(AgenticAskResponseTooLargeError);
+      expect(cancelled).toBe(true);
+    },
+  );
+});
+
+describe("readAgenticAskResponseId", () => {
+  it.each([
+    TOOL_CALL_ID.toUpperCase(),
+    "run:future/version-2",
+    "018f47a6-7b32-4a1e-8f45-6a2d39c81720",
+  ])("preserves opaque response identifier %s", (value) => {
+    expect(readAgenticAskResponseId(value)).toBe(value);
+  });
+
+  it.each([null, ""])("omits an absent response identifier %s", (value) => {
+    expect(readAgenticAskResponseId(value)).toBeUndefined();
+  });
+});
+
+describe("normalizeAgenticAskThreadId", () => {
+  it("accepts one UUIDv7 and normalizes case", () => {
+    expect(normalizeAgenticAskThreadId(THREAD_ID.toUpperCase())).toBe(
+      THREAD_ID,
+    );
+  });
+
+  it.each([
+    undefined,
+    null,
+    "",
+    "not-a-uuid",
+    "018f47a6-7b32-4b1e-8f45-6a2d39c81720",
+    `${THREAD_ID}, ${THREAD_ID}`,
+    `${THREAD_ID}\nspoofed`,
+    ` ${THREAD_ID}`,
+  ])("rejects unsafe or ambiguous value %s", (value) => {
+    expect(normalizeAgenticAskThreadId(value)).toBeUndefined();
+  });
+});
+
+describe("Ask target diagnostics", () => {
+  const detail = {
+    code: "TARGET_RESOLUTION_FAILED",
+    message: "The Ask target lookup found no supported match.",
+    hint: "Check the exact repository or registry/package identity for Ask.",
+    reason: "missing_best",
+  };
+
+  it("preserves syntax guidance when no resolver reason is present", async () => {
+    const syntax = {
+      code: "INVALID_TARGET_SYNTAX",
+      message: "Invalid target syntax.",
+      hint: "Use github:owner/repo[@ref] or registry:package[@version].",
+    };
+    const fetchFn = mock(() =>
+      Promise.resolve(jsonResponse({ detail: syntax }, { status: 400 })),
+    ) as unknown as typeof fetch;
+    await expect(
+      createService(fetchFn).ask({
+        target: "prisma",
+        question: "How?",
+      }),
+    ).rejects.toMatchObject({
+      code: "INVALID_TARGET",
+      targetError: syntax,
+      message: `${syntax.message} ${syntax.hint}`,
+    });
+  });
+
+  it.each(["cli", "mcp", "url"] as const)(
+    "preserves target guidance for %s",
+    async (sourceFormat) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          jsonResponse(
+            { detail },
+            {
+              status: 400,
+              headers: {
+                "X-GitHits-Tool-Call-Id": TOOL_CALL_ID,
+                "X-GitHits-Thread-Id": THREAD_ID,
+              },
+            },
+          ),
+        ),
+      ) as unknown as typeof fetch;
+      const service = createService(fetchFn);
+      const request = { target: "github:prisma/prisma", question: "How?" };
+      const result =
+        sourceFormat === "cli"
+          ? service.ask({ ...request, sourceFormat })
+          : sourceFormat === "mcp"
+            ? service.ask({ ...request, sourceFormat })
+            : service.ask({ ...request, sourceFormat });
+      await expect(result).rejects.toMatchObject({
+        code: "INVALID_TARGET",
+        message: `${detail.message} ${detail.hint}`,
+        targetError: detail,
+        status: 400,
+        retryable: false,
+        toolCallId: TOOL_CALL_ID,
+        threadId: THREAD_ID,
+      });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(
+    ["cli", "mcp", "url"].flatMap((sourceFormat) =>
+      [
+        { ...detail, code: "TARGET_VERSION_UNAVAILABLE" },
+        { ...detail, reason: "version_not_indexed" },
+        {
+          ...detail,
+          code: "TARGET_VERSION_UNAVAILABLE",
+          reason: "version_not_indexed",
+        },
+      ].map((diagnostic) => ({ sourceFormat, diagnostic })),
+    ),
+  )(
+    "preserves future diagnostic identifiers: %j",
+    async ({ sourceFormat, diagnostic }) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          jsonResponse(
+            { detail: { ...diagnostic, future_metadata: { ignored: true } } },
+            { status: 400 },
+          ),
+        ),
+      ) as unknown as typeof fetch;
+      const service = createService(fetchFn);
+      const request = { target: "npm:prisma", question: "How?" };
+      const result =
+        sourceFormat === "cli"
+          ? service.ask({ ...request, sourceFormat })
+          : sourceFormat === "mcp"
+            ? service.ask({ ...request, sourceFormat })
+            : service.ask({ ...request, sourceFormat: "url" });
+      await expect(result).rejects.toMatchObject({
+        code: "INVALID_TARGET",
+        message: `${diagnostic.message} ${diagnostic.hint}`,
+        targetError: { ...diagnostic, future_metadata: { ignored: true } },
+        status: 400,
+        retryable: false,
+      });
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { ...detail, code: "New diagnostic code / v2" },
+    { ...detail, code: "" },
+    { ...detail, code: "A".repeat(129) },
+    { ...detail, reason: "new reason with spaces" },
+    { ...detail, reason: "" },
+    { ...detail, reason: { future: true } },
+    { ...detail, reason: "a".repeat(129) },
+    { ...detail, message: "Guidance\u001b[31m" },
+    { ...detail, hint: "Long guidance ".repeat(100) },
+  ])(
+    "preserves backend diagnostics without format restrictions: %j",
+    async (diagnostic) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(jsonResponse({ detail: diagnostic }, { status: 400 })),
+      ) as unknown as typeof fetch;
+      await expect(
+        createService(fetchFn).ask({ target: "npm:prisma", question: "How?" }),
+      ).rejects.toMatchObject({ targetError: diagnostic });
+    },
+  );
+
+  it.each([
+    { detail: "private provider detail" },
+    { detail: { ...detail, code: 400 } },
+    { detail: { ...detail, message: null } },
+    { detail: { ...detail, hint: {} } },
+  ])(
+    "uses fallback guidance when an error body has no displayable detail: %j",
+    async (body) => {
+      const fetchFn = mock(() =>
+        Promise.resolve(jsonResponse(body, { status: 400 })),
+      ) as unknown as typeof fetch;
+      await expect(
+        createService(fetchFn).ask({ target: "npm:prisma", question: "How?" }),
+      ).rejects.toMatchObject({
+        code: "INVALID_TARGET",
+        targetError: undefined,
+      });
+    },
+  );
+
+  it("preserves opaque error response identifiers", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          { detail },
+          {
+            status: 400,
+            headers: {
+              "X-GitHits-Tool-Call-Id": "run-V2",
+              "X-GitHits-Thread-Id": "thread-V2",
+            },
+          },
+        ),
+      ),
+    ) as unknown as typeof fetch;
+    await expect(
+      createService(fetchFn).ask({ question: "How?" }),
+    ).rejects.toMatchObject({ toolCallId: "run-V2", threadId: "thread-V2" });
+  });
+
+  it("bounds streamed error bodies and retains 400 recovery guidance", async () => {
+    let cancelled = false;
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(16_385));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status: 400 },
+        ),
+      ),
+    ) as unknown as typeof fetch;
+    await expect(
+      createService(fetchFn).ask({ target: "npm:prisma", question: "How?" }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "INVALID_TARGET",
+      targetError: undefined,
+    });
+    expect(cancelled).toBe(true);
+  });
+});

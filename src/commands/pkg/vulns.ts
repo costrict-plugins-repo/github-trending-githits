@@ -1,0 +1,177 @@
+import type { PackageIntelligenceService } from "@githits/core-internal";
+import {
+  buildPackageVulnerabilitiesParams,
+  buildPackageVulnerabilitiesSuccessPayload,
+  formatPackageVulnerabilitiesTerminal,
+  InvalidPackageSpecError,
+  parsePackageSpec,
+  requireAuth,
+  shouldUseColors,
+} from "@githits/mcp/internal";
+import type { Command } from "commander";
+import { createContainer } from "../../container.js";
+import { mapPackageIntelligenceErrorForCli } from "../../shared/cli-error-diagnostics.js";
+import {
+  buildCliMappedErrorPayload,
+  formatMappedErrorForTerminal,
+} from "../format-mapped-error.js";
+
+export interface PkgVulnsCommandOptions {
+  severity?: string;
+  scope?: string;
+  includeWithdrawn?: boolean;
+  transitive?: boolean;
+  verbose?: boolean;
+  json?: boolean;
+}
+
+export interface PkgVulnsCommandDependencies {
+  packageIntelligenceService: PackageIntelligenceService | undefined;
+  codeNavigationUrl: string | undefined;
+  hasValidToken: boolean;
+  mcpUrl: string;
+}
+
+/**
+ * Core `pkg vulns` action. Accepts `<spec>@<version>` (unlike `pkg
+ * info`, which always returns latest). Version flows through to the
+ * backend; `minSeverity`, `includeWithdrawn`, and opt-in `includeTransitive`
+ * likewise go to the wire. No client-side filtering — backend is single
+ * source of truth.
+ */
+export async function pkgVulnsAction(
+  spec: string,
+  options: PkgVulnsCommandOptions,
+  deps: PkgVulnsCommandDependencies,
+): Promise<void> {
+  try {
+    requireAuth(deps);
+  } catch (error) {
+    if (options.json) handlePkgVulnsCommandError(error, true);
+    throw error;
+  }
+
+  try {
+    if (!deps.codeNavigationUrl || !deps.packageIntelligenceService) {
+      throw new InvalidPackageSpecError(
+        "Package intelligence is not configured for this environment.",
+      );
+    }
+
+    const parsed = parsePackageSpec(spec);
+    const { params: builtParams, filter } = buildPackageVulnerabilitiesParams({
+      registry: parsed.registry,
+      packageName: parsed.name,
+      version: parsed.version,
+      minSeverity: options.severity,
+      includeWithdrawn: options.includeWithdrawn,
+      includeTransitive: options.transitive,
+      advisoryScope: options.scope,
+    });
+    const params = {
+      ...builtParams,
+      includeTransitiveAdvisoryDetails:
+        options.json === true ||
+        (options.verbose === true &&
+          (builtParams.advisoryScope ?? "AFFECTED") !== "AFFECTED"),
+    };
+    const report =
+      await deps.packageIntelligenceService.packageVulnerabilities(params);
+
+    if (options.json) {
+      const payload = buildPackageVulnerabilitiesSuccessPayload(report, {
+        requestedVersion: params.version,
+        filter,
+      });
+      console.log(JSON.stringify(payload));
+      return;
+    }
+
+    const output = formatPackageVulnerabilitiesTerminal(report, {
+      verbose: options.verbose,
+      useColors: shouldUseColors(),
+      requestedVersion: params.version,
+      filter,
+      surface: "cli",
+      terminalWidth: process.stdout.columns,
+    });
+    process.stdout.write(output);
+  } catch (error) {
+    handlePkgVulnsCommandError(error, options.json ?? false);
+  }
+}
+
+function handlePkgVulnsCommandError(error: unknown, json: boolean): never {
+  const mapped = mapPackageIntelligenceErrorForCli(error);
+
+  if (json) {
+    console.error(JSON.stringify(buildCliMappedErrorPayload(mapped)));
+    process.exit(1);
+  }
+
+  console.error(formatMappedErrorForTerminal(mapped));
+  process.exit(1);
+}
+
+const PKG_VULNS_DESCRIPTION = `Show known vulnerabilities for a package. Lists CVE / OSV advisories
+with severity, affected version ranges, and fix versions. CLI text shows every
+selected direct and transitive advisory row. --verbose adds aliases, dates where
+relevant, malicious-advisory markers, and complete range/fix evidence without
+changing row completeness. --json emits the complete structured envelope.
+
+Package spec: <registry>:<name>[@<version>]. Supported registries:
+npm, pypi, hex, crates, nuget, maven, packagist, rubygems, go, swift. vcpkg and zig are not supported.
+Omit @<version> to check the latest release.
+Example: githits pkg vulns npm:lodash@4.17.20 --severity high
+
+Severity filter (--severity) and withdrawn-advisory visibility
+(--include-withdrawn) are passed through to the backend; the
+returned count reflects whatever survived the filter and active filters
+are echoed in text and JSON output. Use --scope non_affecting to list
+non-affecting advisories that do not affect the inspected version, or --scope all
+to list all package advisories, including unknown assessments. Use --scope unknown
+to list advisories that could not be evaluated, with reasons.
+
+Use --transitive for npm-audit-style evidence covering vulnerabilities in versions
+resolved by the dependency graph. This opt-in adds graph-analysis cost and is
+distinct from package-wide advisory history. --severity and --scope apply to direct
+and transitive rows. --include-withdrawn affects direct package rows only; transitive
+withdrawn advisories remain excluded.`;
+
+export function registerPkgVulnsCommand(pkgCommand: Command): Command {
+  return pkgCommand
+    .command("vulns")
+    .summary("List known vulnerabilities for a package")
+    .description(PKG_VULNS_DESCRIPTION)
+    .argument("<spec>", "Package spec, e.g. npm:express or npm:express@4.18.0")
+    .option(
+      "-s, --severity <level>",
+      "Only show advisories at or above this severity (low, medium, high, critical). Omit to see all.",
+    )
+    .option(
+      "--scope <scope>",
+      "Advisory rows to return: affected, non_affecting, unknown, all (default: affected)",
+    )
+    .option(
+      "--include-withdrawn",
+      "Include retracted advisories (default: off)",
+    )
+    .option(
+      "--transitive",
+      "Audit vulnerabilities in versions resolved by the dependency graph (opt-in; adds graph-analysis cost)",
+    )
+    .option(
+      "-v, --verbose",
+      "Add aliases, dates where relevant, malicious-advisory markers, and complete range/fix evidence; row count is unchanged",
+    )
+    .option("--json", "Emit the lean JSON envelope")
+    .action(async (spec: string, options: PkgVulnsCommandOptions) => {
+      const deps = await createContainer();
+      await pkgVulnsAction(spec, options, {
+        packageIntelligenceService: deps.packageIntelligenceService,
+        codeNavigationUrl: deps.codeNavigationUrl,
+        hasValidToken: deps.hasValidToken,
+        mcpUrl: deps.mcpUrl,
+      });
+    });
+}

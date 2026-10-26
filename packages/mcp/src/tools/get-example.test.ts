@@ -1,0 +1,220 @@
+import { describe, expect, it, mock } from "bun:test";
+import {
+  ApiRateLimitError,
+  AuthenticationError,
+  FetchTimeoutError,
+} from "@githits/core-internal";
+import { createMockGitHitsService } from "../services/test-helpers.js";
+import { createGetExampleTool } from "./get-example.js";
+
+describe("getExampleTool", () => {
+  it.each([
+    { name: "omitted", format: undefined },
+    { name: "text", format: "text" as const },
+    { name: "json", format: "json" as const },
+  ])("formats authentication failures when format is $name", async (mode) => {
+    const search = mock(() =>
+      Promise.reject(
+        new AuthenticationError("The host token was rejected.", "server"),
+      ),
+    );
+    const tool = createGetExampleTool(createMockGitHitsService({ search }));
+    const result = await tool.handler(
+      {
+        query: "host authentication",
+        ...(mode.format === undefined ? {} : { format: mode.format }),
+      },
+      {},
+    );
+    const content = result.content[0]?.text ?? "";
+
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(result.isError).toBe(true);
+    if (mode.format === "json") {
+      expect(JSON.parse(content)).toEqual({
+        error: "The host token was rejected.",
+        code: "AUTH_REQUIRED",
+        retryable: false,
+        details: {
+          authSource: "server",
+          action:
+            "Re-authenticate with `githits login` or update GITHITS_API_TOKEN if set. If this persists, contact support@githits.com.",
+        },
+      });
+      return;
+    }
+
+    expect(content).toContain("The host token was rejected.");
+    expect(content).toContain(
+      "Re-authenticate with `githits login` or update GITHITS_API_TOKEN if set.",
+    );
+    expect(content).toContain("contact support@githits.com.");
+    expect(content).not.toContain('"code":"AUTH_REQUIRED"');
+  });
+
+  it("tells agents to report source repository provenance", () => {
+    const tool = createGetExampleTool(createMockGitHitsService());
+
+    expect(tool.annotations.readOnlyHint).toBe(true);
+    expect(tool.description).not.toContain("feedback");
+    expect(tool.description).toContain("when no single target is the answer");
+    expect(tool.description).toContain("source repository provenance");
+    expect(tool.description).toContain("generated references");
+    expect(tool.schema.format?.description).toBe(
+      "Omit `format` to use token-efficient text when the model reads the result or chooses follow-up tools. Set `json` only when code consumes the raw response instead of the model, or a required field is absent from text.",
+    );
+    expect(tool.schema.license_mode?.description).toContain(
+      "`yolo` disables filtering",
+    );
+    expect(tool.schema.language?.description).toContain("Omit to infer it");
+    expect(tool.schema.language?.description).toContain(
+      "suggested language from the error",
+    );
+    expect(tool.description).toContain(
+      "markdown with source repository provenance",
+    );
+    expect(tool.description).not.toContain("suggested language from the error");
+    expect(tool.description).not.toContain("search_language");
+  });
+
+  it("returns markdown result from service", async () => {
+    const service = createMockGitHitsService();
+    const tool = createGetExampleTool(service);
+
+    const result = await tool.handler(
+      { query: "hello world", language: "javascript" },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain("# Example");
+    expect(result.content[0]?.text).not.toContain('{"result"');
+  });
+
+  it("returns JSON envelope when format=json", async () => {
+    const service = createMockGitHitsService();
+    const tool = createGetExampleTool(service);
+
+    const result = await tool.handler(
+      { query: "hello world", language: "javascript", format: "json" },
+      {},
+    );
+
+    const payload = JSON.parse(result.content[0]?.text ?? "{}");
+    expect(payload.result).toContain("# Example");
+    expect(payload.solution_id).toBeUndefined();
+  });
+
+  it("passes license_mode to service", async () => {
+    const searchFn = mock(() => Promise.resolve("result"));
+    const service = createMockGitHitsService({ search: searchFn });
+    const tool = createGetExampleTool(service);
+
+    await tool.handler(
+      { query: "test", language: "python", license_mode: "yolo" },
+      {},
+    );
+
+    expect(searchFn).toHaveBeenCalledWith({
+      query: "test",
+      language: "python",
+      licenseMode: "yolo",
+      includeExplanation: false,
+      sourceFormat: "mcp",
+    });
+  });
+
+  it("allows language to be omitted", async () => {
+    const searchFn = mock(() => Promise.resolve("result"));
+    const service = createMockGitHitsService({ search: searchFn });
+    const tool = createGetExampleTool(service);
+
+    await tool.handler({ query: "test" }, {});
+
+    expect(searchFn).toHaveBeenCalledWith({
+      query: "test",
+      language: undefined,
+      licenseMode: undefined,
+      includeExplanation: false,
+      sourceFormat: "mcp",
+    });
+  });
+
+  it("forwards the execution signal as the service request signal", async () => {
+    const searchFn = mock(() => Promise.resolve("result"));
+    const service = createMockGitHitsService({ search: searchFn });
+    const tool = createGetExampleTool(service);
+    const signal = new AbortController().signal;
+
+    await tool.handler({ query: "test" }, { signal });
+
+    expect(searchFn).toHaveBeenCalledWith(
+      {
+        query: "test",
+        language: undefined,
+        licenseMode: undefined,
+        includeExplanation: false,
+        sourceFormat: "mcp",
+      },
+      { signal },
+    );
+  });
+
+  it("returns error result on service failure", async () => {
+    const service = createMockGitHitsService({
+      search: mock(() => Promise.reject(new Error("Network error"))),
+    });
+    const tool = createGetExampleTool(service);
+
+    const result = await tool.handler(
+      { query: "test", language: "python", format: "json" },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: "Failed to get example: Network error",
+      code: "UNKNOWN",
+      retryable: false,
+    });
+  });
+
+  it("returns a retryable rate-limit envelope with retry timing", async () => {
+    const service = createMockGitHitsService({
+      search: mock(() =>
+        Promise.reject(new ApiRateLimitError("Request rate limited.", 17)),
+      ),
+    });
+    const tool = createGetExampleTool(service);
+
+    const result = await tool.handler({ query: "test", format: "json" }, {});
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: "Request rate limited.",
+      code: "RATE_LIMITED",
+      retryable: true,
+      details: {
+        status: 429,
+        retryAfterSeconds: 17,
+      },
+    });
+  });
+
+  it("returns a retryable timeout envelope with timeout metadata", async () => {
+    const service = createMockGitHitsService({
+      search: mock(() => Promise.reject(new FetchTimeoutError(2_500))),
+    });
+    const tool = createGetExampleTool(service);
+
+    const result = await tool.handler({ query: "test", format: "json" }, {});
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: "Failed to get example: Request timed out after 2500ms.",
+      code: "TIMEOUT",
+      retryable: true,
+      details: { timeoutMs: 2_500 },
+    });
+  });
+});

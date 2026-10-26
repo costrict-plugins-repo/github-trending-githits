@@ -1,0 +1,527 @@
+import { describe, expect, it } from "bun:test";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { buildMcpQuickStart } from "@githits/mcp";
+import { parse as parseYaml } from "yaml";
+
+const root = join(import.meta.dir, "..");
+const onboardingSkillPath = join(
+  root,
+  "skills",
+  "githits-onboarding",
+  "SKILL.md",
+);
+const troubleshootingPath = join(
+  root,
+  "skills",
+  "githits-onboarding",
+  "references",
+  "troubleshooting.md",
+);
+const githitsMcpSkillPath = join(root, "skills", "githits-mcp", "SKILL.md");
+const githitsCodeSkillPath = join(root, "skills", "githits-code", "SKILL.md");
+const githitsCodeReferencePath = join(
+  root,
+  "skills",
+  "githits-code",
+  "references",
+  "code-and-docs.md",
+);
+const githitsPackageReferencePath = join(
+  root,
+  "skills",
+  "githits-package",
+  "references",
+  "package.md",
+);
+const pluginMaintenanceSkillPath = join(
+  root,
+  ".agents",
+  "skills",
+  "githits-plugin-maintenance",
+  "SKILL.md",
+);
+const braintrustAgentEvalsSkillPath = join(
+  root,
+  ".agents",
+  "skills",
+  "braintrust-agent-evals",
+  "SKILL.md",
+);
+async function read(path: string): Promise<string> {
+  return readFile(path, "utf8");
+}
+
+function expectContainsAll(content: string, expected: string[]): void {
+  for (const text of expected) {
+    expect(content).toContain(text);
+  }
+}
+
+function expectContainsAllIgnoringWhitespace(
+  content: string,
+  expected: string[],
+): void {
+  const normalizedContent = content.replace(/\s+/g, " ");
+  for (const text of expected) {
+    expect(normalizedContent).toContain(text.replace(/\s+/g, " "));
+  }
+}
+
+function expectNotContainsAllIgnoringWhitespace(
+  content: string,
+  forbidden: string[],
+): void {
+  const normalizedContent = content.replace(/\s+/g, " ");
+  for (const text of forbidden) {
+    expect(normalizedContent).not.toContain(text.replace(/\s+/g, " "));
+  }
+}
+
+describe("agent skills packaging", () => {
+  it("documents canonical target guidance for package and repository scope", async () => {
+    const [mcpContent, codeReference, packageReference] = await Promise.all([
+      read(githitsMcpSkillPath),
+      read(githitsCodeReferencePath),
+      read(githitsPackageReferencePath),
+    ]);
+
+    for (const content of [mcpContent, codeReference]) {
+      expectContainsAll(content, [
+        "swift:github.com/<owner>/<repo>",
+        "zig:gh/<owner>/<repo>",
+        "package subpath",
+        "repositories or sibling packages",
+      ]);
+    }
+    expectContainsAll(codeReference, ["public repository"]);
+
+    expectContainsAll(packageReference, [
+      "swift:github.com/<owner>/<repo>",
+      "zig:gh/<owner>/<repo>",
+    ]);
+
+    expectContainsAll(codeReference, [
+      "Repository refs use an @ suffix and may themselves contain / and @; # is reserved for semantic fragments.",
+    ]);
+    expectNotContainsAllIgnoringWhitespace(codeReference, [
+      "Refs may contain / and @ after # or @",
+      "[#ref|@ref]",
+    ]);
+  });
+
+  it("packages a public githits-onboarding skill with setup-focused frontmatter", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "name: githits-onboarding",
+      "Use when the user asks to",
+      "install",
+      "connect",
+      "configure",
+      "sign in",
+      "sign up",
+      "start using GitHits",
+      "setup recovery",
+      "compatibility:",
+    ]);
+  });
+
+  it("documents current onboarding commands without inventing auth JSON", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "Use `npx -y githits@latest ...` for every normal onboarding command.",
+      "guarantees the latest published GitHits CLI behavior",
+      "Do not use a globally installed `githits` binary",
+      "local, dev, or pinned CLI build",
+      "npx -y githits@latest auth status",
+      "npx -y githits@latest init --detect-agents --json",
+      "npx -y githits@latest init --project --detect-agents --json",
+      "npx -y githits@latest init --install-agents",
+      "npx -y githits@latest init --project --install-agents",
+      "npx -y githits@latest login",
+      "npx -y githits@latest login --no-browser",
+      "also prints a fallback sign-in URL",
+    ]);
+    expect(content).not.toContain("command -v githits");
+    expect(content).not.toContain("{GITHITS}");
+    expect(content).not.toContain("auth status --json");
+  });
+
+  it("keeps onboarding auth and setup safety guardrails", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "browser OAuth",
+      "browser tab",
+      "passwords",
+      "OAuth codes",
+      "cookies",
+      "access tokens",
+      "refresh tokens",
+      "API keys",
+      "Ask before writing configuration",
+      "Ask before launching browser OAuth",
+      "surface the printed sign-in URL clearly",
+      "relay the URL verbatim",
+      "Do not run `init -y` or `init --yes` unless the user explicitly asks",
+    ]);
+  });
+
+  it("frames onboarding as new-user signup with configure-all as the default", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "new-user onboarding skill",
+      "Configure all actionable tools (Recommended)",
+      "recommended default option",
+      "selective setup option",
+      'Do not present "configure none" as a normal onboarding choice',
+      "Start GitHits sign-in/signup during onboarding",
+      "Do not ask whether the user wants to log in",
+      "Login creates or connects the GitHits account",
+    ]);
+    expect(content).not.toContain(
+      "If auth is required, ask before launching browser login",
+    );
+  });
+
+  it("uses project-vs-user setup scope and structured choices instead of freeform IDs", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "structured choice",
+      "Do not ask the user to type",
+      "My user account (Recommended)",
+      "This project only",
+      "project-local MCP",
+      "may be committed",
+      "unsupported_project_config",
+      "Do not ask the user to type comma-separated tool IDs unless the current agent interface has no structured choice mechanism.",
+    ]);
+  });
+
+  it("keeps Codex-style onboarding commands inline and avoids inferred install IDs", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "Run onboarding commands inline",
+      "Do not delegate",
+      "do not use subagents",
+      "subagents",
+      "background",
+      "background terminals",
+      "Do not start `npx -y githits@latest init --detect-agents --json` as a background task",
+      "Do not run `pkill`",
+      "Run detection inline",
+      "Wait for JSON",
+      "official detection fails",
+      "do not inspect package internals",
+      "manually probe tools to infer install IDs",
+      "stop and report that GitHits CLI is unavailable",
+    ]);
+  });
+
+  it("includes onboarding troubleshooting for known recovery paths", async () => {
+    const content = await read(troubleshootingPath);
+
+    expectContainsAll(content, [
+      "Authentication Timeout",
+      "keychain",
+      "login --no-browser",
+      "GITHITS_API_TOKEN",
+      "GITHITS_AUTH_STORAGE=file",
+      "plaintext",
+      "Do not fall back to a globally installed CLI",
+      "user explicitly requested that testing mode",
+      "CLI-emitted verification instruction",
+      "Preserve `--project`",
+      "`--no-guidance`",
+      "Skip local CLI authentication for Cursor-only setup",
+      "Cursor-managed OAuth and tool discovery",
+    ]);
+  });
+
+  it("keeps retired feedback workflows out of public skills", async () => {
+    const skillsRoot = join(root, "skills");
+    const paths = await readdir(skillsRoot, { recursive: true });
+    for (const path of paths.filter((path) => path.endsWith(".md"))) {
+      expect(await read(join(skillsRoot, path)), path).not.toMatch(
+        /\bfeedback\b/i,
+      );
+    }
+  });
+
+  it("keeps install review and guidance repair behavior in the canonical onboarding skill", async () => {
+    const content = await read(onboardingSkillPath);
+
+    expectContainsAll(content, [
+      "actionableIds",
+      "use `installableIds` for MCP setup",
+      "do not infer guidance-only repair",
+      "guidance repair",
+      "GitHits queries and public package, repository, and documentation targets are sent to GitHits services",
+      "does not itself upload the local workspace",
+      "new coding-agent session",
+      "terminal and machine do not need to be restarted",
+      "every agent is `not_detected`",
+      "stop before review, installation, or authentication",
+      "offer user-level detection",
+      "continue only with supported agents",
+      "at least one supported agent is `already_configured`",
+      "execute `suggestedCommand` exactly",
+      "preserve `--no-guidance`",
+      "Follow the CLI-emitted verification instruction",
+      "acknowledges the install review",
+      "stop onboarding without installing or starting authentication",
+      "https://mcp.githits.com",
+      "Cursor-managed OAuth",
+      "cursor-agent mcp list-tools GitHits",
+      "new Cursor Agent chat",
+    ]);
+    const reviewIndex = content.indexOf("show the install review before");
+    const classificationIndex = content.indexOf(
+      "Before showing the review, classify",
+    );
+    const approvalIndex = content.indexOf("Ask before writing configuration");
+    const authIndex = content.indexOf("Start GitHits sign-in/signup");
+    expect(classificationIndex).toBeGreaterThanOrEqual(0);
+    expect(reviewIndex).toBeGreaterThan(classificationIndex);
+    expect(approvalIndex).toBeGreaterThan(reviewIndex);
+    expect(authIndex).toBeGreaterThan(approvalIndex);
+  });
+
+  it("packages the canonical GitHits MCP skill as the exact quick-start guide", async () => {
+    const publicContent = (await read(githitsMcpSkillPath)).replace(
+      /\r\n/g,
+      "\n",
+    );
+    const frontmatterEnd = "\n---\n\n";
+    const bodyIndex = publicContent.indexOf(frontmatterEnd);
+    expect(publicContent.startsWith("---\n")).toBe(true);
+    expect(bodyIndex).toBeGreaterThan(0);
+    const body = publicContent
+      .slice(bodyIndex + frontmatterEnd.length)
+      .replace(/\n$/, "");
+
+    expect(body).toBe(buildMcpQuickStart());
+    expectContainsAllIgnoringWhitespace(publicContent, [
+      "name: githits-mcp",
+      "Route open-source code, documentation, examples, and package questions to GitHits tools",
+      "Read this skill before searching for or selecting GitHits evidence tools",
+      "it identifies the tool to discover and the scope to use",
+      "once either is loaded, do not call `quick_start`",
+    ]);
+    expectNotContainsAllIgnoringWhitespace(publicContent, [
+      "public OSS",
+      "call `quick_start` once per session",
+      "Experimental",
+      "githits-code",
+      "githits-package",
+      "Local experimental tools",
+      "**Issue reporting",
+    ]);
+  });
+
+  it("keeps CLI skill triggers transport-specific and domain-separated", async () => {
+    const [codeContent, packageContent] = await Promise.all([
+      read(githitsCodeSkillPath),
+      read(join(root, "skills", "githits-package", "SKILL.md")),
+    ]);
+
+    expectContainsAllIgnoringWhitespace(codeContent, [
+      "Use whenever invoking the GitHits CLI",
+      "code, documentation, or example evidence",
+      "For GitHits CLI package, dependency, security, release, or upgrade evidence, use githits-package",
+    ]);
+    expectContainsAllIgnoringWhitespace(packageContent, [
+      "Use whenever invoking the GitHits CLI",
+      "package or dependency evidence",
+      "vulnerabilities",
+      "upgrade reviews",
+    ]);
+  });
+
+  it("maps CLI inventories to the current MCP list tool", async () => {
+    const reference = await read(
+      join(root, "skills", "githits-code", "references", "code-and-docs.md"),
+    );
+
+    expect(reference).toContain("`githits list` maps to MCP `list`");
+    expect(reference).toContain(
+      "use MCP `list` for package or repository inventories",
+    );
+    expect(reference).not.toContain("MCP retains `code_files` and `docs_list`");
+    expect(reference).not.toContain("maps to MCP `docs_list`");
+  });
+
+  it("keeps CLI model-read output in text", async () => {
+    const [codeContent, packageContent, packageReference] = await Promise.all([
+      read(githitsCodeSkillPath),
+      read(join(root, "skills", "githits-package", "SKILL.md")),
+      read(githitsPackageReferencePath),
+    ]);
+    const skills = [
+      ["githits-code", codeContent],
+      ["githits-package", packageContent],
+    ] as const;
+    const jsonPolicy =
+      "Use `--json` only when code consumes the raw response or text omits a required field";
+
+    expectContainsAllIgnoringWhitespace(codeContent, [
+      "Keep default text when the model reads results or chooses follow-ups",
+      jsonPolicy,
+    ]);
+    expectContainsAllIgnoringWhitespace(packageContent, [
+      "Keep default text for model-read summaries, comparisons, and counts",
+      jsonPolicy,
+    ]);
+    expectContainsAllIgnoringWhitespace(packageReference, [
+      "Use `--json` only for code consuming raw fields or required fields absent from text.",
+    ]);
+
+    for (const [name, content] of skills) {
+      expectNotContainsAllIgnoringWhitespace(content, [
+        "Prefer structured JSON for final comparisons",
+        "Use JSON for comparisons and counting",
+        "Use `--json` when comparing versions, counting vulnerabilities, or extracting fields.",
+        "Use `--json` when you need stable fields to parse or chain into another command.",
+      ]);
+      expect(content, name).not.toContain("githits-mcp");
+      expect(content, name).toContain("## External Content Posture");
+
+      for (const lineEnding of ["\n", "\r\n"] as const) {
+        const platformContent = content.replace(/\r?\n/g, lineEnding);
+        const coreCommands = platformContent.match(
+          /## Core Commands\s+```bash\r?\n([\s\S]*?)\r?\n```/,
+        );
+        const label = `${name} ${JSON.stringify(lineEnding)}`;
+        expect(coreCommands, label).not.toBeNull();
+        expect(coreCommands?.[1], label).not.toContain("--json");
+      }
+    }
+  });
+
+  it("keeps code skill documentation reads aligned with headers and exact JSON actions", async () => {
+    const [content, reference] = await Promise.all([
+      read(githitsCodeSkillPath),
+      read(
+        join(root, "skills", "githits-code", "references", "code-and-docs.md"),
+      ),
+    ]);
+
+    for (const guidance of [content, reference]) {
+      expectContainsAll(guidance, [
+        "use the search snippet when sufficient; otherwise read the page target in its header",
+        "then replay its `followUp` with every supplied argument unchanged",
+        "From `docs list`, pass `docsReadTarget`",
+        "Hosted/crawled HTTP(S) targets address mutable current content",
+        "A direct HTTP(S) fragment read without explicit bounds returns its heading and full subtree through the next equal-or-higher heading",
+        "Repository docs remain snapshot-addressed and keep returned ranges",
+        "When composing a direct read, add `--lines` only to intentionally select a current page range",
+        "Use `--json` only for required range/source metadata",
+      ]);
+      expect(guidance).not.toContain("without search bounds");
+      expect(guidance).not.toContain(
+        "pass the displayed `[docs page]` target unchanged",
+      );
+    }
+    expect(content).toContain("githits read <docsReadTarget>");
+    expect(content).toContain(
+      "githits read <docsReadTarget> --selector <heading-id>",
+    );
+    expect(content).not.toContain("githits read <docsReadTarget> --lines");
+  });
+
+  it("requires generated plugin asset validation before package creation", async () => {
+    const packageJson = JSON.parse(await read(join(root, "package.json"))) as {
+      scripts?: Record<string, string>;
+      files?: string[];
+    };
+
+    expect(packageJson.scripts?.["plugins:generate"]).toContain(
+      "scripts/generate-plugin-assets.ts",
+    );
+    expect(packageJson.scripts?.["plugins:check"]).toContain("--check");
+    expect(packageJson.scripts?.prepack).toBe("bun run plugins:check");
+    expect(packageJson.scripts?.postpack).toBeUndefined();
+    expect(packageJson.files).toContain("skills");
+    expect(packageJson.files).toContain(".codex-plugin");
+    expect(packageJson.files).toContain("plugin.json");
+    expect(packageJson.files).toContain("mcp.json");
+    expect(packageJson.files).toContain("mcp_config.json");
+    expect(packageJson.files).toContain("githits-icon.svg");
+    expect(packageJson.files).not.toContain(".agents");
+    expect(packageJson.files).not.toContain("plugins");
+    expect(packageJson.files).not.toContain("commands");
+  });
+
+  it("keeps the plugin maintenance skill repository-internal", async () => {
+    const content = await read(pluginMaintenanceSkillPath);
+
+    expectContainsAll(content, [
+      "Internal repository-maintenance skill",
+      "internal, repository-only skill",
+      "Do not publish or package it",
+    ]);
+  });
+
+  it("keeps the Braintrust eval skill repository-internal", async () => {
+    const content = await read(braintrustAgentEvalsSkillPath);
+    const match = content.match(/^---\r?\n(.*?)\r?\n---/s);
+
+    expect(match).not.toBe(null);
+
+    const parsed = parseYaml(match?.[1] ?? "") as {
+      metadata?: { internal?: boolean };
+    };
+
+    expect(parsed.metadata?.internal).toBe(true);
+  });
+
+  it("has valid YAML frontmatter in every public skill SKILL.md", async () => {
+    const skillsDir = join(root, "skills");
+    const entries = await readdir(skillsDir, { withFileTypes: true });
+    const skillDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+
+    expect(skillDirs.length).toBeGreaterThanOrEqual(4);
+
+    for (const dir of skillDirs) {
+      const skillPath = join(skillsDir, dir, "SKILL.md");
+      const content = await read(skillPath);
+
+      const match = content.match(/^---\r?\n(.*?)\r?\n---/s);
+      expect(
+        match,
+        `${dir}/SKILL.md must start with YAML frontmatter`,
+      ).not.toBe(null);
+
+      const frontmatter = match?.[1] ?? "";
+      let parsed: unknown;
+      try {
+        parsed = parseYaml(frontmatter);
+      } catch (e) {
+        throw new Error(
+          `${dir}/SKILL.md has invalid YAML frontmatter: ${(e as Error).message}`,
+        );
+      }
+
+      expect(
+        typeof parsed,
+        `${dir}/SKILL.md frontmatter must parse to an object`,
+      ).toBe("object");
+      const record = parsed as Record<string, unknown>;
+      expect(record.name, `${dir}/SKILL.md must have a name`).toBeDefined();
+      expect(
+        record.description,
+        `${dir}/SKILL.md must have a description`,
+      ).toBeDefined();
+      const metadata = record.metadata as Record<string, unknown> | undefined;
+      expect(
+        metadata?.internal,
+        `${dir}/SKILL.md must remain publicly discoverable`,
+      ).not.toBe(true);
+    }
+  });
+});

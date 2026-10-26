@@ -1,0 +1,3110 @@
+import { fileURLToPath } from "node:url";
+import {
+  buildCliDocsReadCommand,
+  shellQuoteExact,
+} from "@githits/mcp/internal";
+import { isResolveDirectTargetUnwarned } from "@githits/mcp/smoke-test";
+import {
+  createIsolatedSmokeEnvironment,
+  createScopedSmokeEnvironment,
+  writeSmokeConfig,
+} from "./smoke-environment.ts";
+import {
+  appendCliArgs,
+  type CliLaunchTarget,
+  formatCliLaunchTarget,
+  forwardedCliEntryArgs,
+  parseCliLaunchTarget,
+  SOURCE_CLI_LAUNCH_TARGET,
+} from "./smoke-launch-target.ts";
+import {
+  formatCliCommand,
+  mapWithConcurrency,
+  printSmokeTimingSummary,
+  trackSmokeStep,
+} from "./smoke-telemetry.ts";
+
+interface CommandResult {
+  command: string[];
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+interface ErrorEnvelope {
+  error: string;
+  code: string;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+}
+
+export interface CliSmokeOptions {
+  mode: "live" | "unauthenticated";
+  target: CliLaunchTarget;
+}
+
+export type CliLiveCohortStatus = "passed" | "skipped";
+
+export function formatCliLiveCohortSummary(
+  stable: CliLiveCohortStatus,
+): string {
+  return stable === "passed"
+    ? "CLI smoke passed: stable live cohort passed"
+    : "CLI smoke skipped: stable live cohort skipped (AUTH_REQUIRED)";
+}
+
+interface JsonParityFixture {
+  name: string;
+  cliArgs: string[];
+  mcpTool: string;
+  mcpArgs: Record<string, unknown>;
+  expectedStatus?: string;
+}
+
+const DEFAULT_TEXT_LIMIT = 20_000;
+const TARGET_DETAIL_STATE_PATTERN =
+  /^ {2}(?:(?:indexing|searched|available|unavailable|using):|(?:ready|pending|provisional|older snapshot)$|(?:not found|unresolved|version unavailable|repository ref unresolved|(?:package|repository|site|target) (?:not found|unresolved)):)/;
+const JSON_PARITY_CONCURRENCY = 2;
+const SMOKE_PACKAGE_SPEC = "npm:express@5.2.1";
+const SMOKE_TRANSITIVE_VULNERABILITY_SPEC = "npm:express@4.17.1";
+let cliLaunchTarget = SOURCE_CLI_LAUNCH_TARGET;
+
+export const EXPECTED_STABLE_TOP_LEVEL_COMMANDS = [
+  "init",
+  "uninstall",
+  "login",
+  "logout",
+  "mcp",
+  "example",
+  "research",
+  "resolve",
+  "doctor",
+  "settings",
+  "read",
+  "list",
+  "grep",
+  "search",
+  "search-status",
+  "code",
+  "pkg",
+  "docs",
+  "auth",
+] as const;
+
+/** Backwards-compatible name for the exact stable baseline command set. */
+export const EXPECTED_TOP_LEVEL_COMMANDS = EXPECTED_STABLE_TOP_LEVEL_COMMANDS;
+
+export const JSON_PARITY_FIXTURES: JsonParityFixture[] = [
+  {
+    name: "resolve_target",
+    cliArgs: ["resolve", "express", "--json"],
+    mcpTool: "resolve_target",
+    mcpArgs: { name: "express", format: "json" },
+  },
+  {
+    name: "pkg_info",
+    cliArgs: ["pkg", "info", "npm:express", "--json"],
+    mcpTool: "pkg_info",
+    mcpArgs: { target: "npm:express", format: "json" },
+  },
+  {
+    name: "pkg_info_cargo",
+    cliArgs: ["pkg", "info", "cargo:serde", "--json"],
+    mcpTool: "pkg_info",
+    mcpArgs: { target: "cargo:serde", format: "json" },
+  },
+  {
+    name: "pkg_deps",
+    cliArgs: ["pkg", "deps", "npm:express", "--json"],
+    mcpTool: "pkg_deps",
+    mcpArgs: { target: "npm:express", format: "json" },
+  },
+  {
+    name: "pkg_deps_issues",
+    cliArgs: ["pkg", "deps", "npm:express", "--issues", "--json"],
+    mcpTool: "pkg_deps",
+    mcpArgs: {
+      target: "npm:express",
+      include_issues: true,
+      format: "json",
+    },
+  },
+  {
+    name: "pkg_vulns",
+    cliArgs: ["pkg", "vulns", "npm:express", "--json"],
+    mcpTool: "pkg_vulns",
+    mcpArgs: { target: "npm:express", format: "json" },
+  },
+  {
+    name: "pkg_changelog",
+    cliArgs: ["pkg", "changelog", "npm:express", "--limit", "1", "--json"],
+    mcpTool: "pkg_changelog",
+    mcpArgs: {
+      target: "npm:express",
+      limit: 1,
+      format: "json",
+    },
+  },
+  {
+    name: "pkg_upgrade_review",
+    cliArgs: [
+      "pkg",
+      "upgrade-review",
+      "npm:express@5.0.0",
+      "--to",
+      "5.2.1",
+      "--no-transitive-security",
+      "--json",
+    ],
+    mcpTool: "pkg_upgrade_review",
+    mcpArgs: {
+      registry: "npm",
+      package_name: "express",
+      current_version: "5.0.0",
+      target_version: "5.2.1",
+      skip_transitive_security: true,
+      format: "json",
+    },
+  },
+  {
+    name: "list_package",
+    cliArgs: [
+      "list",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--limit",
+      "1",
+      "--json",
+    ],
+    mcpTool: "list",
+    mcpArgs: {
+      target: SMOKE_PACKAGE_SPEC,
+      paths: ["package.json"],
+      limit: 1,
+      format: "json",
+    },
+  },
+  {
+    name: "list_site",
+    cliArgs: [
+      "list",
+      "site:expressjs.com",
+      "en/resources/",
+      "--limit",
+      "20",
+      "--json",
+    ],
+    mcpTool: "list",
+    mcpArgs: {
+      target: "site:expressjs.com",
+      paths: ["en/resources/"],
+      limit: 20,
+      format: "json",
+    },
+  },
+  {
+    name: "read",
+    cliArgs: [
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--lines",
+      "1-5",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: SMOKE_PACKAGE_SPEC,
+      path: "package.json",
+      start_line: 1,
+      end_line: 5,
+      format: "json",
+    },
+  },
+  {
+    name: "read_selector_code_miss",
+    expectedStatus: "NOT_FOUND",
+    cliArgs: [
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--selector",
+      "main",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: SMOKE_PACKAGE_SPEC,
+      path: "package.json",
+      selector: "main",
+      format: "json",
+    },
+  },
+  {
+    name: "read_symbol_fragment",
+    cliArgs: ["read", `${SMOKE_PACKAGE_SPEC}#createApplication`, "--json"],
+    mcpTool: "read",
+    mcpArgs: {
+      target: `${SMOKE_PACKAGE_SPEC}#createApplication`,
+      format: "json",
+    },
+  },
+  {
+    name: "read_symbol_selector",
+    cliArgs: [
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "--selector",
+      "createApplication",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: SMOKE_PACKAGE_SPEC,
+      selector: "createApplication",
+      format: "json",
+    },
+  },
+  {
+    name: "read_docs_fragment",
+    cliArgs: [
+      "read",
+      "https://expressjs.com/en/5x/starter/basic-routing/#overview",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: "https://expressjs.com/en/5x/starter/basic-routing/#overview",
+      format: "json",
+    },
+  },
+  {
+    name: "read_site_path",
+    cliArgs: [
+      "read",
+      "site:expressjs.com",
+      "en/resources",
+      "--lines",
+      "1-5",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: "site:expressjs.com",
+      path: "en/resources",
+      start_line: 1,
+      end_line: 5,
+      format: "json",
+    },
+  },
+  {
+    name: "read_selector_docs",
+    cliArgs: [
+      "read",
+      "https://expressjs.com/llms/api-5x.txt",
+      "--selector",
+      "expressjson",
+      "--json",
+    ],
+    mcpTool: "read",
+    mcpArgs: {
+      target: "https://expressjs.com/llms/api-5x.txt",
+      selector: "expressjson",
+      format: "json",
+    },
+  },
+  {
+    name: "grep",
+    cliArgs: [
+      "grep",
+      "express",
+      SMOKE_PACKAGE_SPEC,
+      "--path",
+      "package.json",
+      "--limit",
+      "1",
+      "--json",
+    ],
+    mcpTool: "grep",
+    mcpArgs: {
+      targets: [
+        {
+          target: SMOKE_PACKAGE_SPEC,
+          path_selectors: [{ kind: "exact", value: "package.json" }],
+        },
+      ],
+      pattern: "express",
+      max_matches: 1,
+      format: "json",
+    },
+  },
+];
+
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
+export function parseCliSmokeArgs(
+  argv: readonly string[],
+  cwd = process.cwd(),
+): CliSmokeOptions {
+  const parsed = parseCliLaunchTarget(argv, cwd);
+  let mode: CliSmokeOptions["mode"] = "live";
+  let modeSpecified = false;
+
+  for (let index = 0; index < parsed.remainingArgs.length; index += 1) {
+    const value = parsed.remainingArgs[index];
+    if (value !== "--mode") {
+      throw new Error(`Unknown CLI smoke option: ${value}`);
+    }
+    if (modeSpecified) throw new Error("--mode may only be specified once");
+    const requestedMode = parsed.remainingArgs[index + 1];
+    if (requestedMode !== "live" && requestedMode !== "unauthenticated") {
+      throw new Error("--mode must be live or unauthenticated");
+    }
+    mode = requestedMode;
+    modeSpecified = true;
+    index += 1;
+  }
+
+  return { mode, target: parsed.target };
+}
+
+export function buildMcpParityCommand(
+  target: CliLaunchTarget,
+  toolName: string,
+  args: Record<string, unknown>,
+): string[] {
+  return [
+    "bun",
+    "run",
+    fileURLToPath(new URL("./mcp-call.ts", import.meta.url)),
+    ...forwardedCliEntryArgs(target),
+    toolName,
+    JSON.stringify(args),
+  ];
+}
+
+export function parseRootHelpCommands(helpText: string): string[] {
+  const commands: string[] = [];
+  let inCommands = false;
+  for (const line of helpText.split(/\r?\n/)) {
+    if (!inCommands) {
+      inCommands = line.trim() === "Commands:";
+      continue;
+    }
+    if (line.trim() === "") break;
+    const match = /^ {2}(\S+)/.exec(line);
+    // Aliases count as commands so a reintroduced alias fails the exact set.
+    for (const command of match?.[1]?.split("|") ?? []) {
+      if (command && command !== "help") commands.push(command);
+    }
+  }
+  return commands;
+}
+
+export function assertRootHelpStructure(
+  helpText: string,
+  expectedCommands: readonly string[] = EXPECTED_STABLE_TOP_LEVEL_COMMANDS,
+): void {
+  const actual = new Set(parseRootHelpCommands(helpText));
+  const expected = new Set<string>(expectedCommands);
+  const missing = [...expected].filter((command) => !actual.has(command));
+  const unexpected = [...actual].filter((command) => !expected.has(command));
+  assert(
+    missing.length === 0 && unexpected.length === 0,
+    `root help command mismatch; missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"}`,
+  );
+}
+
+function parseJson(text: string, context: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    throw new Error(`${context}: expected parseable JSON (${message})`);
+  }
+}
+
+function assertRecord(
+  value: unknown,
+  context: string,
+): asserts value is Record<string, unknown> {
+  assert(
+    value !== null && typeof value === "object" && !Array.isArray(value),
+    `${context}: expected object`,
+  );
+}
+
+function assertNotJson(text: string, context: string): void {
+  try {
+    JSON.parse(text);
+  } catch {
+    return;
+  }
+  throw new Error(`${context}: terminal output unexpectedly parsed as JSON`);
+}
+
+function assertCleanErrorEnvelope(
+  text: string,
+  context: string,
+): ErrorEnvelope {
+  const jsonLine = text
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("{") && line.endsWith("}"));
+  assert(jsonLine, `${context}: missing JSON error envelope`);
+  const payload = parseJson(jsonLine, context);
+  assertRecord(payload, context);
+  assert(
+    typeof payload.error === "string" && payload.error.length > 0,
+    `${context}: missing error`,
+  );
+  assert(
+    typeof payload.code === "string" && payload.code.length > 0,
+    `${context}: missing code`,
+  );
+  assert(
+    typeof payload.retryable === "boolean",
+    `${context}: missing retryable`,
+  );
+  return payload as unknown as ErrorEnvelope;
+}
+
+function listTextFirstFile(text: string, context: string): string {
+  const lines = text.split("\n");
+  assert(
+    lines[0] === "Sources:" && lines[1]?.startsWith("  - "),
+    `${context}: missing Sources row`,
+  );
+  const actionIndex = lines.findIndex((line) =>
+    line.startsWith("Read files: read -- "),
+  );
+  assert(actionIndex > 1, `${context}: missing native read recipe`);
+  const path = lines[actionIndex + 1];
+  assert(path !== undefined && path.length > 0, `${context}: missing path`);
+  return path;
+}
+
+function assertTerminalOutput(result: CommandResult, context: string): string {
+  const text = assertCompleteTerminalOutput(result, context);
+  assert(
+    text.length < DEFAULT_TEXT_LIMIT,
+    `${context}: terminal output too large (${text.length} chars)`,
+  );
+  return text;
+}
+
+function assertCompleteTerminalOutput(
+  result: CommandResult,
+  context: string,
+): string {
+  assert(
+    result.exitCode === 0,
+    `${context}: command failed (${result.exitCode})\n${result.stderr}`,
+  );
+  const text = result.stdout.trim();
+  assert(text.length > 0, `${context}: expected stdout`);
+  assertNotJson(text, context);
+  return text;
+}
+
+export function assertSearchTerminalText(text: string, context: string): void {
+  const lines = text.split("\n");
+  let pathOnlyBlock = false;
+  for (const line of lines) {
+    if (/^\[\d+\] /.test(line)) {
+      pathOnlyBlock = /\[repo (?:code|doc), path match\]$/.test(line);
+    } else if (pathOnlyBlock) {
+      assert(
+        !/^\s*>?\s*\d+ \|/.test(line),
+        `${context}: path-only hit contains an arbitrary source snippet`,
+      );
+    }
+  }
+  const formatterLines = searchFormatterLines(lines);
+  const formatterText = formatterLines.join("\n");
+  const firstLine = lines[0]?.trim() ?? "";
+  assert(firstLine.length > 0, `${context}: missing outcome first line`);
+  assert(
+    !firstLine.startsWith("Warning:") &&
+      !firstLine.startsWith("search |") &&
+      !firstLine.startsWith("search_status |"),
+    `${context}: non-outcome text precedes search outcome`,
+  );
+  assert(
+    /^(?:Found \d+ |No results? )/.test(firstLine),
+    `${context}: missing outcome headline`,
+  );
+  assert(
+    !formatterLines.some((line) => /^status\s*:/i.test(line.trim())),
+    `${context}: duplicated lifecycle status line`,
+  );
+  assert(
+    !formatterLines.some((line) => /^Search\s+\S+\s+\|/.test(line)),
+    `${context}: separate Search <ref> session summary`,
+  );
+  const outcomeLines = formatterLines.filter((line) =>
+    /^(?:Found \d+ |No results? )/.test(line),
+  );
+  assert(outcomeLines.length === 1, `${context}: duplicate outcome lines`);
+  assert(
+    !formatterText.includes("searchRef:") &&
+      !formatterText.includes("searchRef="),
+    `${context}: leaked searchRef detail`,
+  );
+  assert(
+    !formatterText.includes("indexingRef"),
+    `${context}: leaked indexingRef`,
+  );
+  assert(
+    !formatterText.includes("freshnessReason"),
+    `${context}: leaked freshnessReason`,
+  );
+
+  const forbiddenSections = [
+    "Ready:",
+    "Waiting:",
+    "Available but not searched:",
+    "Indexed alternatives:",
+  ];
+  for (const section of forbiddenSections) {
+    assert(
+      !formatterLines.some((line) => line.startsWith(section)),
+      `${context}: legacy flat section ${section}`,
+    );
+  }
+  assert(
+    !formatterLines.some((line) => line === "Evidence may change."),
+    `${context}: vague evidence policy prose`,
+  );
+  assert(
+    !formatterLines.some((line) => line.startsWith("Do not repeat")),
+    `${context}: repeat policy prose`,
+  );
+  assert(
+    !formatterLines.some((line) => line.startsWith("Do not poll")),
+    `${context}: poll policy prose`,
+  );
+
+  const footerLabels = ["Read:", "More results:", "Follow-up:"];
+  const presentFooters = formatterLines.filter((line) =>
+    footerLabels.includes(line),
+  );
+  assert(
+    new Set(presentFooters).size === presentFooters.length,
+    `${context}: duplicated footer section`,
+  );
+  assert(
+    presentFooters.join() ===
+      footerLabels.filter((label) => presentFooters.includes(label)).join(),
+    `${context}: footer sections out of order`,
+  );
+  assert(
+    !firstLine.includes("|") && !/partial|interim|ready|offset/.test(firstLine),
+    `${context}: headline must contain only the outcome`,
+  );
+  const hasReadinessText = formatterLines.some((line) =>
+    TARGET_DETAIL_STATE_PATTERN.test(line),
+  );
+  if (hasReadinessText) {
+    assert(
+      formatterLines.some((line) => /^-\s+\S/.test(line)),
+      `${context}: readiness details must be grouped under a target`,
+    );
+  }
+
+  const statusActions = formatterLines.filter((line) =>
+    line.startsWith("  githits search-status "),
+  );
+  assert(
+    statusActions.length <= 1,
+    `${context}: expected at most one search-status action`,
+  );
+  const statusAction = statusActions[0];
+  if (statusAction) {
+    assert(
+      formatterLines.includes("Follow-up:") &&
+        formatterLines.indexOf("Follow-up:") <
+          formatterLines.indexOf(statusAction),
+      `${context}: status action must be in Follow-up`,
+    );
+    assert(
+      /^ {2}githits search-status \S+ --wait \d+$/.test(statusAction),
+      `${context}: invalid native status action`,
+    );
+  }
+  assert(
+    !formatterText.includes("search_ref="),
+    `${context}: MCP search_ref syntax leaked into CLI output`,
+  );
+  assert(
+    hasHumanSearchHitLocator(lines) ||
+      hasTargetRecovery(formatterLines) ||
+      formatterLines.includes("Follow-up:") ||
+      formatterLines.includes("More results:"),
+    `${context}: missing result follow-up or next action`,
+  );
+}
+
+function hasTargetRecovery(lines: string[]): boolean {
+  return lines.some((line, index) => {
+    if (!/^ {2}(?:Fix|Try):\s+\S/.test(line)) return false;
+    for (
+      let previousIndex = index - 1;
+      previousIndex >= 0;
+      previousIndex -= 1
+    ) {
+      const previous = lines[previousIndex];
+      if (!previous || previous.trim() === "") continue;
+      if (/^-\s+\S/.test(previous)) return true;
+      if (previous.startsWith("  ")) continue;
+      return false;
+    }
+    return false;
+  });
+}
+
+function hasHumanSearchHitLocator(lines: string[]): boolean {
+  return lines.some((line, index) => {
+    const docsMatch = /^\[\d+\]\s+(\S+)\s+\[docs page\]\s+(.+)$/.exec(line);
+    if (docsMatch) {
+      const pageId = docsMatch[1];
+      const docsDetails = docsMatch[2];
+      if (!pageId || pageId === "page ID unavailable" || !docsDetails) {
+        return false;
+      }
+      const firstDivider = docsDetails.indexOf(" - ");
+      if (firstDivider <= 0) return false;
+      const sourceAndTitle = docsDetails.slice(firstDivider + 3);
+      const secondDivider = sourceAndTitle.indexOf(" - ");
+      if (secondDivider > 0) {
+        const source = sourceAndTitle.slice(0, secondDivider).trim();
+        const title = sourceAndTitle.slice(secondDivider + 3).trim();
+        return (
+          source.length > 0 &&
+          (title.length > 0 || hasWrappedHitTitle(lines, index))
+        );
+      }
+      if (!sourceAndTitle.endsWith(" -")) return false;
+      const source = sourceAndTitle.slice(0, -2).trim();
+      return source.length > 0 && hasWrappedHitTitle(lines, index);
+    }
+    const match =
+      /^\[\d+\]\s+(.+?)\s+\[(repo doc|repo code|repo symbol)(?:, path match)?\](?: -(?: (.*))?)?$/.exec(
+        line,
+      );
+    if (!match) return false;
+    const locatorText = match[1];
+    if (!locatorText) return false;
+    const locator = locatorText.trim().split(/\s+/);
+    if (
+      locator.length >= 2 &&
+      !locatorText.trim().endsWith("location unavailable") &&
+      locator.every((part) => part.length > 0)
+    ) {
+      const title = match[3];
+      return title === undefined
+        ? !line.endsWith(" -") || hasWrappedHitTitle(lines, index)
+        : title.trim().length > 0 || hasWrappedHitTitle(lines, index);
+    }
+    return false;
+  });
+}
+
+function hasWrappedHitTitle(lines: string[], index: number): boolean {
+  const titleLine = lines[index + 1];
+  return titleLine?.startsWith("  ") === true && titleLine.trim().length > 0;
+}
+
+function searchFormatterLines(lines: string[]): string[] {
+  let inHit = false;
+  return lines.filter((line) => {
+    if (/^\[\d+\]\s/.test(line)) {
+      inHit = true;
+      return true;
+    }
+    if (inHit && line.length > 0 && !line.startsWith("  ")) inHit = false;
+    return !inHit;
+  });
+}
+
+function assertJsonOutput(result: CommandResult, context: string): unknown {
+  assert(
+    result.exitCode === 0,
+    `${context}: command failed (${result.exitCode})\n${result.stderr}`,
+  );
+  assert(result.stdout.trim().length > 0, `${context}: expected stdout`);
+  return parseJson(result.stdout, context);
+}
+
+export function assertTransitiveVulnerabilityText(
+  text: string,
+  context: string,
+): void {
+  const resolvedIndex = text.indexOf("Resolved dependencies");
+  assert(
+    resolvedIndex >= 0,
+    `${context}: missing resolved-dependencies section`,
+  );
+  assert(
+    !text.includes("use verbose=true or format=json"),
+    `${context}: MCP-native transitive hint leaked into CLI output`,
+  );
+  const resolvedText = text.slice(resolvedIndex);
+  const summaryMatch = resolvedText.match(
+    /(?:^|\n)\s*(\d+)\s+(?:(?:affected|non-affecting|unknown)\s+)?advisory\s+occurrences?\b/,
+  );
+  const headlinePattern =
+    /^ {2}(?:MALWARE(?: \| (?:critical|high|medium|low|unrated))?|critical|high|medium|low|unrated)\s+\S+@\S+(?:\s+\[(?:affected|non-affecting|unknown)\])?/gm;
+  const renderedRows = [...resolvedText.matchAll(headlinePattern)].length;
+  if (summaryMatch !== null) {
+    const expectedRows = Number(summaryMatch[1]);
+    assert(
+      renderedRows === expectedRows,
+      `${context}: expected ${expectedRows} transitive rows from summary, rendered ${renderedRows}`,
+    );
+    return;
+  }
+
+  assert(
+    /(?:^|\n)\s*No\s+(?:(?:affected|non-affecting|unknown)\s+advisory\s+occurrences\s+found;|advisory\s+occurrences\s+found\.)\s+\d+\s+resolved\s+package\s+versions?\s+checked\./.test(
+      resolvedText,
+    ),
+    `${context}: missing recognized advisory occurrence summary`,
+  );
+  assert(
+    renderedRows === 0,
+    `${context}: expected zero transitive rows from clean summary, rendered ${renderedRows}`,
+  );
+}
+
+function assertTransitiveVulnerabilityJson(
+  value: unknown,
+  context: string,
+): void {
+  assertRecord(value, context);
+  assertRecord(value.transitive, `${context}.transitive`);
+  assert(
+    value.transitive.scope === "resolved_dependencies",
+    `${context}: unexpected transitive scope`,
+  );
+  assert(
+    ["affected", "non_affecting", "unknown", "all"].includes(
+      value.transitive.advisoryScope as string,
+    ),
+    `${context}: unexpected transitive advisory scope`,
+  );
+  assert(
+    value.transitive.withdrawnAdvisoriesIncluded === false,
+    `${context}: transitive withdrawn-advisory flag must be false`,
+  );
+  assertRecord(value.transitive.summary, `${context}.transitive.summary`);
+  for (const key of [
+    "totalPackagesAnalyzed",
+    "packageCount",
+    "occurrenceCount",
+  ]) {
+    assert(
+      typeof value.transitive.summary[key] === "number",
+      `${context}: transitive summary missing numeric ${key}`,
+    );
+  }
+  assert(
+    Array.isArray(value.transitive.packages),
+    `${context}: transitive packages must be an array`,
+  );
+}
+
+function assertJsonErrorCode(
+  result: CommandResult,
+  context: string,
+  code: string,
+): void {
+  assert(result.exitCode !== 0, `${context}: expected command failure`);
+  const envelope = assertCleanErrorEnvelope(result.stderr, context);
+  assert(
+    envelope.code === code,
+    `${context}: expected ${code}, got ${envelope.code}`,
+  );
+}
+
+function assertInlineSearchSuccess(
+  value: unknown,
+  expectedQuery: string,
+  context: string,
+): void {
+  assertRecord(value, context);
+  assertRecord(value.query, `${context}: query`);
+  assert(value.query.raw === expectedQuery, `${context}: raw query mismatch`);
+  assert(
+    Array.isArray(value.results) && value.results.length > 0,
+    `${context}: missing ranked results`,
+  );
+  for (const [index, result] of value.results.entries()) {
+    assertRecord(result, `${context}: results[${index}]`);
+    assertRecord(result.locator, `${context}: results[${index}].locator`);
+    const filePath = result.locator.filePath;
+    assert(
+      typeof filePath === "string" &&
+        filePath.startsWith("lib/") &&
+        filePath.endsWith(".js"),
+      `${context}: result escaped JavaScript lib/ scope`,
+    );
+  }
+
+  if ("warnings" in value) {
+    assert(
+      Array.isArray(value.warnings),
+      `${context}: warnings must be an array`,
+    );
+  }
+  if (!("sourceStatus" in value)) return;
+
+  assert(
+    Array.isArray(value.sourceStatus),
+    `${context}: sourceStatus must be an array`,
+  );
+  const unsupportedFeatures: string[] = [];
+  for (const [index, entry] of value.sourceStatus.entries()) {
+    assertRecord(entry, `${context}: sourceStatus[${index}] must be an object`);
+    for (const field of ["ignoredQueryFeatures", "incompatibleQueryFeatures"]) {
+      const features = entry[field];
+      if (features === undefined) continue;
+      assert(
+        Array.isArray(features),
+        `${context}: sourceStatus[${index}].${field} must be an array`,
+      );
+      for (const feature of features) {
+        assert(
+          typeof feature === "string",
+          `${context}: sourceStatus[${index}].${field} must contain strings`,
+        );
+        unsupportedFeatures.push(feature);
+      }
+    }
+  }
+
+  if (unsupportedFeatures.length === 0) return;
+  assert(
+    Array.isArray(value.warnings),
+    `${context}: unsupported qualifiers must be surfaced in warnings`,
+  );
+  const warningText = value.warnings.join(" ").toLowerCase();
+  for (const feature of unsupportedFeatures) {
+    assert(
+      warningText.includes(feature.toLowerCase()),
+      `${context}: qualifier ${feature} was lost without a warning`,
+    );
+  }
+}
+
+function assertInlineSearchError(result: CommandResult, context: string): void {
+  assert(result.exitCode !== 0, `${context}: expected command failure`);
+  const envelope = assertCleanErrorEnvelope(result.stderr, context);
+  assert(
+    envelope.code === "INVALID_ARGUMENT",
+    `${context}: expected INVALID_ARGUMENT, got ${envelope.code}`,
+  );
+  assert(
+    envelope.retryable === false,
+    `${context}: error must not be retryable`,
+  );
+  for (const field of ["searchRef", "search_ref", "continuation"]) {
+    assert(!(field in envelope), `${context}: error exposed ${field}`);
+  }
+}
+
+async function runCliWithEnv(
+  args: string[],
+  baseEnv: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): Promise<CommandResult> {
+  return trackSmokeStep(`cli ${formatCliCommand(args)}`, async () => {
+    const proc = Bun.spawn(appendCliArgs(cliLaunchTarget, args), {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: baseEnv.HOME,
+      env: {
+        ...baseEnv,
+        NO_COLOR: "1",
+      },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { command: args, exitCode, stdout, stderr };
+  });
+}
+
+async function runMcpJson(
+  toolName: string,
+  args: Record<string, unknown>,
+  env: Record<string, string>,
+): Promise<unknown> {
+  return trackSmokeStep(`mcp parity ${toolName}`, async () => {
+    const proc = Bun.spawn(
+      buildMcpParityCommand(cliLaunchTarget, toolName, args),
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: env.HOME,
+        env,
+      },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    assert(
+      exitCode === 0,
+      `${toolName} MCP parity call failed (${exitCode})\n${stderr}`,
+    );
+    return parseJson(stdout, `${toolName} MCP parity`);
+  });
+}
+
+function assertDeepEqual(
+  actual: unknown,
+  expected: unknown,
+  context: string,
+): void {
+  const actualText = JSON.stringify(actual);
+  const expectedText = JSON.stringify(expected);
+  assert(
+    actualText === expectedText,
+    `${context}: JSON parity mismatch\nCLI: ${expectedText}\nMCP: ${actualText}`,
+  );
+}
+
+function jsonContractShape(value: unknown): unknown {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    const uniqueShapes = new Map<string, unknown>();
+    for (const item of value) {
+      const shape = jsonContractShape(item);
+      uniqueShapes.set(JSON.stringify(shape), shape);
+    }
+    return [...uniqueShapes.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, shape]) => shape);
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) {
+      out[key] = jsonContractShape(record[key]);
+    }
+    return out;
+  }
+  return typeof value;
+}
+
+async function assertJsonParity(
+  env: Record<string, string> = inheritedEnv(),
+): Promise<void> {
+  const runCli = (args: string[]): Promise<CommandResult> =>
+    runCliWithEnv(args, env);
+  await mapWithConcurrency(
+    JSON_PARITY_FIXTURES,
+    JSON_PARITY_CONCURRENCY,
+    async (fixture) => {
+      await trackSmokeStep(`json parity ${fixture.name}`, async () => {
+        const [cliPayload, mcpPayload] = await Promise.all([
+          runCli(fixture.cliArgs).then((result) =>
+            assertJsonOutput(result, `${fixture.name} CLI parity`),
+          ),
+          runMcpJson(fixture.mcpTool, fixture.mcpArgs, env),
+        ]);
+        // Dev endpoints may return stale cached data first and refresh in the
+        // background, so concurrent CLI/MCP calls can legitimately see different
+        // values. Parity still verifies both surfaces expose the same JSON contract.
+        assertDeepEqual(
+          jsonContractShape(mcpPayload),
+          jsonContractShape(cliPayload),
+          `${fixture.name} CLI/MCP JSON shape`,
+        );
+        if (fixture.expectedStatus !== undefined) {
+          assertRecord(cliPayload, `${fixture.name} CLI status`);
+          assertRecord(mcpPayload, `${fixture.name} MCP status`);
+          assert(
+            cliPayload.status === fixture.expectedStatus &&
+              mcpPayload.status === fixture.expectedStatus,
+            `${fixture.name} CLI/MCP status should be ${fixture.expectedStatus}; got CLI ${String(cliPayload.status)}, MCP ${String(mcpPayload.status)}`,
+          );
+        }
+      });
+    },
+  );
+}
+
+async function assertUnauthenticatedBehavior(): Promise<void> {
+  const isolated = createIsolatedSmokeEnvironment("githits-cli-smoke-home-");
+  const { env } = isolated;
+  try {
+    writeSmokeConfig(env, "[experimental]\ntools = false\n");
+    for (const args of [
+      ["pkg", "info", "--json"],
+      ["pkg", "info", "npm:express", "--unknown-option", "--json"],
+      ["unknown-command", "--json"],
+    ]) {
+      const result = await runCliWithEnv(args, env);
+      const context = `JSON parser failure: ${args.join(" ")}`;
+      assert(result.exitCode === 1, `${context}: expected exit 1`);
+      assert(result.stdout === "", `${context}: expected empty stdout`);
+      const payload = JSON.parse(result.stderr) as ErrorEnvelope;
+      assert(payload.code === "INVALID_ARGUMENT", `${context}: wrong code`);
+      assert(payload.retryable === false, `${context}: must not retry`);
+      assert(payload.error.length > 0, `${context}: missing message`);
+    }
+    const startupFailure = await runCliWithEnv(["example", "test", "--json"], {
+      ...env,
+      GITHITS_API_TOKEN: "synthetic-smoke-token",
+      GITHITS_API_URL: "http://invalid.test",
+    });
+    assert(
+      startupFailure.exitCode === 1,
+      "JSON startup failure: expected exit 1",
+    );
+    assert(
+      startupFailure.stdout === "",
+      "JSON startup failure: stdout not empty",
+    );
+    const startupPayload = JSON.parse(startupFailure.stderr) as ErrorEnvelope;
+    assert(
+      startupPayload.code === "UNKNOWN",
+      "JSON startup failure: wrong code",
+    );
+    assert(
+      startupPayload.retryable === false,
+      "JSON startup failure: must not retry",
+    );
+    assert(
+      startupPayload.error.includes("Invalid GITHITS_API_URL"),
+      "JSON startup failure: missing message",
+    );
+    const helpResult = await runCliWithEnv(["--help"], env);
+    assert(helpResult.exitCode === 0, "root help should succeed");
+    assert(
+      helpResult.stdout.trim().length > 0,
+      "root help should produce stdout",
+    );
+    assertRootHelpStructure(
+      helpResult.stdout,
+      EXPECTED_STABLE_TOP_LEVEL_COMMANDS,
+    );
+    assert(
+      helpResult.stdout.includes('githits research npm:express "How?"'),
+      "stable root help should expose research",
+    );
+    assert(
+      helpResult.stdout.includes("resolve"),
+      "stable root help should expose resolve",
+    );
+
+    const removedFeedback = await runCliWithEnv(["feedback", "--accept"], env);
+    assert(
+      removedFeedback.exitCode !== 0,
+      "removed feedback command should fail",
+    );
+    assert(
+      removedFeedback.stderr.includes("unknown command 'feedback'"),
+      "feedback must fail as an unknown command before auth",
+    );
+
+    const codeHelp = await runCliWithEnv(["code", "--help"], env);
+    assert(
+      codeHelp.exitCode === 0 && codeHelp.stdout.includes("diff"),
+      "stable code help should expose diff",
+    );
+
+    {
+      const commandHelp = await runCliWithEnv(["research", "--help"], env);
+      assert(
+        commandHelp.exitCode === 0 &&
+          commandHelp.stdout.includes("Usage: githits research") &&
+          commandHelp.stdout.includes("[target] <question>") &&
+          commandHelp.stdout.includes("Omit the target") &&
+          commandHelp.stdout.includes("--thread <UUID>") &&
+          commandHelp.stdout.includes("--source-format <format>") &&
+          commandHelp.stdout.includes('choices: "cli", "url"') &&
+          commandHelp.stdout.includes("--json"),
+        "stable research help should expose the research CLI contract",
+      );
+    }
+
+    const malformedResearchJson = await runCliWithEnv(
+      [
+        "research",
+        "--json",
+        "--thread",
+        "018f47a6-7b32-7b1e-8f45-6a2d39c81720",
+      ],
+      env,
+    );
+    assertJsonErrorCode(
+      malformedResearchJson,
+      "malformed research",
+      "INVALID_ARGUMENT",
+    );
+    assert(
+      malformedResearchJson.stdout.trim() === "",
+      "malformed research should keep stdout empty",
+    );
+
+    const researchJson = await runCliWithEnv(
+      ["research", "npm:express", "How is routing implemented?", "--json"],
+      env,
+    );
+    assertJsonErrorCode(
+      researchJson,
+      "stable unauthenticated research",
+      "AUTH_REQUIRED",
+    );
+    const targetlessResearchJson = await runCliWithEnv(
+      ["research", "How does Express routing work?", "--json"],
+      env,
+    );
+    assertJsonErrorCode(
+      targetlessResearchJson,
+      "stable unauthenticated targetless research",
+      "AUTH_REQUIRED",
+    );
+    const resolveHelp = await runCliWithEnv(["resolve", "--help"], env);
+    assert(
+      resolveHelp.exitCode === 0 &&
+        resolveHelp.stdout.includes("Usage: githits resolve"),
+      "stable resolver help should be available",
+    );
+    const resolveJson = await runCliWithEnv(
+      ["resolve", "express", "--json"],
+      env,
+    );
+    assertJsonErrorCode(
+      resolveJson,
+      "stable resolve auth probe",
+      "AUTH_REQUIRED",
+    );
+    assert(
+      resolveJson.stdout.trim() === "",
+      "stable resolver auth error should keep stdout clean",
+    );
+
+    const stableDiffHelp = await runCliWithEnv(["code", "diff", "--help"], env);
+    assert(
+      stableDiffHelp.exitCode === 0 &&
+        stableDiffHelp.stdout.includes("<from>..<to>"),
+      "stable diff help should explain both endpoints",
+    );
+    const stableDiff = await runCliWithEnv(
+      ["code", "diff", "npm:express", "5.2.0..5.2.1", "--json"],
+      env,
+    );
+    assertJsonErrorCode(
+      stableDiff,
+      "stable unauthenticated code diff",
+      "AUTH_REQUIRED",
+    );
+    assert(
+      stableDiff.stdout === "",
+      "stable diff auth failure should keep stdout empty",
+    );
+
+    for (const command of ["init", "login"] as const) {
+      const commandHelp = await runCliWithEnv([command, "--help"], env);
+      assert(commandHelp.exitCode === 0, `${command} help should succeed`);
+      assert(
+        commandHelp.stdout.includes("--port <port>"),
+        `${command} help should expose the callback port option`,
+      );
+      assert(
+        commandHelp.stdout.includes("--no-browser"),
+        `${command} help should expose the manual browser option`,
+      );
+
+      const invalidPort = await runCliWithEnv(
+        [command, "--port", "8765extra"],
+        env,
+      );
+      assert(
+        invalidPort.exitCode !== 0,
+        `${command} should reject a partially numeric callback port`,
+      );
+      assert(
+        `${invalidPort.stderr}\n${invalidPort.stdout}`.includes(
+          "Port must be an integer between 1 and 65535.",
+        ),
+        `${command} should explain the valid callback port range`,
+      );
+    }
+
+    for (const args of [
+      ["read", SMOKE_PACKAGE_SPEC, "package.json"],
+      ["read", SMOKE_PACKAGE_SPEC, "--selector", "main"],
+      ["read", "https://docs.example.test/guide#section"],
+      ["code", "read", SMOKE_PACKAGE_SPEC, "package.json"],
+      ["docs", "read", "docs-id"],
+    ]) {
+      const read = await runCliWithEnv([...args, "--json"], env);
+      assert(
+        read.exitCode !== 0 && read.stdout.trim() === "",
+        "unauthenticated read must keep stdout clean",
+      );
+      assert(
+        assertCleanErrorEnvelope(read.stderr, args.join(" ")).code ===
+          "AUTH_REQUIRED",
+        "read must require authentication",
+      );
+    }
+    const listJson = await runCliWithEnv(
+      ["list", SMOKE_PACKAGE_SPEC, "--json"],
+      env,
+    );
+    assert(
+      listJson.exitCode !== 0 && listJson.stdout.trim() === "",
+      "unauthenticated list JSON must keep stdout clean",
+    );
+    assertJsonErrorCode(listJson, "unauthenticated list JSON", "AUTH_REQUIRED");
+    const grepJson = await runCliWithEnv(
+      ["grep", "router", SMOKE_PACKAGE_SPEC, "--json"],
+      env,
+    );
+    assert(
+      grepJson.exitCode !== 0 && grepJson.stdout.trim() === "",
+      "unauthenticated grep JSON must keep stdout clean",
+    );
+    assertJsonErrorCode(grepJson, "unauthenticated grep JSON", "AUTH_REQUIRED");
+    const grepHelp = await runCliWithEnv(["grep", "--help"], env);
+    assert(
+      grepHelp.exitCode === 0 &&
+        grepHelp.stdout.includes("--fixed-strings") &&
+        grepHelp.stdout.includes("global page cap"),
+      "grep help must expose matching defaults and page limits",
+    );
+    for (const group of ["code", "docs"]) {
+      const help = await runCliWithEnv([group, "read", "--help"], env);
+      assert(
+        help.exitCode === 0 &&
+          help.stdout.includes("Deprecated: use githits read"),
+        "legacy read help must explain migration",
+      );
+    }
+
+    const result = await runCliWithEnv(["example", "python", "--json"], env);
+    assert(result.exitCode !== 0, "unauthenticated example should fail");
+    assert(
+      result.stdout.trim() === "",
+      "unauthenticated JSON probe should keep stdout clean",
+    );
+    const payload = assertCleanErrorEnvelope(
+      result.stderr,
+      "unauthenticated example",
+    );
+    assertDeepEqual(
+      payload,
+      {
+        error: "No local GitHits authentication token found.",
+        code: "AUTH_REQUIRED",
+        retryable: false,
+        details: { authSource: "local" },
+      },
+      "unauthenticated example JSON envelope",
+    );
+
+    const terminalResult = await runCliWithEnv(["example", "python"], env);
+    assert(
+      terminalResult.exitCode !== 0,
+      "unauthenticated terminal probe should fail",
+    );
+    const authGuidance = `${terminalResult.stderr}\n${terminalResult.stdout}`;
+    assertNotJson(
+      authGuidance.trim(),
+      "unauthenticated terminal auth guidance",
+    );
+    assert(
+      authGuidance.includes("No local GitHits authentication token found"),
+      "unauthenticated terminal probe missing auth guidance",
+    );
+    assert(
+      authGuidance.includes("githits login"),
+      "unauthenticated terminal probe missing login guidance",
+    );
+    assert(
+      !authGuidance.includes("tool call"),
+      "unauthenticated terminal probe used MCP-style auth guidance",
+    );
+  } finally {
+    isolated.cleanup();
+  }
+}
+
+/** A legacy `[experimental] tools = true` config must change nothing. */
+async function assertLegacyExperimentalOptInIgnored(): Promise<void> {
+  const isolated = createIsolatedSmokeEnvironment(
+    "githits-cli-legacy-experimental-smoke-home-",
+  );
+  const { env } = isolated;
+  try {
+    writeSmokeConfig(env, "[experimental]\ntools = true\n");
+    const helpResult = await runCliWithEnv(["--help"], env);
+    assert(
+      helpResult.exitCode === 0,
+      "root help with legacy opt-in should succeed",
+    );
+    assertRootHelpStructure(
+      helpResult.stdout,
+      EXPECTED_STABLE_TOP_LEVEL_COMMANDS,
+    );
+    const researchJson = await runCliWithEnv(
+      ["research", "npm:express", "How is routing implemented?", "--json"],
+      env,
+    );
+    assertJsonErrorCode(
+      researchJson,
+      "research auth probe with legacy opt-in",
+      "AUTH_REQUIRED",
+    );
+  } finally {
+    isolated.cleanup();
+  }
+}
+
+async function assertLiveOrAuthRequired(
+  env: Record<string, string> = inheritedEnv(),
+): Promise<boolean> {
+  const packageResult = await runCliWithEnv(
+    ["pkg", "info", "npm:express", "--json"],
+    env,
+  );
+  if (packageResult.exitCode === 0) {
+    const payload = parseJson(packageResult.stdout, "package auth probe");
+    assertRecord(payload, "package auth probe");
+    assert(payload.name === "express", "package auth probe: expected express");
+    return true;
+  }
+
+  assert(
+    packageResult.exitCode !== 0,
+    "package auth probe: expected non-zero auth failure",
+  );
+  const jsonAuthPayload = assertCleanErrorEnvelope(
+    packageResult.stderr,
+    "package auth probe",
+  );
+  if (jsonAuthPayload.code === "AUTH_REQUIRED") {
+    console.log("AUTH_REQUIRED: live CLI smoke skipped");
+    return false;
+  }
+
+  const authGuidance =
+    `${packageResult.stderr}\n${packageResult.stdout}`.trim();
+  assert(
+    authGuidance.includes("Authentication required"),
+    "package auth probe missing authentication guidance",
+  );
+  assert(
+    authGuidance.includes("githits login"),
+    "package auth probe missing login guidance",
+  );
+  console.log("AUTH_REQUIRED: live CLI smoke skipped");
+  return false;
+}
+
+export function assertCliResolveText(resolveText: string): void {
+  assert(
+    resolveText.includes("Targets:") &&
+      /\n\s+\d+\. (?:npm|github|site):\S+/.test(resolveText),
+    "resolve text should include canonical target groups",
+  );
+  const directTarget = resolveText.match(
+    /Next: githits search .+ --in '((?:npm|github|site):[^']+)'/,
+  )?.[1];
+  if (directTarget) {
+    assert(
+      isResolveDirectTargetUnwarned(resolveText, directTarget),
+      "direct resolve action should target a listed direct candidate without a warning",
+    );
+    return;
+  }
+  if (resolveText.includes("Warning:")) {
+    assert(
+      !resolveText.includes("Next:") &&
+        !resolveText.includes("Next after choosing:"),
+      "malicious-blocked resolve text should omit the normal next action",
+    );
+  } else if (resolveText.includes("Ambiguous:")) {
+    assert(
+      resolveText.includes("Next after choosing:"),
+      "ambiguous resolve text should require an explicit choice",
+    );
+  } else {
+    assert(
+      resolveText.includes("explicitly choose a candidate") &&
+        resolveText.includes("--in '<target>'"),
+      "unconfirmed resolve text should require an explicit choice",
+    );
+  }
+}
+
+async function runResolveLiveSmoke(env: Record<string, string>): Promise<void> {
+  const resolveText = assertTerminalOutput(
+    await runCliWithEnv(["resolve", "express"], env),
+    "resolve terminal",
+  );
+  assertCliResolveText(resolveText);
+  for (const expected of [
+    "npm:express",
+    "github:expressjs/express",
+    "site:expressjs.com",
+    "Related targets:",
+  ]) {
+    assert(
+      resolveText.includes(expected),
+      `express resolution missing ${expected}`,
+    );
+  }
+
+  const siteResolveText = assertTerminalOutput(
+    await runCliWithEnv(["resolve", "expressjs.com"], env),
+    "site resolve terminal",
+  );
+  assertCliResolveText(siteResolveText);
+  assert(
+    /\n {2}1\. site:expressjs\.com \[(?:exact|high)\] · site/.test(
+      siteResolveText,
+    ) &&
+      siteResolveText.includes("Related targets:") &&
+      siteResolveText.includes("npm:express · related package") &&
+      siteResolveText.includes("github:expressjs/express · related repository"),
+    "expressjs.com resolution should directly match the site and group related package/repository targets",
+  );
+
+  const fuzzyResolveText = assertTerminalOutput(
+    await runCliWithEnv(["resolve", "lodahs", "--prefer-kind", "package"], env),
+    "fuzzy resolve terminal",
+  );
+  assert(
+    !fuzzyResolveText.includes("name similarity") &&
+      !fuzzyResolveText.includes("coarse lexical support") &&
+      fuzzyResolveText.includes("indexed package snapshot") &&
+      !fuzzyResolveText.includes("readiness") &&
+      !fuzzyResolveText.includes("no code") &&
+      !fuzzyResolveText.includes("no docs"),
+    "fuzzy resolve default text should omit lexical and negative availability detail",
+  );
+
+  const fuzzyResolveVerbose = assertTerminalOutput(
+    await runCliWithEnv(
+      ["resolve", "lodahs", "--prefer-kind", "package", "--verbose"],
+      env,
+    ),
+    "fuzzy resolve verbose terminal",
+  );
+  assert(
+    /\d+% name similarity/.test(fuzzyResolveVerbose) &&
+      fuzzyResolveVerbose.includes(
+        "Name similarity is coarse lexical support; candidate order follows broader backend policy.",
+      ),
+    "fuzzy resolve verbose text should qualify lexical evidence",
+  );
+
+  const resolveJson = assertJsonOutput(
+    await runCliWithEnv(
+      [
+        "resolve",
+        "express",
+        "--registry",
+        "npm",
+        "--prefer-kind",
+        "package",
+        "--intent-hint",
+        "web server",
+        "--query",
+        "web framework",
+        "--limit",
+        "3",
+        "--json",
+      ],
+      env,
+    ),
+    "resolve json",
+  );
+  assertRecord(resolveJson, "resolve json");
+  assert(
+    typeof resolveJson.best === "string" &&
+      resolveJson.best === "npm:express" &&
+      Array.isArray(resolveJson.candidates) &&
+      resolveJson.candidates.some(
+        (candidate) =>
+          candidate !== null &&
+          typeof candidate === "object" &&
+          candidate.target === "npm:express" &&
+          typeof candidate.latestVersionMaliciousStatus === "string",
+      ) &&
+      Array.isArray(resolveJson.protectedMatches) &&
+      typeof resolveJson.targetsTruncated === "boolean",
+    "resolve JSON missing structured candidate facts",
+  );
+
+  const fuzzyResolveJson = assertJsonOutput(
+    await runCliWithEnv(
+      ["resolve", "lodahs", "--prefer-kind", "package", "--json"],
+      env,
+    ),
+    "fuzzy resolve json",
+  );
+  assertRecord(fuzzyResolveJson, "fuzzy resolve json");
+  assert(
+    Array.isArray(fuzzyResolveJson.candidates) &&
+      fuzzyResolveJson.candidates.some(
+        (candidate) =>
+          candidate !== null &&
+          typeof candidate === "object" &&
+          candidate.target === "npm:lodash" &&
+          typeof candidate.nameSimilarity === "number",
+      ),
+    "fuzzy resolve JSON should preserve numeric name similarity for npm:lodash",
+  );
+}
+
+async function runLiveSmoke(env: Record<string, string>): Promise<void> {
+  for (const probe of [
+    {
+      argv: ["pkg", "deps", "go:github.com/docker/docker@v20.10.0"],
+      code: "VERSION_NOT_FOUND",
+      fact: "availablePackageVersions",
+      operand: "go:github.com/docker/docker@",
+    },
+    {
+      argv: ["list", "github:expressjs/express@v99.99.99-nope"],
+      code: "REF_NOT_FOUND",
+      fact: "suggestedRefs",
+      operand: "github:expressjs/express@",
+    },
+  ]) {
+    const text = await runCliWithEnv(probe.argv, env);
+    assert(
+      text.exitCode !== 0,
+      "recovery probe must fail for the original target",
+    );
+    assert(
+      text.stderr.includes("Try: githits") &&
+        text.stderr.includes(probe.operand),
+      "recovery probe missing native retry command",
+    );
+    const json = await runCliWithEnv([...probe.argv, "--json"], env);
+    const envelope = assertCleanErrorEnvelope(
+      json.stderr,
+      "version/ref recovery JSON",
+    );
+    assert(
+      envelope.code === probe.code,
+      "recovery probe lost backend error code",
+    );
+    const details = (envelope as { details?: Record<string, unknown> }).details;
+    const alternatives = details?.[probe.fact];
+    assert(
+      Array.isArray(alternatives) && alternatives.length > 0,
+      "recovery probe dropped structured alternatives",
+    );
+    assert(
+      typeof details?.action === "string" &&
+        details.action.startsWith(`Try: githits `),
+      "recovery probe JSON missing native action",
+    );
+  }
+  await runResolveLiveSmoke(env);
+  const scopedDiffArgs = [
+    "code",
+    "diff",
+    "npm:express",
+    "5.2.0..5.2.1",
+    "--max-files",
+    "1",
+  ];
+  const defaultDiff = assertTerminalOutput(
+    await runCliWithEnv([...scopedDiffArgs, "--", "lib/utils.js"], env),
+    "stable diff default patch",
+  );
+  assert(
+    defaultDiff.startsWith("diff --git") &&
+      defaultDiff.includes("lib/utils.js"),
+    "stable CLI diff default should emit the scoped unified patch",
+  );
+  const defaultDiffJson = assertJsonOutput(
+    await runCliWithEnv(
+      [...scopedDiffArgs, "--json", "--", "lib/utils.js"],
+      env,
+    ),
+    "stable diff default JSON",
+  );
+  assertRecord(defaultDiffJson, "stable diff default JSON");
+  assert(
+    defaultDiffJson.view === "patch" &&
+      Array.isArray(defaultDiffJson.files) &&
+      defaultDiffJson.files.length === 1,
+    "stable CLI diff JSON default should be a scoped patch",
+  );
+
+  const codeDiffText = assertTerminalOutput(
+    await runCliWithEnv(
+      [
+        "code",
+        "diff",
+        "npm:express",
+        "5.2.0..5.2.1",
+        "--name-status",
+        "--max-files",
+        "2",
+      ],
+      env,
+    ),
+    "stable code diff terminal",
+  );
+  assert(
+    /^[AMDRT?]\t\S.+$/m.test(codeDiffText),
+    "stable code diff text should include CLI-native status/path evidence",
+  );
+
+  const codeDiffJson = assertJsonOutput(
+    await runCliWithEnv(
+      [
+        "code",
+        "diff",
+        "npm:express",
+        "5.2.0..5.2.1",
+        "--name-status",
+        "--max-files",
+        "2",
+        "--json",
+      ],
+      env,
+    ),
+    "stable code diff json",
+  );
+  assertRecord(codeDiffJson, "stable code diff json");
+  assert(
+    codeDiffJson.view === "name-status" &&
+      Array.isArray(codeDiffJson.files) &&
+      typeof codeDiffJson.from === "object" &&
+      typeof codeDiffJson.to === "object",
+    "stable code diff JSON missing exact resolutions",
+  );
+
+  const runCli = (args: string[]): Promise<CommandResult> =>
+    runCliWithEnv(args, env);
+  const exampleText = assertTerminalOutput(
+    await runCli(["example", "express hello world", "--lang", "javascript"]),
+    "example terminal",
+  );
+  assert(exampleText.length > 20, "example terminal unexpectedly short");
+
+  const exampleJson = assertJsonOutput(
+    await runCli([
+      "example",
+      "express hello world",
+      "--lang",
+      "javascript",
+      "--json",
+    ]),
+    "example json",
+  );
+  assertRecord(exampleJson, "example json");
+  assert(typeof exampleJson.result === "string", "example json missing result");
+
+  const pkgInfoText = assertTerminalOutput(
+    await runCli(["pkg", "info", "npm:express"]),
+    "pkg info terminal",
+  );
+  assert(
+    pkgInfoText.includes("express"),
+    "pkg info terminal missing package name",
+  );
+  assert(
+    pkgInfoText.includes("Repository") && pkgInfoText.includes("stars"),
+    "pkg info terminal missing repository popularity",
+  );
+  assert(
+    pkgInfoText.includes("Vulnerabilities"),
+    "pkg info terminal missing vulnerability status",
+  );
+  assert(
+    pkgInfoText.includes("Latest:"),
+    "pkg info terminal missing latest vulnerability scope",
+  );
+  assert(
+    pkgInfoText.includes("History:"),
+    "pkg info terminal missing package-wide vulnerability history scope",
+  );
+  assert(
+    !pkgInfoText.includes("Install") && !pkgInfoText.includes("Usage"),
+    "pkg info terminal should not include quickstart fields",
+  );
+
+  const pkgInfoJson = assertJsonOutput(
+    await runCli(["pkg", "info", "npm:express", "--json"]),
+    "pkg info json",
+  );
+  let rustVersion: string | undefined;
+  for (const target of ["crates:serde", "cargo:serde"]) {
+    const context = `pkg info ${target}`;
+    const metadata = assertJsonOutput(
+      await runCli(["pkg", "info", target, "--json"]),
+      context,
+    );
+    assertRecord(metadata, context);
+    assert(
+      metadata.registry === "crates" && metadata.name === "serde",
+      `${context}: expected canonical crates identity`,
+    );
+    assert(typeof metadata.version === "string", `${context}: missing version`);
+    if (rustVersion !== undefined)
+      assert(
+        metadata.version === rustVersion,
+        `${context}: alias version mismatch`,
+      );
+    rustVersion = metadata.version;
+  }
+  assertRecord(pkgInfoJson, "pkg info json");
+  assert(pkgInfoJson.registry === "npm", "pkg info json registry mismatch");
+  assert(pkgInfoJson.name === "express", "pkg info json name mismatch");
+  assert(
+    typeof pkgInfoJson.version === "string",
+    "pkg info json missing version",
+  );
+  assert(
+    typeof pkgInfoJson.versionCount === "number",
+    "pkg info json missing version count",
+  );
+  assertRecord(pkgInfoJson.downloads, "pkg info json downloads");
+  assert(
+    typeof pkgInfoJson.downloads.refreshedAt === "string",
+    "pkg info json missing download refresh date",
+  );
+  assertRecord(pkgInfoJson.advisoryHistory, "pkg info json advisory history");
+  assert(
+    typeof pkgInfoJson.advisoryHistory.total === "number",
+    "pkg info json missing advisory history count",
+  );
+  assert(
+    !("install" in pkgInfoJson) && !("usage" in pkgInfoJson),
+    "pkg info json should not include quickstart fields",
+  );
+
+  const depsText = assertTerminalOutput(
+    await runCli(["pkg", "deps", "npm:express"]),
+    "pkg deps terminal",
+  );
+  assert(
+    depsText.includes("Runtime dependencies:"),
+    "pkg deps terminal missing runtime deps",
+  );
+
+  const depsAllText = assertTerminalOutput(
+    await runCli(["pkg", "deps", "npm:express", "--lifecycle", "all"]),
+    "pkg deps lifecycle all terminal",
+  );
+  assert(
+    depsAllText.includes("Dependency groups:"),
+    "pkg deps lifecycle all terminal missing groups heading",
+  );
+  assert(
+    depsAllText.includes("development") ||
+      depsAllText.includes("peer") ||
+      depsAllText.includes("optional"),
+    "pkg deps lifecycle all terminal missing non-runtime groups",
+  );
+
+  const depsJson = assertJsonOutput(
+    await runCli(["pkg", "deps", "npm:express", "--json"]),
+    "pkg deps json",
+  );
+  assertRecord(depsJson, "pkg deps json");
+  assertRecord(depsJson.runtime, "pkg deps json runtime");
+
+  const depsIssuesText = assertTerminalOutput(
+    await runCli(["pkg", "deps", "npm:express", "--issues"]),
+    "pkg deps issues terminal",
+  );
+  assert(
+    depsIssuesText.includes("Dependency issues"),
+    "pkg deps issues terminal missing issue heading",
+  );
+
+  const depsIssuesJson = assertJsonOutput(
+    await runCli(["pkg", "deps", "npm:express", "--issues", "--json"]),
+    "pkg deps issues json",
+  );
+  assertRecord(depsIssuesJson, "pkg deps issues json");
+  assert(
+    !("transitive" in depsIssuesJson),
+    "pkg deps issues json should not expose ordinary transitive output",
+  );
+  assertRecord(depsIssuesJson.issues, "pkg deps issues json issues");
+  assertRecord(depsIssuesJson.issues.scope, "pkg deps issues json scope");
+  assert(
+    depsIssuesJson.issues.scope.mode === "full",
+    "pkg deps issues json should report full scope",
+  );
+  for (const category of [
+    "deprecated",
+    "outdated",
+    "duplicates",
+    "conflicts",
+  ]) {
+    assertRecord(
+      depsIssuesJson.issues[category],
+      `pkg deps issues json ${category}`,
+    );
+    assert(
+      typeof depsIssuesJson.issues[category].count === "number",
+      `pkg deps issues json ${category} missing count`,
+    );
+    assert(
+      Array.isArray(depsIssuesJson.issues[category].items),
+      `pkg deps issues json ${category} missing items`,
+    );
+  }
+
+  const vulnsText = assertTerminalOutput(
+    await runCli(["pkg", "vulns", "npm:express"]),
+    "pkg vulns terminal",
+  );
+  assert(
+    vulnsText.includes("express") || vulnsText.includes("vulnerab"),
+    "pkg vulns terminal missing context",
+  );
+
+  const filteredVulnsText = assertTerminalOutput(
+    await runCli(["pkg", "vulns", "npm:lodash@4.17.20", "--severity", "high"]),
+    "pkg vulns filtered terminal",
+  );
+  assert(
+    filteredVulnsText.includes("Filter  severity >= high"),
+    "pkg vulns filtered terminal missing filter echo",
+  );
+
+  const vulnsJson = assertJsonOutput(
+    await runCli(["pkg", "vulns", "npm:express", "--json"]),
+    "pkg vulns json",
+  );
+  assertRecord(vulnsJson, "pkg vulns json");
+  assert(
+    "summary" in vulnsJson || "advisories" in vulnsJson,
+    "pkg vulns json missing vulnerability data",
+  );
+
+  const filteredVulnsJson = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      "npm:lodash@4.17.20",
+      "--severity",
+      "high",
+      "--json",
+    ]),
+    "pkg vulns filtered json",
+  );
+  assertRecord(filteredVulnsJson, "pkg vulns filtered json");
+  assertRecord(filteredVulnsJson.filter, "pkg vulns filtered json filter");
+  assert(
+    filteredVulnsJson.filter.minSeverity === "high",
+    "pkg vulns filtered json missing severity filter echo",
+  );
+
+  const transitiveVulnsText = assertTerminalOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      SMOKE_TRANSITIVE_VULNERABILITY_SPEC,
+      "--transitive",
+    ]),
+    "pkg vulns transitive terminal",
+  );
+  assertTransitiveVulnerabilityText(
+    transitiveVulnsText,
+    "pkg vulns transitive terminal",
+  );
+
+  const transitiveVulnsJson = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      SMOKE_TRANSITIVE_VULNERABILITY_SPEC,
+      "--transitive",
+      "--scope",
+      "all",
+      "--json",
+    ]),
+    "pkg vulns transitive json",
+  );
+  assertTransitiveVulnerabilityJson(
+    transitiveVulnsJson,
+    "pkg vulns transitive json",
+  );
+  assertRecord(transitiveVulnsJson, "pkg vulns transitive json");
+  assert(
+    (transitiveVulnsJson.transitive as Record<string, unknown>)
+      .advisoryScope === "all",
+    "pkg vulns transitive json did not apply all advisory scope",
+  );
+
+  const scopedVulnsText = assertTerminalOutput(
+    await runCli(["pkg", "vulns", "npm:express", "--scope", "non_affecting"]),
+    "pkg vulns scoped terminal",
+  );
+  assert(
+    scopedVulnsText.includes("Scope   non-affecting advisories only"),
+    "pkg vulns scoped terminal missing scope echo",
+  );
+  assert(
+    scopedVulnsText.includes("No active vulnerabilities affect this version"),
+    "pkg vulns scoped terminal missing current-risk statement",
+  );
+
+  const scopedVulnsJson = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      "npm:express",
+      "--scope",
+      "non_affecting",
+      "--json",
+    ]),
+    "pkg vulns scoped json",
+  );
+  assertRecord(scopedVulnsJson, "pkg vulns scoped json");
+  assertRecord(scopedVulnsJson.filter, "pkg vulns scoped json filter");
+  assert(
+    scopedVulnsJson.filter.advisoryScope === "non_affecting",
+    "pkg vulns scoped json missing advisory scope echo",
+  );
+
+  const unknownVulnsText = assertTerminalOutput(
+    await runCli(["pkg", "vulns", "npm:lodash@4.17.20", "--scope", "unknown"]),
+    "pkg vulns unknown scope",
+  );
+  assert(
+    unknownVulnsText.includes("Scope   unknown"),
+    "pkg vulns unknown scope missing scope echo",
+  );
+  const unknownVulnsJson = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      "npm:lodash@4.17.20",
+      "--scope",
+      "unknown",
+      "--json",
+    ]),
+    "pkg vulns unknown json",
+  );
+  assertRecord(unknownVulnsJson, "pkg vulns unknown json");
+  assertRecord(unknownVulnsJson.summary, "pkg vulns unknown summary");
+  assert(
+    typeof unknownVulnsJson.summary.unknownVulnerabilityCount === "number",
+    "pkg vulns missing unknown count",
+  );
+  assert(
+    typeof unknownVulnsJson.summary.assessmentStatus === "string",
+    "pkg vulns missing assessment status in JSON",
+  );
+  const transitiveUnknown = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "vulns",
+      "pypi:torchvision@0.20.1",
+      "--scope",
+      "unknown",
+      "--transitive",
+      "--json",
+    ]),
+    "pkg vulns transitive unknown",
+  );
+  assertRecord(transitiveUnknown, "pkg vulns transitive unknown");
+  assertRecord(
+    transitiveUnknown.transitive,
+    "pkg vulns transitive unknown audit",
+  );
+  assertRecord(
+    transitiveUnknown.transitive.summary,
+    "pkg vulns transitive unknown summary",
+  );
+  assert(
+    typeof transitiveUnknown.transitive.summary.unknownCount === "number",
+    "pkg vulns missing transitive unknown count",
+  );
+  assert(
+    transitiveUnknown.transitive.advisoryScope === "unknown",
+    "pkg vulns missing transitive unknown scope",
+  );
+  assertTransitiveVulnerabilityJson(
+    transitiveUnknown,
+    "pkg vulns transitive unknown",
+  );
+  assert(
+    Array.isArray(transitiveUnknown.transitive.packages),
+    "pkg vulns missing packages",
+  );
+  for (const pkg of transitiveUnknown.transitive.packages) {
+    assertRecord(pkg, "pkg vulns unknown package");
+    assert(Array.isArray(pkg.occurrences), "pkg vulns missing occurrences");
+    for (const row of pkg.occurrences) {
+      assertRecord(row, "pkg vulns unknown occurrence");
+      assert(
+        row.affectsResolvedVersion === false,
+        "pkg vulns unknown row claims a match",
+      );
+      assert(
+        typeof row.assessmentStatus === "string",
+        "pkg vulns missing occurrence status",
+      );
+      assert(
+        Array.isArray(row.assessmentReasons),
+        "pkg vulns missing occurrence reasons",
+      );
+    }
+  }
+
+  const changelogText = assertCompleteTerminalOutput(
+    await runCli(["pkg", "changelog", "npm:express", "--limit", "1"]),
+    "pkg changelog terminal",
+  );
+  assert(
+    changelogText.includes("express") || changelogText.includes("changelog"),
+    "pkg changelog terminal missing context",
+  );
+  assert(
+    !/[·…—–→]/.test(changelogText.split("\n")[0] ?? ""),
+    "pkg changelog summary contains non-ASCII punctuation",
+  );
+
+  const changelogJson = assertJsonOutput(
+    await runCli(["pkg", "changelog", "npm:express", "--limit", "1", "--json"]),
+    "pkg changelog json",
+  );
+  assertRecord(changelogJson, "pkg changelog json");
+  assertRecord(changelogJson.entries, "pkg changelog json entries");
+  assertRecord(changelogJson.statements, "pkg changelog json statements");
+  assert(
+    Array.isArray(changelogJson.statements.items) &&
+      Array.isArray(changelogJson.statements.coverage),
+    "pkg changelog missing statements or coverage",
+  );
+  assert(
+    Array.isArray(changelogJson.entries.items) &&
+      changelogJson.entries.items.every(
+        (entry: unknown) =>
+          typeof entry === "object" && entry !== null && !("body" in entry),
+      ),
+    "pkg changelog default JSON over-fetched raw bodies",
+  );
+
+  const changelogExact = assertJsonOutput(
+    await runCli(["pkg", "changelog", "npm:express@5.2.1", "--json"]),
+    "pkg changelog exact json",
+  );
+  assertRecord(changelogExact, "pkg changelog exact json");
+  assert(changelogExact.mode === "exact", "pkg changelog exact json mode");
+  const exactEntries = changelogExact.entries as
+    | { items?: Array<{ hasChangelog?: unknown; version?: unknown }> }
+    | undefined;
+  assert(
+    exactEntries?.items?.[0]?.version === "5.2.1",
+    "pkg changelog exact json resolved version",
+  );
+  assert(
+    typeof exactEntries?.items?.[0]?.hasChangelog === "boolean",
+    "pkg changelog exact json missing hasChangelog",
+  );
+
+  const upgradeReviewText = assertCompleteTerminalOutput(
+    await runCli([
+      "pkg",
+      "upgrade-review",
+      "npm:express@5.0.0..5.2.1",
+      "--no-transitive-security",
+    ]),
+    "pkg upgrade-review terminal",
+  );
+  const upgradeReviewFirstLine = upgradeReviewText.split("\n")[0]?.trim();
+  assert(
+    upgradeReviewFirstLine === "Upgrade review - 1 package",
+    "pkg upgrade-review terminal missing outcome headline",
+  );
+  assert(
+    upgradeReviewText.includes("npm:express 5.0.0 -> 5.2.1") &&
+      upgradeReviewText.includes("\nSecurity\n") &&
+      upgradeReviewText.includes("\nChanges (classified by agent)\n"),
+    "pkg upgrade-review terminal missing grouped evidence",
+  );
+  assert(
+    !upgradeReviewText.includes("pkg_upgrade_review") &&
+      !/\b(?:recommendation|risk level|assessment)\b/i.test(upgradeReviewText),
+    "pkg upgrade-review terminal leaked assessment language",
+  );
+
+  assert(
+    upgradeReviewText.includes("Classification coverage:") &&
+      upgradeReviewText.includes("labeled no impact") &&
+      upgradeReviewText.includes("Selection: focused"),
+    "pkg upgrade-review text missing classification coverage or selection",
+  );
+
+  const upgradeReviewJson = assertJsonOutput(
+    await runCli([
+      "pkg",
+      "upgrade-review",
+      "npm:express@5.0.0",
+      "--to",
+      "5.2.1",
+      "--no-transitive-security",
+      "--json",
+    ]),
+    "pkg upgrade-review json",
+  );
+  assertRecord(upgradeReviewJson, "pkg upgrade-review json");
+  assertRecord(upgradeReviewJson.summary, "pkg upgrade-review json summary");
+  assert(
+    Array.isArray(upgradeReviewJson.reviews),
+    "pkg upgrade-review json missing reviews array",
+  );
+  const firstUpgradeReview = upgradeReviewJson.reviews[0] as
+    | Record<string, unknown>
+    | undefined;
+  assert(firstUpgradeReview, "pkg upgrade-review json missing first review");
+  assertRecord(firstUpgradeReview.changelog, "pkg upgrade-review changelog");
+  assert(
+    !("riskItems" in firstUpgradeReview.changelog),
+    "pkg upgrade-review returned deprecated riskItems",
+  );
+  const upgradeStatements = firstUpgradeReview.changelog.statements;
+  assertRecord(upgradeStatements, "pkg upgrade-review statements");
+  assert(
+    upgradeStatements.selection === "focused",
+    "pkg upgrade-review statements selection must be focused",
+  );
+  assert(
+    Array.isArray(upgradeStatements.items),
+    "pkg upgrade-review statements missing items array",
+  );
+  assert(
+    Array.isArray(upgradeStatements.coverage),
+    "pkg upgrade-review statements missing coverage array",
+  );
+  assert(
+    typeof upgradeStatements.count === "number" &&
+      upgradeStatements.count === upgradeStatements.items.length,
+    "pkg upgrade-review statements count does not match items",
+  );
+  assert(
+    typeof upgradeStatements.totalCount === "number",
+    "pkg upgrade-review statements missing totalCount",
+  );
+  assert(
+    typeof upgradeStatements.matchingCount === "number",
+    "pkg upgrade-review statements missing matchingCount",
+  );
+  for (const item of upgradeStatements.items) {
+    assertRecord(item, "pkg upgrade-review statement item");
+    assert(
+      typeof item.fullText === "string",
+      "pkg upgrade-review missing statement fullText",
+    );
+    assert(
+      typeof item.sourcePosition === "number",
+      "pkg upgrade-review missing statement sourcePosition",
+    );
+    assert(
+      item.url === undefined || typeof item.url === "string",
+      "pkg upgrade-review invalid statement URL",
+    );
+    if (item.classification !== null) {
+      assertRecord(item.classification, "pkg upgrade-review classification");
+      assert(
+        typeof item.classification.tier === "string",
+        "pkg upgrade-review missing classification tier",
+      );
+      assert(
+        typeof item.classification.ambiguous === "boolean",
+        "pkg upgrade-review missing classification ambiguous flag",
+      );
+      assert(
+        typeof item.classification.model === "string",
+        "pkg upgrade-review missing classification model",
+      );
+      assert(
+        typeof item.classification.formulation === "string",
+        "pkg upgrade-review missing classification formulation",
+      );
+    }
+  }
+  const riskCoverage = firstUpgradeReview.changelog.riskCoverage;
+  assertRecord(riskCoverage, "pkg upgrade-review riskCoverage");
+  assert(
+    !("itemsOmitted" in riskCoverage),
+    "pkg upgrade-review returned deprecated itemsOmitted counter",
+  );
+  for (const counter of [
+    "versionsClassified",
+    "versionsNotAssessed",
+    "versionsWithoutNotes",
+    "versionsUnparseable",
+    "unitsNoImpact",
+    "itemsMustActConfident",
+    "itemsMustActAmbiguous",
+    "itemsShouldKnowConfident",
+    "itemsShouldKnowAmbiguous",
+    "itemsUnclassified",
+  ]) {
+    assert(
+      typeof riskCoverage[counter] === "number",
+      `pkg upgrade-review missing coverage counter ${counter}`,
+    );
+  }
+  for (const forbidden of [
+    "risk",
+    "riskLevel",
+    "recommendation",
+    "findings",
+    "verification",
+  ]) {
+    assert(
+      !(forbidden in firstUpgradeReview),
+      `pkg upgrade-review json leaked judgment field ${forbidden}`,
+    );
+  }
+
+  const grepPage = assertJsonOutput(
+    await runCli([
+      "grep",
+      "router",
+      SMOKE_PACKAGE_SPEC,
+      "--path",
+      "lib/express.js",
+      "--limit",
+      "1",
+      "--json",
+    ]),
+    "unified grep source JSON",
+  );
+  assertRecord(grepPage, "unified grep source JSON");
+  assert(
+    Array.isArray(grepPage.pathWarnings) &&
+      grepPage.pathWarnings.every((warning) => typeof warning === "string"),
+    "unified grep must retain pathWarnings",
+  );
+  assert(
+    Array.isArray(grepPage.hits) &&
+      grepPage.hits.length === 1 &&
+      Array.isArray(grepPage.targets),
+    "unified grep must return a bounded source match and statuses",
+  );
+  const selectedSite = (grepPage.targets as unknown[]).find(
+    (target) =>
+      typeof target === "object" &&
+      target !== null &&
+      "kind" in target &&
+      target.kind === "SITE",
+  );
+  assertRecord(selectedSite, "unified grep retained selected site");
+  assert(
+    Array.isArray(selectedSite.requestedInputIndices) &&
+      selectedSite.requestedInputIndices.includes(0),
+    "unified grep must retain selected-site input attribution",
+  );
+  if (selectedSite.readiness === "UNSPECIFIED")
+    assert(
+      selectedSite.traversal === "RESUMABLE_LIMIT" &&
+        selectedSite.errorCode === null &&
+        typeof grepPage.nextCursor === "string",
+      "unvisited grep scope must retain resumable traversal without failure",
+    );
+  const grepHit = grepPage.hits[0] as unknown;
+  assertRecord(grepHit, "unified grep source hit");
+  assert(
+    grepHit.__typename === "GrepRepositoryHit" &&
+      grepHit.filePath === "lib/express.js" &&
+      typeof grepHit.sourceMatchStartByte === "number",
+    "unified grep must retain source identities and physical coordinates",
+  );
+  assertRecord(grepHit.read, "unified grep exact read");
+  const grepRead = grepHit.read;
+  assert(
+    typeof grepRead.target === "string" &&
+      typeof grepRead.path === "string" &&
+      typeof grepRead.startLine === "number" &&
+      typeof grepRead.endLine === "number",
+    "unified grep read action must be complete",
+  );
+  assertJsonOutput(
+    await runCli([
+      "read",
+      grepRead.target,
+      grepRead.path,
+      "--lines",
+      `${grepRead.startLine}-${grepRead.endLine}`,
+      "--json",
+    ]),
+    "unified grep exact read replay",
+  );
+  const grepText = assertTerminalOutput(
+    await runCli([
+      "grep",
+      "router",
+      SMOKE_PACKAGE_SPEC,
+      "--path",
+      "lib/express.js",
+      "--limit",
+      "1",
+    ]),
+    "unified grep source text",
+  );
+  assert(
+    grepText.includes("Found 1 match on 1 line in 1 file.") &&
+      grepText.includes("Sources:") &&
+      grepText
+        .split("\n")
+        .includes(`[1] ${grepRead.target} ${grepRead.path}`) &&
+      grepText.includes("lib/express.js") &&
+      /^\s*\d+: .*router/m.test(grepText) &&
+      grepText.includes(
+        "Files: githits read --lines $start-$end -- $target $path",
+      ) &&
+      !grepText.includes("# source [") &&
+      !grepText.includes("Read recipes") &&
+      !grepText.includes("Hosted page reads") &&
+      !grepText.includes("CURRENT / RESUMABLE_LIMIT") &&
+      !grepText.includes("retryable false"),
+    "unified grep text must show grouped evidence and read guidance without a protocol dump",
+  );
+
+  const packageListText = assertTerminalOutput(
+    await runCli(["list", SMOKE_PACKAGE_SPEC, "--limit", "2"]),
+    "list package terminal",
+  );
+  assert(
+    packageListText.startsWith("Sources:\n  - ") &&
+      packageListText.includes("Read files: read -- "),
+    "list package terminal missing source header or paths",
+  );
+
+  const packageListSilent = assertTerminalOutput(
+    await runCli(["list", SMOKE_PACKAGE_SPEC, "--limit", "2", "--silent"]),
+    "list package silent",
+  );
+  const silentPaths = packageListSilent.split("\n");
+  assert(
+    silentPaths.length === 2 &&
+      silentPaths.every(
+        (path) =>
+          path.length > 0 &&
+          !path.startsWith("Sources:") &&
+          !path.startsWith("Read files:"),
+      ),
+    "list package silent must contain only result paths",
+  );
+
+  const packageListJson = assertJsonOutput(
+    await runCli(["list", SMOKE_PACKAGE_SPEC, "--limit", "1", "--json"]),
+    "list package json",
+  );
+  assertRecord(packageListJson, "list package json");
+  assert(
+    Array.isArray(packageListJson.entries) &&
+      packageListJson.entries.length === 1 &&
+      packageListJson.hasMore === true &&
+      typeof packageListJson.nextCursor === "string",
+    "list package json missing bounded page or continuation cursor",
+  );
+  const firstPackageEntry = packageListJson.entries[0] as unknown;
+  assertRecord(firstPackageEntry, "list package first entry");
+
+  const packageListFirstText = assertTerminalOutput(
+    await runCli(["list", SMOKE_PACKAGE_SPEC, "--limit", "1"]),
+    "list package first page text",
+  );
+  assert(
+    packageListFirstText.includes(
+      `  --after ${shellQuoteExact(packageListJson.nextCursor)}`,
+    ),
+    "list package first page text missing exact continuation cursor",
+  );
+  const firstPackagePath = listTextFirstFile(
+    packageListFirstText,
+    "list first page",
+  );
+  assert(
+    typeof firstPackagePath === "string" &&
+      firstPackagePath.length > 0 &&
+      firstPackagePath === firstPackageEntry.path,
+    "list package first page text missing path",
+  );
+
+  const packageListNext = assertTerminalOutput(
+    await runCli([
+      "list",
+      SMOKE_PACKAGE_SPEC,
+      "--limit",
+      "1",
+      "--after",
+      packageListJson.nextCursor,
+    ]),
+    "list package continuation text",
+  );
+  const nextPackagePath = listTextFirstFile(packageListNext, "list next page");
+  assert(
+    typeof nextPackagePath === "string" &&
+      nextPackagePath.length > 0 &&
+      nextPackagePath !== firstPackagePath,
+    "list package text continuation repeated the first entry",
+  );
+
+  const siteListText = assertTerminalOutput(
+    await runCli(["list", "site:expressjs.com", "--limit", "20"]),
+    "list site terminal",
+  );
+  assert(
+    siteListText.startsWith("Sources:\n  - site:expressjs.com") &&
+      siteListText
+        .split("\n")
+        .some((line) => line === "/" || line === "https://expressjs.com/"),
+    "list site terminal missing source or root page",
+  );
+
+  const siteListJson = assertJsonOutput(
+    await runCli([
+      "list",
+      "site:expressjs.com",
+      "/en/resources/",
+      "--limit",
+      "20",
+      "--json",
+    ]),
+    "list site json",
+  );
+  assertRecord(siteListJson, "list site json");
+  assert(Array.isArray(siteListJson.entries), "list site json missing entries");
+  const sitePage = siteListJson.entries.find((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.read !== "object" || record.read === null) return false;
+    const read = record.read as Record<string, unknown>;
+    return (
+      record.kind === "PAGE" &&
+      typeof read.target === "string" &&
+      read.target.startsWith("site:") &&
+      typeof read.path === "string"
+    );
+  }) as Record<string, unknown> | undefined;
+  assert(sitePage, "list site json missing readable page");
+  assertRecord(sitePage.read, "list site page read action");
+  assert(
+    typeof sitePage.read.target === "string" &&
+      typeof sitePage.read.path === "string",
+    "list site page missing target/path read action",
+  );
+  const listedSiteRead = assertJsonOutput(
+    await runCli([
+      "read",
+      sitePage.read.target,
+      sitePage.read.path,
+      "--lines",
+      "1-5",
+      "--json",
+    ]),
+    "list site read action",
+  );
+  assertRecord(listedSiteRead, "list site read action");
+  assert(
+    typeof listedSiteRead.content === "string" &&
+      listedSiteRead.content.length > 0,
+    "list site read action returned no content",
+  );
+
+  const descendantSiteTarget =
+    "site:reference.langchain.com/python/langchain/agents";
+  const descendantSiteJson = assertJsonOutput(
+    await runCli(["list", descendantSiteTarget, "--json"]),
+    "list descendant site json",
+  );
+  assertRecord(descendantSiteJson, "list descendant site json");
+  assert(
+    Array.isArray(descendantSiteJson.entries),
+    "descendant site missing entries",
+  );
+  const descendantDirectories = descendantSiteJson.entries.filter(
+    (entry) =>
+      typeof entry === "object" && entry !== null && entry.kind === "DIRECTORY",
+  );
+  assert(
+    descendantDirectories.length > 0,
+    "descendant site missing directories",
+  );
+  const descendantSiteText = assertTerminalOutput(
+    await runCli(["list", descendantSiteTarget]),
+    "list descendant site terminal",
+  );
+  const descendantLines = descendantSiteText.trimEnd().split("\n");
+  assert(
+    descendantLines[0] === "Sources:" &&
+      descendantLines[1]?.startsWith(`  - ${descendantSiteTarget}`),
+    "descendant site header must use the requested path base",
+  );
+  for (const directory of descendantDirectories) {
+    assertRecord(directory, "descendant site directory");
+    assert(
+      typeof directory.path === "string",
+      "descendant site directory missing path",
+    );
+    const renderedPath = directory.path.endsWith("/")
+      ? directory.path
+      : `${directory.path}/`;
+    assert(
+      descendantLines.includes(renderedPath),
+      "descendant site text must preserve the JSON directory path",
+    );
+  }
+
+  const docsJson = assertJsonOutput(
+    await runCli([
+      "docs",
+      "list",
+      SMOKE_PACKAGE_SPEC,
+      "--limit",
+      "500",
+      "--json",
+    ]),
+    "docs list json",
+  );
+  assertRecord(docsJson, "docs list json");
+  assert(Array.isArray(docsJson.pages), "docs list json missing pages array");
+  const docsPages = docsJson.pages as unknown[];
+  const crawledPage = docsPages.find(
+    (page) =>
+      typeof page === "object" &&
+      page !== null &&
+      (page as Record<string, unknown>).sourceKind === "crawled" &&
+      typeof (page as Record<string, unknown>).docsReadTarget === "string" &&
+      /^https?:\/\//.test(
+        (page as Record<string, unknown>).docsReadTarget as string,
+      ),
+  ) as Record<string, unknown> | undefined;
+  const repoPage = docsPages.find(
+    (page) =>
+      typeof page === "object" &&
+      page !== null &&
+      (page as Record<string, unknown>).sourceKind === "repo",
+  ) as Record<string, unknown> | undefined;
+  assert(
+    crawledPage &&
+      typeof crawledPage.docsReadTarget === "string" &&
+      typeof crawledPage.pageId === "string" &&
+      typeof crawledPage.sourceUrl === "string",
+    "docs list json missing crawled URL target, stable page ID, or source URL",
+  );
+  assert(
+    repoPage &&
+      typeof repoPage.docsReadTarget === "string" &&
+      typeof repoPage.pageId === "string" &&
+      typeof repoPage.sourceUrl === "string",
+    "docs list json missing repo-backed target, stable page ID, or source URL",
+  );
+  assert(
+    repoPage.docsReadTarget === repoPage.pageId,
+    "docs list json repo-backed docsReadTarget should remain snapshot-pinned",
+  );
+
+  const crawledPageIndex = docsPages.indexOf(crawledPage);
+  let crawledPageAfter: string | undefined;
+  if (crawledPageIndex > 0) {
+    const precedingDocs = assertJsonOutput(
+      await runCli([
+        "docs",
+        "list",
+        SMOKE_PACKAGE_SPEC,
+        "--limit",
+        String(crawledPageIndex),
+        "--json",
+      ]),
+      "docs list crawled target cursor",
+    );
+    assertRecord(precedingDocs, "docs list crawled target cursor");
+    assert(
+      typeof precedingDocs.nextCursor === "string",
+      "docs list crawled target cursor missing nextCursor",
+    );
+    crawledPageAfter = precedingDocs.nextCursor;
+  }
+  const docsListArgs = ["docs", "list", SMOKE_PACKAGE_SPEC, "--limit", "1"];
+  if (crawledPageAfter) docsListArgs.push("--after", crawledPageAfter);
+  const docsText = assertTerminalOutput(
+    await runCli(docsListArgs),
+    "docs list crawled target terminal",
+  );
+  assert(
+    docsText.includes(buildCliDocsReadCommand(crawledPage.docsReadTarget)),
+    "docs list terminal missing shell-quoted crawled URL follow-up",
+  );
+
+  const docsReadText = assertTerminalOutput(
+    await runCli(["read", crawledPage.docsReadTarget, "--lines", "1-5"]),
+    "docs read crawled URL terminal",
+  );
+  assert(
+    docsReadText.length > 0,
+    "docs read crawled URL terminal missing content",
+  );
+
+  const docsReadJson = assertJsonOutput(
+    await runCli([
+      "read",
+      crawledPage.docsReadTarget,
+      "--lines",
+      "1-5",
+      "--json",
+    ]),
+    "docs read crawled URL json",
+  );
+  assertRecord(docsReadJson, "docs read crawled URL json");
+  assert(
+    docsReadJson.docsReadTarget === crawledPage.docsReadTarget &&
+      docsReadJson.pageId === crawledPage.pageId &&
+      docsReadJson.sourceUrl === crawledPage.sourceUrl &&
+      typeof docsReadJson.content === "string" &&
+      docsReadJson.startLine === 1 &&
+      typeof docsReadJson.endLine === "number" &&
+      docsReadJson.endLine >= 1 &&
+      docsReadJson.endLine <= 5 &&
+      typeof docsReadJson.totalLines === "number" &&
+      docsReadJson.totalLines >= docsReadJson.endLine,
+    "docs read crawled URL json missing locators, content, or backend range",
+  );
+
+  const legacyCrawledRead = assertJsonOutput(
+    await runCli([
+      "docs",
+      "read",
+      crawledPage.pageId,
+      "--lines",
+      "1-5",
+      "--json",
+    ]),
+    "docs read legacy crawled ID json",
+  );
+  assertRecord(legacyCrawledRead, "docs read legacy crawled ID json");
+  assert(
+    legacyCrawledRead.pageId === docsReadJson.pageId &&
+      legacyCrawledRead.content === docsReadJson.content,
+    "docs read URL and legacy crawled ID returned different ranged content",
+  );
+
+  const repoRead = assertJsonOutput(
+    await runCli(["docs", "read", repoPage.docsReadTarget, "--json"]),
+    "docs read repo-backed ID json",
+  );
+  assertRecord(repoRead, "docs read repo-backed ID json");
+  assert(
+    repoRead.docsReadTarget === repoPage.docsReadTarget &&
+      repoRead.pageId === repoPage.pageId &&
+      typeof repoRead.content === "string" &&
+      typeof repoRead.totalLines === "number" &&
+      (repoRead.totalLines === 0 ||
+        (typeof repoRead.startLine === "number" &&
+          typeof repoRead.endLine === "number")),
+    "docs read repo-backed ID json missing snapshot locators, content, or range",
+  );
+
+  const snapshotPath = /@[a-f0-9]{40}\/(.+)$/i.exec(
+    repoPage.docsReadTarget as string,
+  )?.[1];
+  assert(snapshotPath, "repo-backed target must contain a snapshot file path");
+  const snapshotFileRead = assertJsonOutput(
+    await runCli([
+      "read",
+      repoPage.docsReadTarget as string,
+      snapshotPath,
+      "--json",
+    ]),
+    "unified read repo-backed ID plus path json",
+  );
+  assertRecord(snapshotFileRead, "unified read repo-backed ID plus path json");
+  assert(
+    snapshotFileRead.path === snapshotPath &&
+      typeof snapshotFileRead.content === "string" &&
+      snapshotFileRead.gitRef ===
+        /@([a-f0-9]{40})\//i.exec(repoPage.docsReadTarget as string)?.[1],
+    "unified read repo-backed ID plus path lost snapshot file identity",
+  );
+
+  assertJsonErrorCode(
+    await runCli([
+      "docs",
+      "read",
+      "https://docs.example.invalid/githits-smoke-unknown",
+      "--json",
+    ]),
+    "docs read unknown URL",
+    "NOT_FOUND",
+  );
+
+  const codeFilesText = assertTerminalOutput(
+    await runCli([
+      "code",
+      "files",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--limit",
+      "1",
+    ]),
+    "code files terminal",
+  );
+  assert(
+    codeFilesText.includes("package.json"),
+    "code files terminal missing package.json",
+  );
+
+  const codeFilesJson = assertJsonOutput(
+    await runCli([
+      "code",
+      "files",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--limit",
+      "1",
+      "--json",
+    ]),
+    "code files json",
+  );
+  assertRecord(codeFilesJson, "code files json");
+  assert(
+    Array.isArray(codeFilesJson.files),
+    "code files json missing files array",
+  );
+
+  const codeReadText = assertTerminalOutput(
+    await runCli([
+      "code",
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--lines",
+      "1-5",
+    ]),
+    "code read terminal",
+  );
+  assert(
+    codeReadText.includes('"name"'),
+    "code read terminal missing file content",
+  );
+
+  const codeReadJson = assertJsonOutput(
+    await runCli([
+      "code",
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--lines",
+      "1-5",
+      "--json",
+    ]),
+    "code read json",
+  );
+  assertRecord(codeReadJson, "code read json");
+  assert(codeReadJson.path === "package.json", "code read json path mismatch");
+  assert(
+    typeof codeReadJson.content === "string",
+    "code read json missing content",
+  );
+
+  const unifiedCodeReadJson = assertJsonOutput(
+    await runCli([
+      "read",
+      SMOKE_PACKAGE_SPEC,
+      "package.json",
+      "--lines",
+      "1-5",
+      "--json",
+    ]),
+    "unified read exact file json",
+  );
+  assertRecord(unifiedCodeReadJson, "unified read exact file json");
+  assert(
+    unifiedCodeReadJson.path === codeReadJson.path &&
+      unifiedCodeReadJson.content === codeReadJson.content &&
+      unifiedCodeReadJson.registry === codeReadJson.registry &&
+      unifiedCodeReadJson.name === codeReadJson.name,
+    "unified read exact file changed legacy content or target identity",
+  );
+
+  const codeReadInvalid = await runCli([
+    "code",
+    "read",
+    SMOKE_PACKAGE_SPEC,
+    "lib/",
+    "--json",
+  ]);
+  const codeReadInvalidEnvelope = assertCleanErrorEnvelope(
+    codeReadInvalid.stderr,
+    "code read invalid json",
+  );
+  assert(
+    codeReadInvalid.exitCode !== 0 &&
+      codeReadInvalidEnvelope.code === "INVALID_ARGUMENT" &&
+      codeReadInvalidEnvelope.error.includes("githits list") &&
+      codeReadInvalidEnvelope.error.includes("githits read") &&
+      !codeReadInvalidEnvelope.error.includes("code_files"),
+    "code read invalid json missing CLI-native recovery",
+  );
+
+  const codeGrepText = assertTerminalOutput(
+    await runCli([
+      "code",
+      "grep",
+      SMOKE_PACKAGE_SPEC,
+      "express",
+      "package.json",
+      "--limit",
+      "1",
+    ]),
+    "code grep terminal",
+  );
+  assert(
+    codeGrepText.includes("package.json"),
+    "code grep terminal missing package.json",
+  );
+
+  const codeGrepJson = assertJsonOutput(
+    await runCli([
+      "code",
+      "grep",
+      SMOKE_PACKAGE_SPEC,
+      "express",
+      "package.json",
+      "--limit",
+      "1",
+      "--after-context",
+      "12",
+      "--json",
+    ]),
+    "code grep json",
+  );
+  assertRecord(codeGrepJson, "code grep json");
+  assert(
+    "matches" in codeGrepJson || "totalMatches" in codeGrepJson,
+    "code grep json missing matches",
+  );
+  assertRecord(
+    codeGrepJson.contextClamping,
+    "legacy code grep context clamping",
+  );
+  assert(
+    codeGrepJson.contextClamping.requestedAfter === 12 &&
+      codeGrepJson.contextClamping.effectiveAfter === 10,
+    "legacy code grep context clamping changed",
+  );
+
+  const codeGrepInvalid = await runCli([
+    "code",
+    "grep",
+    SMOKE_PACKAGE_SPEC,
+    " ",
+    "--json",
+  ]);
+  const codeGrepInvalidEnvelope = assertCleanErrorEnvelope(
+    codeGrepInvalid.stderr,
+    "code grep invalid json",
+  );
+  assert(
+    codeGrepInvalid.exitCode !== 0 &&
+      codeGrepInvalidEnvelope.code === "INVALID_ARGUMENT" &&
+      codeGrepInvalidEnvelope.error.includes("<pattern>") &&
+      codeGrepInvalidEnvelope.error.includes("githits list") &&
+      !codeGrepInvalidEnvelope.error.includes("code_files"),
+    "code grep invalid json missing CLI-native recovery",
+  );
+
+  const searchInvalidPrefix = await runCli([
+    "search",
+    "router",
+    "--in",
+    SMOKE_PACKAGE_SPEC,
+    "--source",
+    "docs",
+    "--path-prefix",
+    "docs/",
+    "--json",
+  ]);
+  const searchInvalidPrefixEnvelope = assertCleanErrorEnvelope(
+    searchInvalidPrefix.stderr,
+    "search unsupported path prefix",
+  );
+  assert(
+    searchInvalidPrefix.exitCode !== 0 &&
+      searchInvalidPrefixEnvelope.code === "INVALID_ARGUMENT",
+    "search must reject unsupported path prefixes",
+  );
+
+  const inlineSearchQuery =
+    "application path:lib/ intent:production lang:javascript";
+  const inlineSearchJson = assertJsonOutput(
+    await runCli([
+      "search",
+      inlineSearchQuery,
+      "--in",
+      SMOKE_PACKAGE_SPEC,
+      "--source",
+      "code",
+      "--limit",
+      "1",
+      "--json",
+    ]),
+    "search inline qualifiers",
+  );
+  assertInlineSearchSuccess(
+    inlineSearchJson,
+    inlineSearchQuery,
+    "search inline qualifiers",
+  );
+
+  for (const [qualifier, source] of [
+    ["kind:bogus", "symbol"],
+    ["category:bogus", "symbol"],
+    ["intent:bogus", "code"],
+  ] as const) {
+    assertInlineSearchError(
+      await runCli([
+        "search",
+        `router ${qualifier}`,
+        "--in",
+        SMOKE_PACKAGE_SPEC,
+        "--source",
+        source,
+        "--json",
+      ]),
+      `search invalid inline qualifier ${qualifier}`,
+    );
+  }
+
+  const searchText = assertTerminalOutput(
+    await runCli([
+      "search",
+      "router",
+      "--in",
+      SMOKE_PACKAGE_SPEC,
+      "--limit",
+      "1",
+    ]),
+    "search terminal",
+  );
+  assertSearchTerminalText(searchText, "search terminal");
+
+  const searchJson = assertJsonOutput(
+    await runCli([
+      "search",
+      "router",
+      "--in",
+      SMOKE_PACKAGE_SPEC,
+      "--limit",
+      "1",
+      "--json",
+    ]),
+    "search json",
+  );
+  assertRecord(searchJson, "search json");
+  assert(
+    "results" in searchJson || "searchRef" in searchJson,
+    "search json missing results/searchRef",
+  );
+  if (typeof searchJson.searchRef === "string") {
+    const statusJson = assertJsonOutput(
+      await runCli([
+        "search-status",
+        searchJson.searchRef,
+        "--wait",
+        "0",
+        "--json",
+      ]),
+      "search-status json",
+    );
+    assertRecord(statusJson, "search-status json");
+    assert(
+      "completed" in statusJson || "progress" in statusJson,
+      "search-status json missing status data",
+    );
+  } else {
+    assertJsonErrorCode(
+      await runCli([
+        "search-status",
+        "smoke-invalid-search-ref",
+        "--wait",
+        "0",
+        "--json",
+      ]),
+      "search-status invalid json error",
+      "NOT_FOUND",
+    );
+  }
+
+  const invalidJson = await runCli([
+    "pkg",
+    "info",
+    "npm:express@4.18.0",
+    "--json",
+  ]);
+  assertJsonErrorCode(
+    invalidJson,
+    "pkg info invalid json error",
+    "INVALID_ARGUMENT",
+  );
+}
+
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const options = parseCliSmokeArgs(argv);
+  cliLaunchTarget = options.target;
+  process.stderr.write(
+    `[smoke] CLI launch target: ${formatCliLaunchTarget(options.target)}\n`,
+  );
+  await assertUnauthenticatedBehavior();
+  await assertLegacyExperimentalOptInIgnored();
+  if (options.mode === "unauthenticated") {
+    console.log("CLI stable unauthenticated smoke passed");
+    return;
+  }
+  const stableLive = createScopedSmokeEnvironment(
+    "githits-cli-live-stable-home-",
+  );
+  let stableStatus: CliLiveCohortStatus = "skipped";
+  try {
+    writeSmokeConfig(stableLive.env, "[experimental]\ntools = false\n");
+    if (await assertLiveOrAuthRequired(stableLive.env)) {
+      await runLiveSmoke(stableLive.env);
+      await assertJsonParity(stableLive.env);
+      stableStatus = "passed";
+    }
+  } finally {
+    stableLive.cleanup();
+  }
+
+  console.log(formatCliLiveCohortSummary(stableStatus));
+}
+
+function inheritedEnv(): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+}
+
+if (import.meta.main) {
+  try {
+    await main();
+  } finally {
+    printSmokeTimingSummary();
+  }
+}

@@ -1,0 +1,517 @@
+<p align="center">
+  <img src="./github-githits.png" alt="GitHits" width="100%" />
+</p>
+
+<h1 align="center">GitHits CLI</h1>
+
+<p align="center">
+  The infrastructure layer connecting agents to the open-source ecosystem.
+</p>
+
+<p align="center">
+  <a href="https://index.githits.dev/repositories/github.com/githits-com/githits-cli/"><img alt="GitHits index status" src="https://index.githits.dev/badge/repositories/github.com/githits-com/githits-cli/index-status.svg"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/githits"><img alt="npm version" src="https://img.shields.io/npm/v/githits.svg"></a>
+  <a href="https://www.npmjs.com/package/githits"><img alt="npm downloads" src="https://img.shields.io/npm/dm/githits.svg"></a>
+  <a href="https://github.com/githits-com/githits-cli/actions/workflows/main.yml"><img alt="Main" src="https://github.com/githits-com/githits-cli/actions/workflows/main.yml/badge.svg"></a>
+  <a href="https://github.com/githits-com/githits-cli/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="https://www.npmjs.com/package/githits"><img alt="Node" src="https://img.shields.io/node/v/githits.svg"></a>
+  <a href="https://modelcontextprotocol.io/"><img alt="MCP" src="https://img.shields.io/badge/MCP-enabled-5C4EE5"></a>
+  <a href="https://skills.sh/githits-com/githits-cli"><img alt="skills.sh" src="https://skills.sh/b/githits-com/githits-cli"></a>
+  <a href="https://glama.ai/mcp/servers/githits-com/githits-cli"><img alt="githits-cli MCP server" src="https://glama.ai/mcp/servers/githits-com/githits-cli/badges/score.svg"></a>
+  <a href="https://lobehub.com/mcp/githits-com-githits-cli"><img alt="MCP Badge" src="https://lobehub.com/badge/mcp/githits-com-githits-cli?style=plastic"></a>
+</p>
+
+<p align="center">
+  <a href="https://githits.com">Website</a> ·
+  <a href="https://docs.githits.com">Documentation</a> ·
+  <a href="https://github.com/githits-com/githits-cli/issues">Issues</a>
+</p>
+
+GitHits connects AI coding agents to public open-source evidence across the
+full software development lifecycle: discovery, planning, research,
+implementation, debugging, and maintenance.
+
+The CLI runs a local [MCP](https://modelcontextprotocol.io/) server that your
+coding tool starts on demand. Agents can then search indexed package and
+repository source, read exact files and documentation pages, inspect package
+health, compare dependency upgrades, and find source-cited examples from real
+open-source projects when model knowledge and local repository context are not
+enough.
+
+Want to use GitHits as part of your agent harness or software factory? Check out
+our [public API documentation](https://docs.githits.com/api/overview).
+
+## Quick Start
+
+```sh
+npx githits@latest init
+```
+
+`init` signs you in, detects supported coding tools, and configures GitHits for
+the tools you select. It uses the local stdio MCP except for Cursor, whose
+direct setup uses the hosted remote MCP.
+
+Automatic setup currently supports Claude Code, Cursor, Windsurf,
+VS Code / Copilot, Cline, Claude Desktop, Codex CLI, Pi, Gemini CLI,
+Google Antigravity, OpenCode, Hermes Agent, Zed, Junie, Qwen Code,
+Kiro, Kilo Code, Factory Droid, and Amazon Q CLI.
+
+After setup, open your coding agent and work normally. Many agents call GitHits
+when they need source-backed context. If your agent starts guessing, prompt it
+directly:
+
+```text
+Use GitHits Code Navigation to inspect npm:express. Find how middleware
+errors are handled, read the relevant source, and explain the fix before
+editing code.
+```
+
+## What GitHits Adds
+
+GitHits is designed for the point where an agent needs evidence from the
+broader open-source ecosystem, not just model memory or local repo context:
+
+| Capability | MCP tools | CLI commands |
+|---|---|---|
+| Tool orientation | `quick_start` | — |
+| Code examples | `get_example` | `githits example` |
+| Inventory browsing | `list` | `githits list` |
+| Code and documentation search | `search`, `search_status`, `grep` | `githits search`, `githits search-status`, `githits grep` |
+| Read source files or documentation sections | `read` | `githits read <target> [path]` |
+| Package inspection | `pkg_info`, `pkg_vulns`, `pkg_deps`, `pkg_changelog`, `pkg_upgrade_review` | `githits pkg ...` |
+
+Use GitHits when your agent needs to:
+
+- discover, plan, or research how OSS projects solve a vague issue or unfamiliar error
+- find broad prior art or rare needle-in-the-haystack examples across repositories
+- inspect source, tests, symbols, or docs for a known package or repository
+- verify how a dependency actually behaves before changing code
+- debug stack traces that point into third-party code
+- review package health, licenses, vulnerabilities, dependencies, and changelogs
+- compare dependency upgrades using factual evidence
+
+## Examples
+
+Find prior art across open source:
+
+```sh
+npx githits@latest example "HTTP retries with exponential backoff in Python"
+```
+
+Search indexed code, docs, and symbols for a dependency:
+
+```sh
+npx githits@latest search "router middleware" --in npm:express
+npx githits@latest search '"body parser" OR multer' --in npm:express --source docs
+npx githits@latest search "debounce" --in npm:lodash --source symbol
+```
+
+Read and grep dependency source without cloning:
+
+```sh
+npx githits@latest code files npm:express lib
+npx githits@latest code read npm:express lib/router/index.js --lines 120-200
+npx githits@latest grep 'router\.use' npm:express --path-prefix lib/
+```
+
+Inspect package health and upgrade evidence:
+
+```sh
+npx githits@latest pkg info npm:express
+npx githits@latest pkg vulns npm:lodash@4.17.20 --severity high
+npx githits@latest pkg deps npm:express@4.18.2 --depth 2
+npx githits@latest pkg changelog npm:express --from 4.18.2 --to 5.2.1
+npx githits@latest pkg upgrade-review npm:zod@4.3.6 --to 4.4.3
+```
+
+Browse and read package documentation:
+
+```sh
+npx githits@latest docs list npm:express
+npx githits@latest docs read <docs-read-target> --lines 20-80
+```
+
+## Source Diffs
+
+`githits code diff` and the public MCP `code_diff` tool are available by default.
+Compare exact package versions or public repository refs, for example:
+
+```sh
+githits code diff npm:express 5.2.0..5.2.1 --stat
+githits code diff npm:express 5.2.0..5.2.1 --patch -- 'lib/**/*.js'
+```
+
+Package diffs are repository-wide unless narrowed by an explicit path glob.
+Raw diffs do not prove upgrade safety. See [source diff](docs/implementation/code-diff.md)
+for bounds, patch safety, and supported addressing. Hosted MCP availability
+requires adoption of the released `@githits/mcp` package and deployment.
+
+## Target Resolution
+
+`resolve_target` / `githits resolve` turns a fuzzy, misspelled or ambiguous public
+package, repository or documentation-site name into ranked canonical targets.
+It is available by default in the CLI, local MCP and public MCP package.
+Canonical targets skip resolution; uncertain identity needs an explicit choice.
+See [target resolution](docs/implementation/resolve-target.md) for continuation
+rules and limits. Hosted MCP and plugins receive it after the released package
+is adopted and deployed.
+
+## Research
+
+`research` / `githits research` answers a question about one public package or
+repository with a verified answer that cites its sources. It is available by
+default in the CLI, local MCP and public MCP package:
+
+```sh
+githits research "How does FastAPI dependency injection resolve nested dependencies?"
+githits research npm:express "Where is router dispatch implemented?"
+githits research --thread <thread-id> "How does that interact with route parameters?"
+```
+
+Omit the target to let GitHits identify it from the question; reuse a returned
+thread ID for follow-ups. Answers usually take 30 seconds to a few minutes.
+Questions are sent to GitHits, so never include credentials, personal data or
+private code. Research may return a rate-limit or daily-limit error; the message says when to
+retry, and the daily limit resets at 00:00 UTC. See
+[research](docs/implementation/research.md) for sources, threads and limits.
+Hosted MCP and plugins receive it after the released package is adopted and
+deployed.
+
+## Supported Sources
+
+GitHits works with package and repository targets such as:
+
+- package specs: `npm:react`, `npm:react@18.2.0`, `pypi:requests`, `crates:serde`
+- GitHub repos: `https://github.com/expressjs/express`, `github:expressjs/express@main`
+
+Package inspection supports npm, PyPI, Hex, Crates, NuGet, Maven, Packagist,
+RubyGems, Go, Swift, vcpkg, and Zig. Advisory data is unavailable for vcpkg and
+Zig; dependency graph support varies by registry. `cargo:` is an input alias for
+`crates:` (public crates.io); canonical registry identities remain `crates`.
+
+## License Filtering
+
+Code example search supports license filtering:
+
+- `strict` is the default and filters repositories with copyleft or undeclared licenses
+- `custom` uses your account blocklist configured at [githits.com](https://githits.com)
+- `yolo` disables license filtering
+
+```sh
+npx githits@latest example "async file reading" --lang python --license strict
+```
+
+## Authentication
+
+Normal local setup is handled by:
+
+```sh
+npx githits@latest init
+```
+
+For manual login:
+
+```sh
+npx githits@latest login
+```
+
+Browser OAuth is recommended for local development. Credentials are stored in
+the system keychain by default and refreshed automatically. Useful flags:
+
+- `init --no-browser` or `login --no-browser` prints the login URL instead of launching a browser
+- `init --port <port>` or `login --port <port>` fixes the loopback callback port
+- `login --force` re-authenticates even if you are already logged in
+
+The OAuth callback always listens on the machine where GitHits is running.
+When GitHits runs over SSH and the browser runs locally, forward the selected
+port from the browser machine:
+
+```sh
+ssh -N -L 8765:127.0.0.1:8765 user@remote-host
+```
+
+With that tunnel open, run GitHits on the remote machine using the same port:
+
+```sh
+npx githits@latest init --no-browser --port 8765
+```
+
+Open the URL printed by GitHits in the local browser. Replace
+`user@remote-host` with the SSH destination you normally use. The same flags
+work with `githits login` after setup.
+
+Browser OAuth is interactive. For CI and other unattended environments, supply
+`GITHITS_API_TOKEN` through the environment's secret manager.
+
+### Keychain Prompts and File Storage
+
+GitHits uses the system keychain by default because OAuth credentials include a
+refresh token. On macOS this means Keychain Access; on Windows it means
+Credential Manager; on Linux it means the available Secret Service or keyring
+backend.
+
+If macOS shows a prompt such as "githits wants to access ... in your keychain",
+choose **Always Allow** when you trust the installed `githits` CLI. GitHits
+cannot customize that operating-system prompt; it is generated by macOS.
+
+GitHits also writes a small non-secret metadata file so recent startup checks do
+not need to read the keychain. The keychain is only read when GitHits needs the
+token, for example during a tool call, token refresh, `githits auth status`, or a
+login check after metadata is stale or expired.
+
+If your agent keeps showing keychain prompts even after **Always Allow**, switch
+OAuth storage to file mode:
+
+```toml
+# macOS/Linux: ~/.config/githits/config.toml, or $XDG_CONFIG_HOME/githits/config.toml
+# Windows: %APPDATA%\githits\config.toml
+[auth]
+storage = "file"
+```
+
+The config directory may be empty until you create `config.toml` or GitHits
+writes auth metadata. Older macOS installs may have used
+`~/Library/Application Support/githits`; GitHits still reads that location for
+migration, but new auth config and file storage use `~/.config/githits`.
+
+You can also opt in for one process:
+
+```sh
+GITHITS_AUTH_STORAGE=file githits login --force
+```
+
+File mode stores OAuth credentials as JSON files under the GitHits config
+directory. The files are written with private permissions where the platform
+supports it, but they are not encrypted. Any process that can read files as your
+operating-system user may be able to read the tokens.
+
+Use file mode only on machines where you trust local user-account access. For CI
+and automation, prefer `GITHITS_API_TOKEN` instead of browser OAuth.
+
+Inspect auth and runtime state with:
+
+```sh
+npx githits@latest auth status
+npx githits@latest doctor
+```
+
+See the [authentication docs](https://docs.githits.com/authentication) for
+keychain behavior, file storage mode, CI setup, and troubleshooting.
+
+## Manual MCP Setup
+
+If your coding tool is not auto-configured by `init`, add GitHits to its MCP
+configuration manually:
+
+```json
+{
+  "mcpServers": {
+    "githits": {
+      "command": "npx",
+      "args": ["-y", "githits@latest", "mcp", "start"]
+    }
+  }
+}
+```
+
+Your tool runs this command over stdio. No background daemon or global install
+is required.
+
+To remove configuration written by `init`:
+
+```sh
+npx githits@latest uninstall
+```
+
+This removes GitHits MCP configuration and guidance written by `init`, while
+preserving stored credentials. Run `npx githits@latest logout` separately to
+remove credentials. The compatibility form `npx githits@latest init uninstall`
+accepts the same `--yes`, `--project`, and `--keep-guidance` options.
+
+## Project Setup
+
+For project-local MCP config, run:
+
+```sh
+npx githits@latest init --project
+```
+
+Project setup is available only for tools with verified project-local MCP
+support. Project config contains no secrets, but it may be committed like other
+tooling configuration, so review generated files before adding them to source
+control.
+
+Agent-safe non-interactive setup uses staged discovery and explicit install:
+
+```sh
+npx githits@latest init --detect-agents --json
+npx githits@latest init --install-agents cursor,codex-cli
+```
+
+## Plugin and Extension Packaging
+
+The repository and published package provide the plugin and extension assets
+used by compatible hosts. Git-based installs also retain the context-file
+symlinks (`CLAUDE.md` and `GEMINI.md`) to the canonical `AGENTS.md`:
+
+- `.plugin/plugin.json`
+- `.claude-plugin/plugin.json`
+- `.claude-plugin/marketplace.json`
+- `.codex-plugin/plugin.json`
+- `.cursor-plugin/plugin.json`
+- `.mcp.json`
+- `gemini-extension.json`
+- `plugin.json` (Google Antigravity)
+- `mcp_config.json` (Google Antigravity)
+- `AGENTS.md`
+- `CLAUDE.md`
+- `GEMINI.md`
+- `skills/`
+
+The root skill tree is shared by all supported hosts. Every plugin and extension
+install uses the hosted remote MCP, including Claude, Codex, Cursor, Gemini CLI,
+Google Antigravity, and VS Code/GitHub Copilot OpenPlugin. Direct `githits init`
+setup is a separate path: it installs local stdio configurations for supported
+tools except Cursor, which remains remote-only. The repository root is a native
+Antigravity plugin through `plugin.json`, `mcp_config.json`, and the shared
+`skills/` tree. Generated manifests are refreshed with `bun run plugins:generate`
+and validated with `bun run plugins:check`.
+
+Guided `init` installs the four canonical skills (`githits-code`, `githits-mcp`,
+`githits-onboarding`, and `githits-package`) only for selected agents. Shared
+skill-capable agents use `~/.agents/skills/` at user scope or `.agents/skills/`
+at project scope; native-only agents use their verified native skill directory.
+Compatible agents reading a shared root can discover those skills. A later
+guided run repairs missing skills, and migration removes only the historical
+Cline or Junie `githits-mcp/SKILL.md` after the complete shared set is verified.
+
+For Claude Code marketplace installs:
+
+```sh
+claude plugin marketplace add githits-com/githits-cli
+claude plugin install githits@githits-plugins
+```
+
+For Gemini CLI extension installs:
+
+```sh
+gemini extensions install https://github.com/githits-com/githits-cli
+```
+
+## Command Reference
+
+```text
+githits init             Connect GitHits to your coding agents
+githits uninstall        Remove GitHits MCP configuration and guidance
+githits init uninstall   Compatibility alias for `githits uninstall`
+githits login            Sign in to your GitHits account
+githits logout           Remove stored credentials
+githits mcp              Show setup instructions or start the local MCP server
+githits mcp start        Always start the local MCP server over stdio
+githits example          Find real-world implementations from open source
+githits doctor           Diagnose configuration and auth state
+githits resolve          Resolve a fuzzy name to canonical targets
+githits settings         View and update preferences, privacy, and terms
+githits search           Explore repository code, dependencies, docs, and symbols
+githits search-status    Check the status of a previous indexed search
+githits code             List, read, grep, or diff source
+githits pkg              Inspect package metadata, vulnerabilities, deps, and changelogs
+githits docs             Browse and read package documentation
+githits auth             Manage authentication
+githits auth status      Show authentication status
+```
+
+Full CLI reference: https://docs.githits.com/cli/commands
+
+## Environment Variables
+
+Most users do not need environment variables. These are the common overrides for
+CI, auth storage, and local diagnostics:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GITHITS_API_TOKEN` | API token for authentication | unset |
+| `GITHITS_AUTH_STORAGE` | Override OAuth storage mode: `keychain` or `file` | `keychain` |
+| `GITHITS_DISABLE_UPDATE_CHECK` | Disable npm latest-version update notices | unset |
+| `GITHITS_TELEMETRY` | Emit local timing diagnostics to stderr | unset |
+
+Full reference: https://docs.githits.com/cli/environment-variables
+
+## Source Layout
+
+This repository contains the GitHits CLI and reusable MCP package:
+
+- `src/` - CLI commands, local auth, setup flows, and local MCP stdio startup
+- `packages/mcp/` - public `@githits/mcp` package for transport-neutral MCP
+  server APIs, tool registration, instructions, and smoke-test helpers
+- `packages/core-internal/` - shared workspace implementation used by the CLI
+  and MCP package
+- `docs/` - implementation notes and contributor guidelines
+- `scripts/` - package validation, smoke tests, and development utilities
+
+See [CHANGELOG.md](CHANGELOG.md) for released changes, pending work, and the
+current package-version impact.
+
+## Development
+
+Requirements:
+
+- Node.js `^20.18.1 || >=22.13.0`
+- Bun
+- Python 3.11 or later for the dependency-upgrade scorer tests (`python` on
+  Windows, `python3` elsewhere)
+
+Common commands:
+
+```sh
+bun install
+bun run dev --help
+bun test
+bun run typecheck
+bun run build
+```
+
+When changing MCP tools, CLI commands, shared formatters, auth/error envelopes,
+or MCP/CLI parity behavior, also run the relevant smoke suites:
+
+```sh
+bun run smoke:mcp
+bun run smoke:cli
+```
+
+CI also checks the built product without credentials or live backend calls. Run
+the same checks locally after `bun run build`:
+
+```sh
+bun run smoke:cli:built
+bun run smoke:mcp:built
+```
+
+The harness remains on Bun, while product subprocesses execute `dist/cli.js`
+with `node` from `PATH`. CI provisions that runtime from `.node-version`.
+
+Secret scanning uses the gitleaks OSS CLI at version 8.30.1. The pre-commit
+hook runs `bun run check:gitleaks` on staged changes. Scan the full history
+locally with:
+
+```sh
+gitleaks git --redact --no-banner --no-color .
+```
+
+Install the 8.30.1 binary from the gitleaks releases and put it on `PATH`.
+See [secret scanning](docs/implementation/security-scanning.md) for the CI
+schedule, suppression order, and npm package boundary.
+
+When changing MCP instructions, tool descriptions, or agent-facing behavior,
+use the targeted agent evals described in `eval/agentic/README.md`:
+
+```sh
+bun run agent:e2e
+```
+
+## License
+
+Apache-2.0

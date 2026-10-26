@@ -1,0 +1,569 @@
+import { describe, expect, it, mock } from "bun:test";
+import {
+  AuthenticationError,
+  TermsAcceptanceRequiredError,
+} from "@githits/core-internal";
+import * as publicMcp from "@githits/mcp";
+import {
+  buildMcpQuickStart,
+  createMcpServer,
+  getMcpToolDescriptors,
+  type McpToolExecutionHook,
+  type McpToolServices,
+  type McpToolServicesProvider,
+  registerMcpTools,
+} from "@githits/mcp";
+import { getMcpToolDefinitions } from "@githits/mcp/internal";
+import { EXPECTED_MCP_TOOLS } from "@githits/mcp/smoke-test";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type {
+  ServerNotification,
+  ServerRequest,
+} from "@modelcontextprotocol/sdk/types.js";
+import * as publicMcpClient from "../packages/mcp/src/client.js";
+import {
+  createMockAgenticAskService,
+  createMockCodeNavigationService,
+  createMockGitHitsService,
+  createMockGrepService,
+  createMockListService,
+  createMockPackageIntelligenceService,
+  createMockReadService,
+  createMockResolveTargetService,
+  defaultAgenticAskResponse,
+  defaultCodeDiffResult,
+  defaultResolveTargetResult,
+} from "./services/test-helpers.js";
+
+interface RegisteredTool {
+  handler: (
+    args: unknown,
+    extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+  ) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }>;
+}
+
+interface RemoteExtra {
+  sessionId: string;
+}
+
+function createServices(
+  overrides: Partial<McpToolServices> = {},
+): McpToolServices {
+  return {
+    codeNavigationService: createMockCodeNavigationService(),
+    githitsService: createMockGitHitsService(),
+    packageIntelligenceService: createMockPackageIntelligenceService(),
+    listService: createMockListService(),
+    readService: createMockReadService(),
+    grepService: createMockGrepService(),
+    resolveTargetService: createMockResolveTargetService(),
+    agenticAskService: createMockAgenticAskService(),
+    ...overrides,
+  };
+}
+
+function registeredTool(server: McpServer, name: string): RegisteredTool {
+  return (
+    server as unknown as {
+      _registeredTools: Record<string, RegisteredTool>;
+    }
+  )._registeredTools[name]!;
+}
+
+const EXPECTED_DESCRIPTOR_NAMES = [
+  "quick_start",
+  "get_example",
+  "search",
+  "search_status",
+  "list",
+  "read",
+  "grep",
+  "resolve_target",
+  "code_diff",
+  "pkg_info",
+  "pkg_vulns",
+  "pkg_deps",
+  "pkg_changelog",
+  "pkg_upgrade_review",
+  "research",
+] as const;
+
+const EXPECTED_SMOKE_NAMES = [
+  "quick_start",
+  "get_example",
+  "search",
+  "search_status",
+  "list",
+  "read",
+  "grep",
+  "resolve_target",
+  "code_diff",
+  "pkg_info",
+  "pkg_vulns",
+  "pkg_deps",
+  "pkg_changelog",
+  "pkg_upgrade_review",
+  "research",
+] as const;
+
+describe("public MCP package surface", () => {
+  it.each([undefined, "json"] as const)(
+    "executes stable resolve with request-scoped services and format=%s",
+    async (format) => {
+      const resolveTarget = mock(() =>
+        Promise.resolve(defaultResolveTargetResult),
+      );
+      const provider = mock((context: { extra: RemoteExtra | undefined }) => {
+        expect(context.extra?.sessionId).toBe("resolve-session");
+        return createServices({
+          resolveTargetService: createMockResolveTargetService({
+            resolveTarget,
+          }),
+        });
+      });
+      const server = createMcpServer<RemoteExtra>({
+        metadata: { name: "public-resolve", version: "0.0.0" },
+        services: provider,
+      });
+      expect(provider).not.toHaveBeenCalled();
+      const result = await registeredTool(server, "resolve_target").handler(
+        { name: "express", ...(format ? { format } : {}) },
+        { sessionId: "resolve-session" } as unknown as RequestHandlerExtra<
+          ServerRequest,
+          ServerNotification
+        >,
+      );
+      expect(result.isError).toBeUndefined();
+      expect(provider).toHaveBeenCalledTimes(1);
+      expect(resolveTarget).toHaveBeenCalledTimes(1);
+      expect(resolveTarget).toHaveBeenCalledWith({
+        name: "express",
+        limit: 8,
+        includeDetailedFields: format === "json",
+        includeNameSimilarity: format === "json",
+      });
+      const text = result.content[0]?.text ?? "";
+      if (format === "json") {
+        expect(JSON.parse(text)).toMatchObject({
+          best: "npm:express",
+          ambiguous: false,
+        });
+      } else {
+        expect(text).toContain("npm:express");
+        expect(text).toContain("[exact; package]");
+      }
+    },
+  );
+
+  it.each([undefined, "json"] as const)(
+    "executes stable research with request-scoped services and format=%s",
+    async (format) => {
+      const ask = mock(() => Promise.resolve(defaultAgenticAskResponse));
+      const provider = mock((context: { extra: RemoteExtra | undefined }) => {
+        expect(context.extra?.sessionId).toBe("research-session");
+        return createServices({
+          agenticAskService: createMockAgenticAskService({ ask }),
+        });
+      });
+      const server = createMcpServer<RemoteExtra>({
+        metadata: { name: "public-research", version: "0.0.0" },
+        services: provider,
+      });
+      const result = await registeredTool(server, "research").handler(
+        {
+          target: "npm:express",
+          question: "How is routing dispatched?",
+          ...(format ? { format } : {}),
+        },
+        { sessionId: "research-session" } as unknown as RequestHandlerExtra<
+          ServerRequest,
+          ServerNotification
+        >,
+      );
+      expect(result.isError).toBeUndefined();
+      expect(ask).toHaveBeenCalledTimes(1);
+      expect(ask).toHaveBeenCalledWith(
+        {
+          target: "npm:express",
+          question: "How is routing dispatched?",
+          sourceFormat: "mcp",
+        },
+        undefined,
+      );
+      const text = result.content[0]?.text ?? "";
+      if (format === "json") {
+        expect(JSON.parse(text)).toEqual(defaultAgenticAskResponse);
+      } else {
+        expect(text).toBe(defaultAgenticAskResponse.display_markdown);
+      }
+    },
+  );
+
+  it("maps stable resolver auth failures using the host remediation", async () => {
+    const action = "Sign in through the hosted MCP connection, then retry.";
+    const server = createMcpServer({
+      metadata: { name: "public-resolve-auth", version: "0.0.0" },
+      authAction: action,
+      services: createServices({
+        resolveTargetService: createMockResolveTargetService({
+          resolveTarget: mock(() => Promise.reject(new AuthenticationError())),
+        }),
+      }),
+    });
+    const result = await registeredTool(server, "resolve_target").handler(
+      { name: "express", format: "json" },
+      undefined as unknown as RequestHandlerExtra<
+        ServerRequest,
+        ServerNotification
+      >,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toMatchObject({
+      code: "AUTH_REQUIRED",
+      details: { action },
+    });
+  });
+
+  it("executes stable diff with request-scoped services and the inventory default", async () => {
+    const codeDiff = mock(() => Promise.resolve(defaultCodeDiffResult));
+    const provider = mock(() =>
+      createServices({
+        codeNavigationService: createMockCodeNavigationService({ codeDiff }),
+      }),
+    );
+    const server = createMcpServer({
+      metadata: { name: "public-diff", version: "0.0.0" },
+      services: provider,
+    });
+    const result = await registeredTool(server, "code_diff").handler(
+      { target: "npm:express", from: "4.18.1", to: "4.18.2", format: "json" },
+      undefined as unknown as RequestHandlerExtra<
+        ServerRequest,
+        ServerNotification
+      >,
+    );
+    expect(provider).toHaveBeenCalledWith({ extra: undefined });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0]?.text ?? "{}").view).toBe(
+      "name-status",
+    );
+    expect(codeDiff).toHaveBeenCalledTimes(1);
+    expect(codeDiff).toHaveBeenCalledWith({
+      target: { registry: "NPM", packageName: "express" },
+      from: "4.18.1",
+      to: "4.18.2",
+      mode: "inventory",
+    });
+  });
+
+  it("keeps the public and smoke inventories stable", () => {
+    const names = getMcpToolDescriptors().map((tool) => tool.name);
+    const definitions = getMcpToolDefinitions(createServices()).map(
+      (tool) => tool.name,
+    );
+    const server = createMcpServer({
+      metadata: { name: "public-githits", version: "0.0.0" },
+      services: createServices(),
+    });
+    const registeredNames = Object.keys(
+      (
+        server as unknown as {
+          _registeredTools: Record<string, unknown>;
+        }
+      )._registeredTools,
+    );
+
+    expect(names).toEqual([...EXPECTED_DESCRIPTOR_NAMES]);
+    expect(names).toHaveLength(15);
+    expect(names).toContain("list");
+    expect(names).toContain("read");
+    expect(names).not.toContain("code_read");
+    expect(names).not.toContain("docs_read");
+    expect(definitions).toEqual([...EXPECTED_DESCRIPTOR_NAMES]);
+    expect(definitions).not.toContain("code_read");
+    expect(definitions).not.toContain("docs_read");
+    expect(registeredNames).toEqual([...EXPECTED_DESCRIPTOR_NAMES]);
+    expect(registeredNames).not.toContain("code_read");
+    expect(registeredNames).not.toContain("docs_read");
+    expect(EXPECTED_MCP_TOOLS).toEqual([...EXPECTED_SMOKE_NAMES]);
+    for (const inventory of [
+      names,
+      definitions,
+      registeredNames,
+      [...EXPECTED_MCP_TOOLS],
+    ]) {
+      expect(
+        inventory.filter((name) => name === "resolve_target"),
+      ).toHaveLength(1);
+      expect(inventory.filter((name) => name === "research")).toHaveLength(1);
+      expect(inventory).toContain("code_diff");
+      expect(inventory.filter((name) => name === "code_diff")).toHaveLength(1);
+      expect(inventory).not.toContain("code_read");
+      expect(inventory).not.toContain("docs_read");
+      expect(inventory).not.toContain("docs_list");
+      expect(inventory).not.toContain("code_files");
+    }
+    expect("createLocalMcpServer" in publicMcp).toBe(false);
+    expect("ReadServiceImpl" in publicMcp).toBe(false);
+    expect(publicMcpClient.ReadServiceImpl).toBeDefined();
+    expect("ListServiceImpl" in publicMcp).toBe(false);
+    expect(publicMcpClient.ListServiceImpl).toBeDefined();
+    expect(publicMcpClient.ResolveTargetServiceImpl).toBeDefined();
+    expect(publicMcpClient.AgenticAskServiceImpl).toBeDefined();
+    expect(publicMcpClient.AGENTIC_ASK_REQUEST_TIMEOUT_MS).toBe(210_000);
+  });
+
+  it("contains the APIs needed by a remote MCP server without internal imports", () => {
+    const provider: McpToolServicesProvider<RemoteExtra> = () =>
+      createServices();
+
+    expect(buildMcpQuickStart()).toContain("## Choose a tool");
+    expect(getMcpToolDescriptors().map((tool) => tool.name)).toContain(
+      "search",
+    );
+    expect(
+      createMcpServer<RemoteExtra>({
+        metadata: { name: "remote-githits", version: "0.0.0" },
+        services: provider,
+      }),
+    ).toBeDefined();
+  });
+
+  it("supports request-scoped services and remote-specific auth guidance", async () => {
+    const server = new McpServer({ name: "remote-githits", version: "0.0.0" });
+    const search = mock(() =>
+      Promise.reject(
+        new AuthenticationError("Authentication required.", "server"),
+      ),
+    );
+    const seenSessionIds: Array<string | undefined> = [];
+    const provider = mock((context: { extra: RemoteExtra | undefined }) => {
+      seenSessionIds.push(context.extra?.sessionId);
+      return createServices({
+        githitsService: createMockGitHitsService({ search }),
+      });
+    });
+
+    registerMcpTools<RemoteExtra>(server, {
+      authAction: ({ authSource }) =>
+        `Open the hosted GitHits authorization flow for auth source ${String(authSource)}.`,
+      services: provider,
+    });
+
+    const extra = { sessionId: "session-1" } as unknown as RequestHandlerExtra<
+      ServerRequest,
+      ServerNotification
+    >;
+    const result = await registeredTool(server, "get_example").handler(
+      { query: "express hello world", format: "json" },
+      extra,
+    );
+
+    expect(provider).toHaveBeenCalledWith({ extra });
+    expect(seenSessionIds).toEqual(["session-1"]);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: "Authentication required.",
+      code: "AUTH_REQUIRED",
+      retryable: false,
+      details: {
+        action:
+          "Open the hosted GitHits authorization flow for auth source server.",
+        authSource: "server",
+      },
+    });
+  });
+
+  it("applies remote auth guidance to mapped code-navigation errors", async () => {
+    const server = new McpServer({ name: "remote-githits", version: "0.0.0" });
+    const search = mock(() =>
+      Promise.reject(
+        new AuthenticationError("Authentication required.", "server"),
+      ),
+    );
+
+    registerMcpTools(server, {
+      authAction: "Authenticate in the hosted GitHits MCP server, then retry.",
+      services: createServices({
+        codeNavigationService: createMockCodeNavigationService({ search }),
+      }),
+    });
+
+    const result = await registeredTool(server, "search").handler(
+      {
+        query: "router",
+        target: "npm:express",
+        format: "json",
+      },
+      undefined as unknown as RequestHandlerExtra<
+        ServerRequest,
+        ServerNotification
+      >,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: "Authentication required.",
+      code: "AUTH_REQUIRED",
+      retryable: false,
+      details: {
+        action: "Authenticate in the hosted GitHits MCP server, then retry.",
+        authSource: "server",
+      },
+    });
+  });
+
+  it("uses URL-based terms remediation for hosted callers", async () => {
+    const acceptanceUrl = "https://acceptance.example.test/settings/privacy";
+    const server = createMcpServer({
+      metadata: { name: "remote-githits", version: "0.0.0" },
+      services: createServices({
+        githitsService: createMockGitHitsService({
+          search: mock(() =>
+            Promise.reject(new TermsAcceptanceRequiredError({ acceptanceUrl })),
+          ),
+        }),
+      }),
+    });
+
+    const result = await registeredTool(server, "get_example").handler(
+      { query: "express hello world", format: "json" },
+      undefined as unknown as RequestHandlerExtra<
+        ServerRequest,
+        ServerNotification
+      >,
+    );
+
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toEqual({
+      error: `Terms acceptance required. Review and accept the current terms at ${acceptanceUrl}, then retry.`,
+      code: "TERMS_ACCEPTANCE_REQUIRED",
+      retryable: false,
+      details: {
+        termsUrl: "https://githits.com/legal/terms-of-service/",
+        acceptanceUrl,
+        action: acceptanceUrl,
+      },
+    });
+  });
+
+  it("keeps custom auth actions isolated across concurrent servers", async () => {
+    const makeServer = (action: string) => {
+      const server = new McpServer({
+        name: "remote-githits",
+        version: "0.0.0",
+      });
+      registerMcpTools(server, {
+        authAction: action,
+        services: createServices({
+          githitsService: createMockGitHitsService({
+            search: mock(() => Promise.reject(new AuthenticationError())),
+          }),
+        }),
+      });
+      return server;
+    };
+
+    const [resultA, resultB] = await Promise.all([
+      registeredTool(makeServer("authenticate A"), "get_example").handler(
+        { query: "python", format: "json" },
+        undefined as unknown as RequestHandlerExtra<
+          ServerRequest,
+          ServerNotification
+        >,
+      ),
+      registeredTool(makeServer("authenticate B"), "get_example").handler(
+        { query: "python", format: "json" },
+        undefined as unknown as RequestHandlerExtra<
+          ServerRequest,
+          ServerNotification
+        >,
+      ),
+    ]);
+
+    expect(JSON.parse(resultA.content[0]?.text ?? "{}").details.action).toBe(
+      "authenticate A",
+    );
+    expect(JSON.parse(resultB.content[0]?.text ?? "{}").details.action).toBe(
+      "authenticate B",
+    );
+  });
+
+  it("propagates caller cancellation through traceTool", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    controller.abort(reason);
+    const traceTool: McpToolExecutionHook = mock(async (_name, runHandler) =>
+      runHandler(),
+    );
+    const server = createMcpServer({
+      metadata: { name: "remote-githits", version: "0.0.0" },
+      services: createServices({
+        githitsService: createMockGitHitsService({
+          search: mock(() => Promise.reject(reason)),
+        }),
+      }),
+      traceTool,
+    });
+
+    await expect(
+      registeredTool(server, "get_example").handler(
+        { query: "express hello world" },
+        { signal: controller.signal } as unknown as RequestHandlerExtra<
+          ServerRequest,
+          ServerNotification
+        >,
+      ),
+    ).rejects.toBe(reason);
+    expect(traceTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes unified grep through the remote server API", async () => {
+    const grep = mock(() =>
+      Promise.resolve({
+        pathWarnings: [],
+        hits: [],
+        targets: [],
+        unavailableTargets: [],
+        traversal: "COMPLETE" as const,
+        nextCursor: null,
+        totalMatches: 0,
+      }),
+    );
+    const server = createMcpServer({
+      metadata: { name: "remote-githits", version: "0.0.0" },
+      services: createServices({
+        grepService: createMockGrepService({ grep }),
+      }),
+    });
+
+    const result = await registeredTool(server, "grep").handler(
+      {
+        targets: [{ target: "npm:express" }],
+        pattern: "pagination",
+        format: "json",
+      },
+      undefined as unknown as RequestHandlerExtra<
+        ServerRequest,
+        ServerNotification
+      >,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0]?.text ?? "{}")).toMatchObject({
+      hits: [],
+      traversal: "COMPLETE",
+      totalMatches: 0,
+    });
+    expect(grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targets: [
+          { target: "npm:express", corpus: "ALL", allowUnscoped: true },
+        ],
+        pattern: "pagination",
+        patternType: "REGEX",
+        caseSensitive: true,
+      }),
+    );
+  });
+});

@@ -1,0 +1,1905 @@
+import { describe, expect, it } from "bun:test";
+import { type GrepResult, parseGrepResult } from "@githits/core-internal";
+import mixedGrepPageFixture from "./shared/fixtures/grep-text/mixed-100.json";
+import { formatGrepText } from "./shared/grep-text.js";
+import {
+  assertCleanErrorEnvelope,
+  assertDefaultText,
+  assertHttpUnauthorizedChallenge,
+  callToolText,
+  EXPECTED_MCP_TOOLS,
+  type McpSmokeCaller,
+  type McpSmokeToolResult,
+  resultText,
+  runMcpSmoke,
+} from "./smoke-test.js";
+
+function textResult(text: string): McpSmokeToolResult {
+  return { content: [{ type: "text", text }] };
+}
+
+function jsonResult(payload: unknown): McpSmokeToolResult {
+  return textResult(JSON.stringify(payload));
+}
+
+function errorResult(code: string, text?: string): McpSmokeToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          text ??
+          JSON.stringify({
+            error: `${code} error`,
+            code,
+            retryable: false,
+          }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+function createCaller(callTool: McpSmokeCaller["callTool"]): McpSmokeCaller {
+  return {
+    listTools: async () => ({
+      tools: EXPECTED_MCP_TOOLS.map((name) => ({
+        name,
+        annotations: {
+          readOnlyHint: true,
+          openWorldHint: name !== "quick_start",
+          destructiveHint: false,
+        },
+      })),
+    }),
+    callTool,
+  };
+}
+
+describe("MCP smoke-test helpers", () => {
+  it("requires stable research registration", async () => {
+    const caller = createCaller(async (name, args) =>
+      smokeResponse(name, args),
+    );
+    const listTools = caller.listTools;
+    caller.listTools = async () => ({
+      tools: (await listTools()).tools.filter(
+        (tool) => tool.name !== "research",
+      ),
+    });
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("listTools missing research");
+  });
+
+  it("probes research validation without requesting an answer", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const caller = createCaller(async (name, args) => {
+      if (name === "research") calls.push(args);
+      return smokeResponse(name, args);
+    });
+    await runMcpSmoke(caller, { logger: { log: () => {}, error: () => {} } });
+    expect(calls).toEqual([
+      {
+        target: "npm:express",
+        thread_id: "018f47a6-7b32-7b1e-8f45-6a2d39c81720",
+        question: "How is routing dispatched?",
+        format: "json",
+      },
+    ]);
+  });
+
+  it("requires stable resolver registration", async () => {
+    const caller = createCaller(async (name, args) =>
+      smokeResponse(name, args),
+    );
+    const listTools = caller.listTools;
+    caller.listTools = async () => ({
+      tools: (await listTools()).tools.filter(
+        (tool) => tool.name !== "resolve_target",
+      ),
+    });
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("listTools missing resolve_target");
+  });
+
+  it("exercises stable resolver text, verbose, JSON and its selected target", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const caller = createCaller(async (name, args) => {
+      calls.push({ name, args });
+      return smokeResponse(name, args);
+    });
+    await runMcpSmoke(caller, { logger: { log: () => {}, error: () => {} } });
+    expect(
+      calls
+        .filter(({ name }) => name === "resolve_target")
+        .map(({ args }) => args),
+    ).toEqual([
+      { name: "express" },
+      { name: "lodahs", preferred_kind: "package" },
+      { name: "lodahs", preferred_kind: "package", verbose: true },
+      { name: "express", format: "json" },
+      { name: "lodahs", preferred_kind: "package", format: "json" },
+    ]);
+    expect(calls).toContainEqual({
+      name: "list",
+      args: { target: "npm:express", depth: 1, limit: 2, format: "json" },
+    });
+  });
+
+  it("requests JSON when probing a missing search reference", async () => {
+    let invalidRefArgs: Record<string, unknown> | undefined;
+    const caller = createCaller(async (name, args) => {
+      if (
+        name === "search" &&
+        args.format === "json" &&
+        args.query === "router"
+      ) {
+        return jsonResult({ completed: true, results: [] });
+      }
+      if (
+        name === "search_status" &&
+        args.search_ref === "smoke-invalid-search-ref"
+      ) {
+        invalidRefArgs = args;
+        return args.format === "json"
+          ? errorResult("NOT_FOUND")
+          : errorResult("NOT_FOUND", "Search reference not found");
+      }
+      return smokeResponse(name, args);
+    });
+    await runMcpSmoke(caller, { logger: { log: () => {}, error: () => {} } });
+    expect(invalidRefArgs).toEqual({
+      search_ref: "smoke-invalid-search-ref",
+      wait_timeout_ms: 0,
+      format: "json",
+    });
+  });
+
+  it("requires stable diff registration", async () => {
+    const caller = createCaller(async (name, args) =>
+      smokeResponse(name, args),
+    );
+    const listTools = caller.listTools;
+    caller.listTools = async () => ({
+      tools: (await listTools()).tools.filter(
+        (tool) => tool.name !== "code_diff",
+      ),
+    });
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("listTools missing code_diff");
+  });
+  it("rejects a diff patch outside the requested file", async () => {
+    const caller = createCaller(async (name, args) =>
+      name === "code_diff" && args.view === "patch"
+        ? jsonResult({
+            view: "patch",
+            files: [
+              { path: "other.js", patch: "diff --git a/other.js b/other.js" },
+            ],
+          })
+        : smokeResponse(name, args),
+    );
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "code_diff scoped patch missing unified content",
+    );
+  });
+
+  it("extracts successful tool text and throws MCP error text", async () => {
+    const successCaller = createCaller(async () => textResult("ok"));
+    await expect(callToolText(successCaller, "get_example", {})).resolves.toBe(
+      "ok",
+    );
+
+    const failingCaller = createCaller(async () =>
+      errorResult("AUTH_REQUIRED", "auth required"),
+    );
+    await expect(
+      callToolText(failingCaller, "get_example", {}),
+    ).rejects.toThrow("auth required");
+  });
+
+  it("validates clean error envelopes", () => {
+    expect(assertCleanErrorEnvelope(errorResult("NOT_FOUND"), "probe")).toEqual(
+      {
+        error: "NOT_FOUND error",
+        code: "NOT_FOUND",
+        retryable: false,
+      },
+    );
+  });
+
+  it("rejects default text that looks like JSON", () => {
+    expect(() => assertDefaultText(textResult('{"ok":true}'), "probe")).toThrow(
+      "text response unexpectedly parsed as JSON",
+    );
+  });
+
+  it("keeps the size budget for compact default text", () => {
+    expect(() =>
+      assertDefaultText(textResult("release note ".repeat(2000)), "probe"),
+    ).toThrow("default text too large");
+  });
+
+  it("validates remote HTTP bearer challenges", () => {
+    expect(() =>
+      assertHttpUnauthorizedChallenge({
+        status: 401,
+        headers: { "WWW-Authenticate": 'Bearer realm="GitHits"' },
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      assertHttpUnauthorizedChallenge({
+        status: 401,
+        headers: new Headers({ "www-authenticate": "Basic" }),
+      }),
+    ).toThrow("expected Bearer challenge");
+  });
+});
+
+describe("runMcpSmoke", () => {
+  it("accepts complete changelog and upgrade evidence beyond the compact budget", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (
+        name === "pkg_changelog" &&
+        args.format !== "json" &&
+        (args.body_lines === undefined || args.verbatim === true) &&
+        args.omit_bodies !== true
+      ) {
+        return textResult(
+          `express release notes\n${"* Complete statement.\n".repeat(1000)}`,
+        );
+      }
+      if (name === "pkg_upgrade_review" && args.format !== "json") {
+        const response = smokeResponse(name, args);
+        const content = response.content as [{ type: "text"; text: string }];
+        return textResult(
+          content[0].text + "\n* Complete statement.".repeat(1000),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("accepts untruncated short changelog bodies with an explicit line budget", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (
+        name === "pkg_changelog" &&
+        args.body_lines === 3 &&
+        args.format !== "json"
+      )
+        return textResult(
+          "express | npm | 2 entries\n5.2.1\n  * Short release note.\n5.2.0\n  * Another short note.",
+        );
+      return smokeResponse(name, args);
+    });
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+  it("requires unified grep and rejects the retired code_grep catalog entry", async () => {
+    expect(EXPECTED_MCP_TOOLS).toContain("grep");
+    expect(EXPECTED_MCP_TOOLS).not.toContain("code_grep");
+
+    const caller = createCaller(async () => {
+      throw new Error("tools must not execute");
+    });
+    const { tools } = await caller.listTools();
+    caller.listTools = async () => ({
+      tools: [
+        ...tools,
+        {
+          name: "code_grep",
+          annotations: {
+            readOnlyHint: true,
+            openWorldHint: true,
+            destructiveHint: false,
+          },
+        },
+      ],
+    });
+
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("listTools advertises retired code_grep instead of grep");
+  });
+
+  it.each([
+    ["get_example", false],
+    ["search_status", undefined],
+    ["quick_start", true],
+    ["unlisted_tool", false],
+  ] as const)(
+    "rejects incorrect open-world annotation for %s: %s",
+    async (name, openWorldHint) => {
+      const caller = createCaller(async () => {
+        throw new Error("must not execute");
+      });
+      const { tools } = await caller.listTools();
+      const changed = {
+        name,
+        annotations: {
+          readOnlyHint: true,
+          openWorldHint,
+          destructiveHint: false,
+        },
+      };
+      caller.listTools = async () => ({
+        tools: [...tools.filter((tool) => tool.name !== name), changed],
+      });
+      const expected = name !== "quick_start";
+      await expect(
+        runMcpSmoke(caller, { includeLiveTools: false }),
+      ).rejects.toThrow(
+        `${name} must advertise openWorldHint: ${expected}, got ${String(openWorldHint)}`,
+      );
+    },
+  );
+
+  it.each([true, undefined])(
+    "rejects destructive or missing annotations: %s",
+    async (destructiveHint) => {
+      const caller = createCaller(async () => {
+        throw new Error("must not execute");
+      });
+      const { tools } = await caller.listTools();
+      caller.listTools = async () => ({
+        tools: tools.map((tool) => ({
+          ...tool,
+          annotations: { ...tool.annotations, destructiveHint },
+        })),
+      });
+      await expect(
+        runMcpSmoke(caller, { includeLiveTools: false }),
+      ).rejects.toThrow("must advertise destructiveHint: false");
+    },
+  );
+
+  it("rejects a non-read-only tool outside the stable inventory", async () => {
+    const caller = createCaller(async () => {
+      throw new Error("must not execute");
+    });
+    caller.listTools = async () => ({
+      tools: [
+        ...EXPECTED_MCP_TOOLS.map((name) => ({
+          name,
+          annotations: {
+            readOnlyHint: true,
+            openWorldHint: name !== "quick_start",
+            destructiveHint: false,
+          },
+        })),
+        { name: "unlisted_tool", annotations: { readOnlyHint: false } },
+      ],
+    });
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("unlisted_tool must advertise readOnlyHint: true");
+  });
+
+  it.each([false, undefined])(
+    "rejects non-read-only or missing annotations: %s",
+    async (readOnlyHint) => {
+      const caller = createCaller(async () => {
+        throw new Error("must not execute");
+      });
+      caller.listTools = async () => ({
+        tools: EXPECTED_MCP_TOOLS.map((name) => ({
+          name,
+          annotations: { readOnlyHint },
+        })),
+      });
+      await expect(
+        runMcpSmoke(caller, { includeLiveTools: false }),
+      ).rejects.toThrow("must advertise readOnlyHint: true");
+    },
+  );
+  it("rejects catalogs that retain feedback before executing tools", async () => {
+    const caller = createCaller(async () => {
+      throw new Error("must not execute");
+    });
+    caller.listTools = async () => ({
+      tools: [...EXPECTED_MCP_TOOLS, "feedback"].map((name) => ({
+        name,
+        annotations: {
+          readOnlyHint: true,
+          openWorldHint: name !== "quick_start",
+          destructiveHint: false,
+        },
+      })),
+    });
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("removed feedback tool");
+  });
+
+  it("can verify registration and quick_start without live evidence calls", async () => {
+    const caller = createCaller(async (name) => {
+      if (name === "quick_start") return smokeResponse(name, {});
+      throw new Error("live evidence call should not run");
+    });
+
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("fails registration smoke when an expected tool is missing", async () => {
+    const caller = createCaller(async () => {
+      throw new Error("live tool call should not run");
+    });
+    caller.listTools = async () => ({
+      tools: EXPECTED_MCP_TOOLS.filter((name) => name !== "search_status").map(
+        (name) => ({ name, annotations: { readOnlyHint: true } }),
+      ),
+    });
+
+    await expect(
+      runMcpSmoke(caller, { includeLiveTools: false }),
+    ).rejects.toThrow("listTools missing search_status");
+  });
+
+  it("checks readable auth errors before skipping the live corpus", async () => {
+    const logs: string[] = [];
+    const pkgInfoCalls: Array<Record<string, unknown>> = [];
+    const hostedAuthAction = "Open the hosted authorization page, then retry.";
+    const caller = createCaller(async (name, args) => {
+      if (name === "quick_start") return smokeResponse(name, {});
+      expect(name).toBe("pkg_info");
+      pkgInfoCalls.push(args);
+      if (args.format === "json") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "Authentication required.",
+                code: "AUTH_REQUIRED",
+                retryable: false,
+                details: {
+                  authSource: "server",
+                  action: hostedAuthAction,
+                },
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (args.format === undefined || args.format === "text") {
+        return errorResult(
+          "AUTH_REQUIRED",
+          `Authentication required.\n${hostedAuthAction}`,
+        );
+      }
+      throw new Error(`unexpected pkg_info format: ${String(args.format)}`);
+    });
+
+    await runMcpSmoke(caller, {
+      logger: { log: (message: string) => logs.push(message), error: () => {} },
+    });
+
+    expect(pkgInfoCalls).toEqual([
+      { target: "npm:express", format: "json" },
+      { target: "npm:express" },
+      { target: "npm:express", format: "text" },
+    ]);
+    expect(logs).toEqual(["AUTH_REQUIRED: live smoke skipped"]);
+  });
+
+  it("runs the shared live corpus without calling removed feedback", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const logs: string[] = [];
+    const caller = createCaller(async (name, args) => {
+      calls.push({ name, args });
+      return smokeResponse(name, args);
+    });
+
+    await runMcpSmoke(caller, {
+      logger: { log: (message: string) => logs.push(message), error: () => {} },
+    });
+
+    expect(logs).toEqual(["MCP smoke passed"]);
+    expect(new Set(calls.map((call) => call.name))).toEqual(
+      new Set(EXPECTED_MCP_TOOLS),
+    );
+    expect(calls.some(({ name }) => name === "feedback")).toBe(false);
+    const compactPackageNames = new Set([
+      "list",
+      "pkg_info",
+      "pkg_vulns",
+      "pkg_deps",
+      "pkg_changelog",
+    ]);
+    const compactPackageCalls = calls.filter(({ name }) =>
+      compactPackageNames.has(name),
+    );
+    expect(new Set(compactPackageCalls.map(({ name }) => name))).toEqual(
+      compactPackageNames,
+    );
+    for (const { name, args } of compactPackageCalls) {
+      expect(typeof args.target, `${name} target`).toBe("string");
+      expect(args, `${name} registry`).not.toHaveProperty("registry");
+      expect(args, `${name} package_name`).not.toHaveProperty("package_name");
+      expect(args, `${name} version`).not.toHaveProperty("version");
+    }
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_PACKAGE_TARGET,
+        paths: ["package.json"],
+        limit: 1,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_PACKAGE_TARGET,
+        paths: ["package.json"],
+        limit: 1,
+        format: "json",
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_PACKAGE_TARGET,
+        limit: 1,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_PACKAGE_TARGET,
+        limit: 1,
+        after: SMOKE_LIST_CURSOR,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_SITE_TARGET,
+        paths: [`/${SMOKE_SITE_PAGE_PATH}`],
+        limit: 20,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "list",
+      args: {
+        target: SMOKE_SITE_TARGET,
+        paths: [`/${SMOKE_SITE_PAGE_PATH}`],
+        limit: 20,
+        format: "json",
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "read",
+      args: {
+        target: SMOKE_PACKAGE_TARGET,
+        path: "package.json",
+        start_line: 1,
+        end_line: 5,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "read",
+      args: {
+        target: SMOKE_SITE_TARGET,
+        path: SMOKE_SITE_PAGE_PATH,
+        start_line: 1,
+        end_line: 5,
+      },
+    });
+    const firstGrepPage = smokeGrepResult({});
+    const grepRepositoryHit = firstGrepPage.hits.find(
+      (hit) => hit.__typename === "GrepRepositoryHit",
+    );
+    const grepHostedDocsHit = firstGrepPage.hits.find(
+      (hit) => hit.__typename === "GrepSiteHit",
+    );
+    expect(grepRepositoryHit).toBeDefined();
+    expect(grepHostedDocsHit).toBeDefined();
+    expect(calls).toContainEqual({
+      name: "grep",
+      args: {
+        targets: [{ target: SMOKE_PACKAGE_TARGET }],
+        pattern: "router",
+        max_matches: 2,
+        wait_timeout_ms: 60_000,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "grep",
+      args: {
+        targets: [{ target: SMOKE_PACKAGE_TARGET }],
+        pattern: "router",
+        max_matches: 2,
+        wait_timeout_ms: 60_000,
+        format: "json",
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "grep",
+      args: {
+        targets: [{ target: SMOKE_PACKAGE_TARGET }],
+        pattern: "router",
+        max_matches: 2,
+        wait_timeout_ms: 60_000,
+        cursor: SMOKE_GREP_CURSOR,
+        format: "json",
+      },
+    });
+    for (const hit of [grepRepositoryHit!, grepHostedDocsHit!]) {
+      const read = hit.read;
+      expect(calls).toContainEqual({
+        name: "read",
+        args: {
+          target: read.target,
+          ...(read.path === null ? {} : { path: read.path }),
+          start_line: read.startLine,
+          end_line: read.endLine,
+          format: "json",
+        },
+      });
+      expect(calls).toContainEqual({
+        name: "read",
+        args: {
+          target: read.target,
+          ...(read.path === null ? {} : { path: read.path }),
+          start_line: read.startLine,
+          end_line: read.endLine,
+        },
+      });
+    }
+    expect(calls).toContainEqual({
+      name: "pkg_deps",
+      args: {
+        target: "npm:express",
+        include_issues: true,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "pkg_deps",
+      args: {
+        target: "npm:express",
+        include_issues: true,
+        format: "json",
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "pkg_vulns",
+      args: {
+        target: "npm:express@4.17.1",
+        include_transitive: true,
+      },
+    });
+    expect(calls).toContainEqual({
+      name: "pkg_vulns",
+      args: {
+        target: "npm:express@4.17.1",
+        include_transitive: true,
+        advisory_scope: "all",
+        format: "json",
+      },
+    });
+  });
+
+  it("upgrade statement smoke accepts null classification and rejects missing statements", async () => {
+    const createUpgradeCaller = (omitStatements: boolean): McpSmokeCaller =>
+      createCaller(async (name, args) => {
+        const response = smokeResponse(name, args);
+        if (name !== "pkg_upgrade_review" || args.format !== "json") {
+          return response;
+        }
+
+        const payload = JSON.parse(
+          resultText(response, "upgrade statement smoke fixture"),
+        ) as {
+          reviews: Array<{ changelog: Record<string, unknown> }>;
+        };
+        const changelog = payload.reviews[0]?.changelog;
+        if (!changelog) throw new Error("missing smoke changelog fixture");
+
+        if (omitStatements) {
+          delete changelog.statements;
+        } else {
+          const statements = changelog.statements as {
+            items: Array<{ classification: unknown }>;
+          };
+          const firstItem = statements.items[0];
+          if (!firstItem) throw new Error("missing smoke statement fixture");
+          firstItem.classification = null;
+        }
+
+        return jsonResult(payload);
+      });
+    const logger = { log: () => {}, error: () => {} };
+
+    await expect(
+      runMcpSmoke(createUpgradeCaller(false), { logger }),
+    ).resolves.toBeUndefined();
+    await expect(
+      runMcpSmoke(createUpgradeCaller(true), { logger }),
+    ).rejects.toThrow("pkg_upgrade_review statements: expected object");
+  });
+
+  it("rejects hosted documentation follow-ups that replay search bounds", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.source === "docs") {
+        return jsonResult({
+          completed: true,
+          results: [
+            {
+              type: "documentation_page",
+              locator: {
+                docsReadTarget: SMOKE_SITE_PAGE_URL,
+                startLine: 81,
+                endLine: 93,
+              },
+              followUp: `read target=${JSON.stringify(SMOKE_SITE_PAGE_URL)} start_line=81 end_line=93`,
+            },
+          ],
+        });
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "hosted documentation follow-up replayed search line bounds",
+    );
+  });
+
+  it("continues an in-progress hosted documentation smoke search once", async () => {
+    let docsStatusCalls = 0;
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.source === "docs") {
+        return jsonResult({
+          completed: false,
+          results: [],
+          searchRef: "docs-smoke-ref",
+        });
+      }
+      if (name === "search_status" && args.search_ref === "docs-smoke-ref") {
+        docsStatusCalls += 1;
+        return jsonResult({
+          completed: true,
+          result: {
+            results: [
+              {
+                type: "documentation_page",
+                locator: { docsReadTarget: SMOKE_SITE_PAGE_URL },
+                followUp: `read target=${JSON.stringify(SMOKE_SITE_PAGE_URL)}`,
+              },
+            ],
+          },
+        });
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+    expect(docsStatusCalls).toBe(1);
+  });
+
+  it("rejects arbitrary snippets beneath path-only search hits", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] npm:express@4.21.2 examples/route-middleware/index.js [repo code, path match]\n  50 | function andRestrictTo(role) {",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "path-only hit contains an arbitrary source snippet",
+    );
+  });
+
+  it("accepts a completed result containing only a compact path match", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] npm:express@4.21.2 examples/route-middleware/index.js [repo code, path match]",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("accepts compact path matches followed by proven source", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 2 code results.\n\n[1] npm:express@4.21.2 examples/route-middleware/index.js [repo code, path match]\n\n[2] npm:express@4.21.2 lib/router/index.js:303-307 [repo code]\n> 305 | // route",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it.each([10_000, 50_000, 60_000, 90_000, 120_000])(
+    "accepts bounded estimate-based continuation at %s ms",
+    async (waitMs) => {
+      const caller = createCaller(async (name, args) => {
+        if (name === "search" && args.format !== "json") {
+          return textResult(
+            smokeSearchText().replace(
+              "wait_timeout_ms=30000",
+              `wait_timeout_ms=${waitMs}`,
+            ),
+          );
+        }
+        return smokeResponse(name, args);
+      });
+      await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+    },
+  );
+
+  it("rejects search action references outside a Next line", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          'No results available yet.\nFollow-up:\n  search_status search_ref="smoke-ref" wait_timeout_ms=30000\nsearch_ref=leaked',
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: expected at most one native status action",
+    );
+  });
+
+  it.each([
+    ["status: indexing", "duplicated lifecycle status line"],
+    ["searchRef=leaked", "leaked searchRef="],
+    ["indexingRef=leaked", "leaked indexingRef"],
+  ])(
+    "rejects top-level formatter diagnostic %s",
+    async (diagnostic, message) => {
+      const caller = createCaller(async (name, args) => {
+        if (name === "search" && args.format !== "json") {
+          return textResult(`${smokeSearchText()}\n${diagnostic}`);
+        }
+        return smokeResponse(name, args);
+      });
+
+      await expect(runMcpSmoke(caller)).rejects.toThrow(
+        `search default: ${message}`,
+      );
+    },
+  );
+
+  it.each([
+    "Follow-up:\n  githits search-status smoke-ref --wait 30",
+    "Next: githits read npm:express index.js",
+    "Next: githits code read npm:express index.js",
+    "Next: githits docs read page-1 --offset 10",
+  ])("rejects CLI syntax leaked into MCP search text: %s", async (action) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          smokeSearchText().replace(
+            'Follow-up:\n  search_status search_ref="smoke-ref" wait_timeout_ms=30000',
+            action,
+          ),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: CLI command syntax leaked into MCP output",
+    );
+  });
+
+  it("requires Using details to remain grouped under a target", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          smokeSearchText().replace(
+            "- npm:express@5.2.1\n  indexing: code; available: versions 5.2.1",
+            "  using: 5.1.0 while 5.2.1 indexes",
+          ),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: readiness details must be grouped under a target",
+    );
+  });
+
+  it.each([
+    ["Ready:", "legacy flat section Ready:"],
+    ["Waiting:", "legacy flat section Waiting:"],
+    [
+      "Available but not searched:",
+      "legacy flat section Available but not searched:",
+    ],
+    ["Indexed alternatives:", "legacy flat section Indexed alternatives:"],
+  ])("rejects legacy flat search section %s", async (section, message) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          smokeSearchText().replace(
+            "  indexing: code; available: versions 5.2.1",
+            `${section} 0/1 targets`,
+          ),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      `search default: ${message}`,
+    );
+  });
+
+  it.each([
+    ["Evidence may change.", "vague evidence policy prose"],
+    ["Do not repeat search.", "repeat policy prose"],
+    ["Do not poll this session.", "poll policy prose"],
+  ])("rejects superseded search prose %s", async (prose, message) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(`${smokeSearchText()}\n${prose}`);
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      `search default: ${message}`,
+    );
+  });
+
+  it("requires readiness details to be grouped under a target", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          smokeSearchText().replace("\n- npm:express@5.2.1", ""),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: readiness details must be grouped under a target",
+    );
+  });
+
+  it("requires an outcome headline before search details", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          smokeSearchText().replace("No results available yet.", "Warnings:"),
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: missing outcome headline",
+    );
+  });
+
+  it("ignores formatter-like words inside indented hit content", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] npm:express@5.2.1 index.js [repo code]\n" +
+            "  Ready: payload text\n" +
+            "  Waiting: payload text\n" +
+            "  Available but not searched: payload text\n" +
+            "  Indexed alternatives: payload text\n" +
+            "  Evidence may change.\n" +
+            "  Do not repeat this payload.\n" +
+            "  Do not poll this payload.\n" +
+            "  Next: payload text\n" +
+            "  Indexing: payload text\n" +
+            "  status: payload text\n" +
+            "  searchRef=payload text\n" +
+            "  indexingRef payload text\n" +
+            "  search_ref=payload text",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("keeps multiline hit-body diagnostics opaque after a blank line", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] npm:express@5.2.1 index.js [repo code]\n" +
+            "  First summary paragraph.\n\n" +
+            "  status: payload text\n" +
+            "  searchRef=payload text\n" +
+            "  indexingRef payload text\n" +
+            "  search_ref=payload text",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("allows completed hit text without a target group", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] npm:express@5.2.1 index.js [repo code]",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("allows completed documentation hit text without a target group", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n[1] page-1 [docs page] npm:express - docs.example.com/readme - README | API - section",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("allows documentation hits that disclose a missing source URL", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 documentation result.\n\n[1] page-1 [docs page] npm:express - source URL unavailable - README",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("allows wrapped documentation and repository title tails", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result and 1 documentation result.\n\n" +
+            "[1] page-1 [docs page] npm:express - docs.example.com/readme -\n" +
+            "  A long documentation title\n\n" +
+            "[2] npm:express@5.2.1 lib/application.js [repo code] -\n" +
+            "  A long repository title",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("allows a wrapped repository title without a documentation hit", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "Found 1 code result.\n\n" +
+            "[1] npm:express@5.2.1 lib/application.js [repo code] -\n" +
+            "  A long repository title",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    [
+      "focused evidence",
+      "Found 1 code result.\n\n" +
+        "[1] github:owner/repo@abc123 packages/pkg/src/compact.ts:920-930 [repo code] - compact (function at lines 858-964)\n" +
+        "  // Merge into single summary",
+    ],
+    [
+      "equal evidence",
+      "Found 1 symbol result.\n\n" +
+        "[1] github:owner/repo@abc123 packages/pkg/src/compact.ts:858-964 [repo symbol] - compact (function)",
+    ],
+  ])("allows a unified repository hit with %s", async (_name, searchText) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(searchText);
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it("accepts structural search evidence text", async () => {
+    const structuralText =
+      "Found 1 code result.\n\n" +
+      "[1] npm:express@4.18.2 lib/client.ts:142-145 [repo code]\n" +
+      "  - class Client | lines 20-220\n" +
+      "    - method Client.send | lines 120-165\n" +
+      "  ... lines omitted before\n" +
+      "  142 |     const indexingRef = request;\n" +
+      "> 143 | ...    if (response.status === 429) {...\n" +
+      "  144 |       return retry(request);\n" +
+      "  145 | \n" +
+      "  ... lines omitted after";
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(structuralText);
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n" +
+        "  This payload mentions read but has no locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n" +
+        '  read target="npm:express@5.2.1"',
+    ],
+    ["Found 1 code result.\n\n[1] page-1 [docs page] npm:express - README"],
+    [
+      "Found 1 code result.\n\n[1] page-1 [docs page] npm:express -\n" +
+        "  README without a source locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] page ID unavailable [docs page] npm:express - docs.example.com/readme -\n" +
+        "  Wrapped title without a page locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n" +
+        "  ordinary title\n" +
+        '  read target="npm:express@5.2.1" path="index.js"',
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code] -\n" +
+        "  Wrapped title without a locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 lib/application.js [repo code] -",
+    ],
+    [
+      "Found 1 code result.\n\n[1] compact - function defined at packages/pkg/src/compact.ts:858-964",
+    ],
+    [
+      "Found 1 code result.\n\n" +
+        "[1] compact - function defined at packages/pkg/src/compact.ts:858-964\n" +
+        "  github:owner/repo@abc123 evidence at 920-930 [repo code]",
+    ],
+    [
+      "Found 1 code result.\n\n[1] compact - function defined at location unavailable\n" +
+        "  github:owner/repo@abc123 evidence at 920-930 [repo code]",
+    ],
+  ])("rejects incomplete or prose-only hit follow-ups", async (searchText) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(searchText);
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: missing usable result locator or status follow-up",
+    );
+  });
+
+  it.each([
+    [
+      "Fix",
+      "No results found.\n\n- npm:missing@1.0.0\n  Fix: verify the package coordinate.",
+    ],
+    [
+      "Try",
+      "No results found.\n\n- npm:missing latest\n  Try: npm:missing@1.0.0",
+    ],
+  ])(
+    "accepts target-local %s recovery without a hit or Next",
+    async (_kind, searchText) => {
+      const caller = createCaller(async (name, args) => {
+        if (name === "search" && args.format !== "json") {
+          return textResult(searchText);
+        }
+        return smokeResponse(name, args);
+      });
+
+      await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+    },
+  );
+
+  it("accepts terminal target rows with a global rerun action", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          "No results found.\nSearch failed.\n\n" +
+            "- npm:express@4.18.2\n" +
+            "  searched: code; not found: symbols\n\n" +
+            "Follow-up:\n  Search again later.",
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "ready",
+    "pending",
+    "provisional",
+    "older snapshot",
+    "package not found: code",
+  ])("recognizes grouped target state detail: %s", async (detail) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          `No results found.\n\n- npm:express@4.18.2\n  ${detail}\n\nFollow-up:
+  Search again later.`,
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "ready",
+    "pending",
+    "provisional",
+    "older snapshot",
+    "package not found: code",
+  ])("rejects ungrouped target state detail: %s", async (detail) => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(
+          `No results found.\n  ${detail}\n\nFollow-up:
+  Search again later.`,
+        );
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: readiness details must be grouped under a target",
+    );
+  });
+
+  it("rejects duplicate outcome lines", async () => {
+    const caller = createCaller(async (name, args) => {
+      if (name === "search" && args.format !== "json") {
+        return textResult(`${smokeSearchText()}\nNo results available yet.`);
+      }
+      return smokeResponse(name, args);
+    });
+
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "search default: duplicate outcome lines",
+    );
+  });
+});
+
+const SMOKE_SITE_TARGET = "site:expressjs.com";
+const SMOKE_SITE_PAGE_PATH = "en/resources/";
+const SMOKE_SITE_PAGE_URL = "https://expressjs.com/en/resources/";
+const SMOKE_PACKAGE_TARGET = "npm:express@5.2.1";
+const SMOKE_PACKAGE_VERSION = "5.2.1";
+const SMOKE_LIST_CURSOR = "smoke-list-cursor";
+const SMOKE_GREP_CURSOR = "c21va2UtZ3JlcC1jdXJzb3I";
+const MIXED_GREP_FIXTURE = parseGrepResult(mixedGrepPageFixture);
+
+function smokeGrepResult(args: Record<string, unknown>): GrepResult {
+  const continuation = args.cursor === SMOKE_GREP_CURSOR;
+  if (args.cursor !== undefined && !continuation) {
+    throw new Error("grep smoke received an unexpected cursor");
+  }
+  const continuationHit = MIXED_GREP_FIXTURE.hits[2];
+  if (!continuationHit)
+    throw new Error("grep smoke fixture has no next-page hit");
+  const result = {
+    ...MIXED_GREP_FIXTURE,
+    hits: continuation
+      ? [continuationHit]
+      : MIXED_GREP_FIXTURE.hits.slice(0, 2),
+    targets: MIXED_GREP_FIXTURE.targets.map((target) => ({
+      ...target,
+      target: SMOKE_PACKAGE_TARGET,
+      traversal: continuation ? "COMPLETE" : "RESUMABLE_LIMIT",
+    })),
+    traversal: continuation ? "COMPLETE" : "RESUMABLE_LIMIT",
+    nextCursor: continuation ? null : SMOKE_GREP_CURSOR,
+    totalMatches: continuation ? 1 : 2,
+  };
+  return parseGrepResult(result);
+}
+
+function smokeListResult(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const target = args.target;
+  if (typeof target !== "string") {
+    throw new Error("list smoke requires a target");
+  }
+  const isSite = target.startsWith("site:");
+  const isRootPackageQuery = !isSite && args.paths === undefined;
+  const hasMore =
+    isRootPackageQuery && args.limit === 1 && args.after !== SMOKE_LIST_CURSOR;
+  const packagePath = isRootPackageQuery
+    ? args.after === SMOKE_LIST_CURSOR
+      ? "index.js"
+      : "History.md"
+    : "package.json";
+  return {
+    inventoryKind: isSite ? "SITE" : "SOURCE",
+    requestedTarget: target,
+    canonicalTarget: target,
+    entries: isSite
+      ? [
+          {
+            kind: "PAGE",
+            path: SMOKE_SITE_PAGE_PATH,
+            read: { target: SMOKE_SITE_TARGET, path: SMOKE_SITE_PAGE_PATH },
+          },
+        ]
+      : [
+          {
+            kind: "FILE",
+            path: packagePath,
+            read: { target: SMOKE_PACKAGE_TARGET, path: packagePath },
+          },
+        ],
+    hasMore,
+    nextCursor: hasMore ? SMOKE_LIST_CURSOR : null,
+    indexedVersion: isSite ? null : SMOKE_PACKAGE_VERSION,
+    codeIndexState: null,
+    indexingStatus: null,
+    indexingRef: null,
+    inventoryState: "AVAILABLE",
+    crawlStatus: isSite ? "COMPLETE" : null,
+    coverageState: "COMPLETE",
+    coverageReason: null,
+    preparation: null,
+  };
+}
+
+function smokeListText(args: Record<string, unknown>): string {
+  const result = smokeListResult(args);
+  const isSite = result.inventoryKind === "SITE";
+  const source = result.canonicalTarget;
+  const followUp = isSite
+    ? 'Read pages: read target="site:expressjs.com" path=$path'
+    : `Read files: read target=${JSON.stringify(source)} path=$path`;
+  const entries = result.entries as Array<Record<string, unknown>>;
+  const path = entries[0]?.path;
+  const continuation = result.nextCursor
+    ? `\n\nMore results: repeat this list, adding:\n  after=${JSON.stringify(result.nextCursor)}`
+    : "";
+  return `Sources:\n  - ${String(source)}${isSite ? " (hosted documentation)" : ""}\n${followUp}\n${path}${continuation}`;
+}
+
+function smokeResponse(
+  name: string,
+  args: Record<string, unknown>,
+): McpSmokeToolResult {
+  if (
+    (name === "pkg_deps" &&
+      args.target === "go:github.com/docker/docker@v20.10.0") ||
+    (name === "list" &&
+      args.target === "github:expressjs/express@v99.99.99-nope")
+  ) {
+    const code = name === "pkg_deps" ? "VERSION_NOT_FOUND" : "REF_NOT_FOUND";
+    const details =
+      name === "pkg_deps"
+        ? { availablePackageVersions: ["v20.10.0+incompatible"] }
+        : { suggestedRefs: [{ ref: "v5.3.0" }] };
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text:
+            args.format === "json"
+              ? JSON.stringify({
+                  error: "Missing revision.",
+                  code,
+                  retryable: false,
+                  details: {
+                    ...details,
+                    action: `Retry ${name} with target="corrected".`,
+                  },
+                })
+              : `Missing revision. Retry ${name} with target="corrected".`,
+        },
+      ],
+    };
+  }
+  if (
+    name === "pkg_changelog" &&
+    typeof args.target === "string" &&
+    (args.target.startsWith("github:") || args.target.startsWith("site:"))
+  ) {
+    return errorResult(
+      "INVALID_ARGUMENT",
+      JSON.stringify({
+        error: "pkg_changelog is package-only",
+        code: "INVALID_ARGUMENT",
+        retryable: false,
+      }),
+    );
+  }
+  if (
+    name === "research" &&
+    args.target !== undefined &&
+    args.thread_id !== undefined
+  ) {
+    return errorResult("INVALID_ARGUMENT");
+  }
+  if (args.format === "json") return smokeJsonResponse(name, args);
+
+  switch (name) {
+    case "resolve_target":
+      if (args.name === "lodahs") {
+        return textResult(
+          "Targets:\n  1. npm:lodash [high; package]\n     code: indexed package snapshot" +
+            (args.verbose === true
+              ? "\n     91% name similarity\nName similarity is coarse lexical support; candidate order follows broader backend policy."
+              : ""),
+        );
+      }
+      return textResult(
+        'Targets:\n  1. npm:express [exact; package]\n     github:expressjs/express\nRelated targets:\n       site:expressjs.com\nNext: pass the canonical target "npm:express" to search.',
+      );
+    case "code_diff":
+      return textResult(
+        "Source changed\nResolved endpoints:\nScope: repository",
+      );
+    case "quick_start":
+      return textResult(
+        "## Choose a tool\nUse `search` to discover, `list` to browse files, `grep` to match code and docs, and `read` to open results; `resolve_target` resolves names; `code_diff` compares source; `research` answers questions.",
+      );
+    case "get_example":
+      return textResult("example\nsolution_id: smoke");
+    case "pkg_info":
+      return textResult(
+        "express\nRepository 1 stars\n" +
+          "Vulnerabilities  Latest: none affected\n                 History: 5 known advisories across all versions",
+      );
+    case "pkg_deps":
+      if (args.include_issues === true) {
+        return textResult("Dependency issues: 0 issues across the full graph");
+      }
+      return textResult(
+        args.lifecycle === "all"
+          ? "Dependency groups: runtime, development"
+          : 'Runtime dependencies:\npass lifecycle="all"',
+      );
+    case "pkg_vulns":
+      if (args.advisory_scope === "unknown") {
+        return textResult(
+          "lodash vulnerabilities\nScope   unknown\nAssessment AFFECTED | 4 non-affecting | 8 all",
+        );
+      }
+      if (args.include_transitive === true) {
+        return textResult(
+          "express vulnerabilities\n\n" +
+            "Resolved dependencies\n" +
+            "1 affected advisory occurrence in 1 dependency package; " +
+            "6 resolved package versions checked\n" +
+            "  high  body-parser@1.19.0  GHSA-body-parser\n" +
+            "    matched       < 2.0.0\n" +
+            "    nearest fix   2.0.0\n" +
+            "  high  cookie@0.7.0  GHSA-cookie\n" +
+            "  high  qs@6.5.2  GHSA-qs\n" +
+            "  high  path-to-regexp@0.1.12  GHSA-path\n" +
+            "  high  set-function-length@1.2.2  GHSA-set-length\n" +
+            "... (+1 more; use verbose=true or format=json)",
+        );
+      }
+      if (args.min_severity === "high") {
+        return textResult("Filter  severity >= high\nvulnerabilities");
+      }
+      if (args.advisory_scope === "non_affecting") {
+        return textResult(
+          "Scope   non-affecting advisories only\nNo active vulnerabilities affect this version",
+        );
+      }
+      return textResult("express vulnerabilities");
+    case "pkg_changelog":
+      return textResult(
+        args.body_lines === 3 && args.verbose !== true && args.verbatim !== true
+          ? "truncated; pass verbatim=true"
+          : "compact changelog timeline",
+      );
+    case "pkg_upgrade_review":
+      return textResult(
+        "Upgrade review - 1 package\n\n" +
+          "npm:express 5.0.0 -> 5.2.1 (patch)\n\n" +
+          "Security\n" +
+          "  Direct: 0 affected -> 0 affected | 0 fixed | 0 added | 0 still present\n" +
+          "  Transitive: not checked\n\n" +
+          "Changes (classified by agent)\n" +
+          "  Repository releases | 1 entry | 1 with release notes\n" +
+          "  Classification coverage: 1 classified | 0 not assessed | 0 without notes | 0 statements labeled no impact\n" +
+          "  Statements: 0 returned | 1 labeled no impact\n" +
+          "  Selection: focused | 0 matching statements of 1 parsed.",
+      );
+    case "list":
+      return textResult(smokeListText(args));
+    case "read":
+      if (
+        typeof args.target === "string" &&
+        (args.target.startsWith("site:") ||
+          (args.target.startsWith("http") && args.path === undefined))
+      ) {
+        return textResult("router documentation");
+      }
+      if (args.path === "package.json") {
+        return textResult('1  {"name":"express"}');
+      }
+      if (typeof args.path === "string") {
+        return textResult(
+          `${String(args.start_line ?? 1)}  var Router = require('router');`,
+        );
+      }
+      return textResult("documentation content");
+    case "grep":
+      return textResult(
+        formatGrepText(smokeGrepResult(args), { syntax: "mcp" }),
+      );
+    case "search":
+      return textResult(
+        "No results available yet.\n\n" +
+          "- npm:express@5.2.1\n" +
+          "  indexing: code; available: versions 5.2.1\n\n" +
+          'Follow-up:\n  search_status search_ref="smoke-ref" wait_timeout_ms=30000',
+      );
+    case "search_status":
+      return errorResult("NOT_FOUND");
+    default:
+      throw new Error(`unexpected smoke tool ${name}`);
+  }
+}
+
+function smokeSearchText(): string {
+  return resultText(smokeResponse("search", {}), "search fixture");
+}
+
+function smokeJsonResponse(
+  name: string,
+  args: Record<string, unknown>,
+): McpSmokeToolResult {
+  switch (name) {
+    case "resolve_target": {
+      const target = args.name === "lodahs" ? "npm:lodash" : "npm:express";
+      return jsonResult({
+        best: target,
+        ambiguous: false,
+        protectedMatches: [target],
+        targetsTruncated: false,
+        candidates: [
+          {
+            target,
+            kind: "package",
+            direct: true,
+            confidence: "exact",
+            latestVersionMaliciousStatus: "clear",
+            nameSimilarity: 0.91,
+          },
+        ],
+      });
+    }
+    case "code_diff":
+      return jsonResult({
+        view: args.view ?? "name-status",
+        from: { requested: args.from },
+        to: { requested: args.to },
+        scope: { status: "repository" },
+        files: [
+          {
+            path: "lib/utils.js",
+            status: "modified",
+            ...(args.view === "patch"
+              ? { patch: "diff --git a/lib/utils.js b/lib/utils.js\n" }
+              : {}),
+          },
+        ],
+        hasMoreFiles: true,
+      });
+    case "get_example":
+      return jsonResult({ result: "example" });
+    case "pkg_info":
+      return jsonResult({
+        registry:
+          args.target === "cargo:serde" || args.target === "crates:serde"
+            ? "crates"
+            : "npm",
+        name:
+          args.target === "cargo:serde" || args.target === "crates:serde"
+            ? "serde"
+            : "express",
+        version: "1.0.0",
+        versionCount: 42,
+        downloads: { refreshedAt: "2024-06-15" },
+        advisoryHistory: { total: 5 },
+      });
+    case "pkg_deps":
+      if (args.include_issues === true) {
+        return jsonResult({
+          issues: {
+            total: 0,
+            scope: { mode: "full" },
+            deprecated: { count: 0, items: [] },
+            outdated: { count: 0, items: [] },
+            duplicates: { count: 0, items: [] },
+            conflicts: { count: 0, items: [] },
+          },
+        });
+      }
+      return jsonResult({ runtime: {} });
+    case "pkg_vulns":
+      if (args.include_transitive === true) {
+        return jsonResult({
+          summary: { total: 0 },
+          transitive: {
+            scope: "resolved_dependencies",
+            advisoryScope: args.advisory_scope ?? "affected",
+            withdrawnAdvisoriesIncluded: false,
+            summary: {
+              totalPackagesAnalyzed: 6,
+              packageCount: 1,
+              occurrenceCount: 1,
+              unknownCount: args.advisory_scope === "unknown" ? 1 : 0,
+            },
+            packages: [
+              {
+                registry: "npm",
+                name: "body-parser",
+                occurrenceCount: 1,
+                unknownCount: args.advisory_scope === "unknown" ? 1 : 0,
+                occurrences: [
+                  {
+                    resolvedVersion: "1.19.0",
+                    affectsResolvedVersion: args.advisory_scope !== "unknown",
+                    assessmentStatus:
+                      args.advisory_scope === "unknown" ? "UNKNOWN" : undefined,
+                    assessmentReasons:
+                      args.advisory_scope === "unknown"
+                        ? ["INVALID_RANGE"]
+                        : undefined,
+                    id: "GHSA-body-parser",
+                    matchedAffectedVersionRanges:
+                      args.advisory_scope === "unknown" ? [] : ["< 2.0.0"],
+                    fixVersionsAboveResolved:
+                      args.advisory_scope === "unknown" ? [] : ["2.0.0"],
+                    nearestFixedVersion:
+                      args.advisory_scope === "unknown" ? undefined : "2.0.0",
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+      return jsonResult({
+        summary: { unknownVulnerabilityCount: 0, assessmentStatus: "AFFECTED" },
+        filter: {
+          minSeverity: args.min_severity,
+          advisoryScope: args.advisory_scope,
+        },
+      });
+    case "pkg_changelog":
+      if (args.omit_bodies === true) return jsonResult({ entries: {} });
+      if (args.target === "npm:express@5.2.1") {
+        return jsonResult({
+          mode: "exact",
+          statements: { items: [], coverage: [] },
+          entries: {
+            items: [{ version: "5.2.1", hasChangelog: true }],
+          },
+        });
+      }
+      return jsonResult({
+        entries: { items: [] },
+        statements: { items: [], coverage: [] },
+      });
+    case "pkg_upgrade_review":
+      return jsonResult({
+        summary: {},
+        reviews: [
+          {
+            changelog: {
+              statements: {
+                selection: "focused",
+                count: 1,
+                totalCount: 2,
+                matchingCount: 1,
+                items: [
+                  {
+                    version: "5.0.0",
+                    position: 0,
+                    sourceIndex: 0,
+                    sourcePosition: 0,
+                    text: "Removed an API.",
+                    textTruncated: false,
+                    fullText: "Removed an API.",
+                    url: "https://example.com/releases/v5.0.0",
+                    classification: {
+                      tier: "must_act",
+                      ambiguous: false,
+                      model: "jev-1.13.0",
+                      formulation: "s-hier-v3",
+                    },
+                  },
+                ],
+                coverage: [],
+              },
+              riskCoverage: {
+                versionsClassified: 1,
+                versionsNotAssessed: 0,
+                versionsWithoutNotes: 0,
+                versionsUnparseable: 0,
+                unitsNoImpact: 1,
+                itemsMustActConfident: 1,
+                itemsMustActAmbiguous: 0,
+                itemsShouldKnowConfident: 0,
+                itemsShouldKnowAmbiguous: 0,
+                itemsUnclassified: 0,
+              },
+            },
+          },
+        ],
+      });
+    case "list":
+      return jsonResult(smokeListResult(args));
+    case "read": {
+      if (
+        (args.target === SMOKE_SITE_TARGET &&
+          args.path === SMOKE_SITE_PAGE_PATH) ||
+        args.target === SMOKE_SITE_PAGE_URL
+      ) {
+        const startLine =
+          typeof args.start_line === "number" ? args.start_line : 1;
+        const endLine =
+          typeof args.end_line === "number" ? args.end_line : startLine;
+        return jsonResult({
+          docsReadTarget: SMOKE_SITE_PAGE_URL,
+          pageId: "express-resources",
+          sourceUrl: SMOKE_SITE_PAGE_URL,
+          content: "router documentation",
+          startLine,
+          endLine,
+          totalLines: endLine,
+        });
+      }
+      if (
+        args.target === "https://docs.example.invalid/githits-smoke-unknown"
+      ) {
+        return errorResult("NOT_FOUND");
+      }
+      const startLine =
+        typeof args.start_line === "number" ? args.start_line : 1;
+      const endLine =
+        typeof args.end_line === "number" ? args.end_line : startLine;
+      if (
+        typeof args.path === "string" &&
+        typeof args.target === "string" &&
+        !args.target.startsWith("site:")
+      ) {
+        return jsonResult({
+          target: args.target,
+          path: args.path,
+          content:
+            args.path === "package.json"
+              ? '{"name":"express"}'
+              : "var Router = require('router');",
+          startLine,
+          endLine,
+          totalLines: endLine,
+        });
+      }
+      const docsReadTarget =
+        args.target === SMOKE_SITE_TARGET && args.path === SMOKE_SITE_PAGE_PATH
+          ? SMOKE_SITE_PAGE_URL
+          : args.target;
+      return jsonResult({
+        docsReadTarget,
+        pageId: "express-smoke-page",
+        sourceUrl: docsReadTarget,
+        content: "router documentation",
+        startLine,
+        endLine,
+        totalLines: endLine,
+      });
+    }
+    case "grep":
+      return jsonResult(smokeGrepResult(args));
+    case "search": {
+      const query = typeof args.query === "string" ? args.query : "";
+      const invalidQualifier =
+        /(?:^|\s)(kind|category|intent):bogus(?:\s|$)/.exec(query);
+      if (invalidQualifier) {
+        return errorResult("INVALID_ARGUMENT");
+      }
+      if (query.includes("path:lib/") && query.includes("lang:javascript")) {
+        return jsonResult({
+          completed: true,
+          hasMore: false,
+          query: { raw: query },
+          results: [
+            {
+              target: "npm:express@5.2.1",
+              locator: { filePath: "lib/router/index.js" },
+            },
+          ],
+          sourceStatus: [
+            {
+              source: "CODE",
+              ignoredQueryFeatures: [],
+              incompatibleQueryFeatures: [],
+            },
+          ],
+        });
+      }
+      if (args.source === "docs") {
+        return jsonResult({
+          completed: true,
+          results: [
+            {
+              type: "documentation_page",
+              locator: {
+                docsReadTarget: SMOKE_SITE_PAGE_URL,
+                sourceUrl: SMOKE_SITE_PAGE_URL,
+                startLine: 81,
+                endLine: 93,
+              },
+              followUp: `read target=${JSON.stringify(SMOKE_SITE_PAGE_URL)}`,
+            },
+          ],
+        });
+      }
+      return jsonResult({
+        completed: false,
+        searchRef: "smoke-ref",
+        progress: { status: "INDEXING", targetsReady: 0, targetsTotal: 1 },
+      });
+    }
+    case "search_status":
+      return jsonResult({ completed: true });
+    default:
+      throw new Error(`unexpected smoke JSON tool ${name}`);
+  }
+}
+
+describe("search MCP footer structure", () => {
+  it("rejects status operands without the Follow-up section", async () => {
+    const caller = createCaller(async (name, args) =>
+      name === "search" && args.format !== "json"
+        ? textResult(
+            'No results available yet.\n  search_status search_ref="ref" wait_timeout_ms=30000',
+          )
+        : smokeResponse(name, args),
+    );
+    await expect(runMcpSmoke(caller)).rejects.toThrow(
+      "status action must be in Follow-up",
+    );
+  });
+});

@@ -1,0 +1,5500 @@
+import { describe, expect, it } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, win32 } from "node:path";
+import {
+  GITHITS_GUIDANCE_BLOCK,
+  GITHITS_GUIDANCE_MARKER,
+} from "../src/commands/init/guidance-assets.ts";
+import {
+  buildAgentEvalMetricsArtifact,
+  buildClaudeCommand,
+  buildCodexCommand,
+  buildCodexConfig,
+  buildCodexConfigArgs,
+  buildEvalEnv,
+  buildEvalPrompt,
+  buildMcpConfig,
+  buildOpenCodeCommand,
+  buildOpenCodeConfig,
+  buildOpenCodeSkillsConfig,
+  type CommandProbe,
+  type CommandProbeResult,
+  collectGitMetadata,
+  collectHostHomeValues,
+  collectSecretValues,
+  createWorkloadIsolation,
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_REASONING_EFFORT,
+  extractDiscoveryEvents,
+  extractEvalValidationViolations,
+  extractToolCalls,
+  GITHITS_INTENT_FRAGMENT,
+  GITHITS_INTENT_FRAGMENT_HASH,
+  isolateOpenCodeSkills,
+  isValidAgentReport,
+  loadTargetGuidanceBlock,
+  parseArgs,
+  prepareFullGuidanceWorkspace,
+  prepareSkillsWorkspace,
+  readObservedStdout,
+  redactText,
+  runAgentEval,
+  runWithTimeout,
+  sanitizedEnvSummary,
+  validateCodexEvalHome,
+} from "./agent-eval.ts";
+import {
+  type AgentEvalRecordInput,
+  adaptAgentUsage,
+  agentEvalMetricsSchema,
+  buildAgentEvalMetrics,
+} from "./agent-eval-metrics.ts";
+import {
+  assertUniqueWorkloadIds,
+  buildRunReportFromMetadata,
+  compareReports,
+  formatCompareReport,
+  formatRunReport,
+  isContainedRelativePath,
+  loadRunReport,
+  normalizeToolName,
+  normalizeToolStatus,
+  parseReportArgs,
+  summarizeCallsByTool,
+  summarizeFinalReport,
+  summarizeToolCalls,
+} from "./agent-eval-report.ts";
+import {
+  buildClaudeSessionCommand,
+  buildCodexSessionCommand,
+  buildOpenCodeSessionCommand,
+  parseSessionArgs,
+  prepareAgentSession,
+  runAgentSession,
+} from "./agent-session.ts";
+
+function writeJson(path: string, value: unknown): void {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function createTargetFixture(guidanceBlock = "Target guidance"): string {
+  const targetRoot = mkdtempSync(join(tmpdir(), "agent-eval-target-"));
+  mkdirSync(join(targetRoot, "src", "commands", "init"), {
+    recursive: true,
+  });
+  mkdirSync(join(targetRoot, "skills", "githits-mcp"), { recursive: true });
+  writeFileSync(
+    join(targetRoot, "src", "commands", "init", "guidance-assets.ts"),
+    `export const GITHITS_GUIDANCE_BLOCK = ${JSON.stringify(guidanceBlock)};\n`,
+  );
+  writeFileSync(
+    join(targetRoot, "skills", "githits-mcp", "SKILL.md"),
+    "# Target skill\n",
+  );
+  return targetRoot;
+}
+
+function createRunFixture(status = "success"): string {
+  const runDir = mkdtempSync(join(tmpdir(), "agent-eval-test-"));
+  const workloadDir = join(runDir, "workloads", "pkg-vulns");
+  mkdirSync(workloadDir, { recursive: true });
+  writeJson(join(workloadDir, "tool-calls.json"), [
+    { agent: "codex", tool: "pkg_vulns", status: "in_progress" },
+    { agent: "codex", tool: "pkg_vulns", status: "completed" },
+  ]);
+  writeJson(join(workloadDir, "final.json"), {
+    status: "success",
+    answer: "No active vulnerabilities.",
+    toolIssues: [],
+    expectedToolUse: ["mcp__githits__pkg_vulns"],
+    unexpectedToolUse: [],
+    instructionIssues: ["Package aliases were unclear"],
+    githitsUsefulness: "helped",
+    githitsUsefulnessReason: "It returned advisory details.",
+    confidence: "high",
+  });
+  writeFileSync(join(workloadDir, "stderr.txt"), "");
+  writeJson(join(runDir, "run.json"), {
+    agent: "codex",
+    server: "local",
+    dryRun: false,
+    workloads: [
+      {
+        id: "pkg-vulns",
+        status,
+        durationMs: 1234,
+        workloadDir,
+      },
+    ],
+  });
+  return runDir;
+}
+
+function createMetricsRecord(
+  workloadId: string,
+  overrides: Partial<AgentEvalRecordInput> = {},
+): AgentEvalRecordInput {
+  return {
+    workloadId,
+    requestedModel: DEFAULT_CODEX_MODEL,
+    resolvedModel: null,
+    agent: "codex",
+    agentVersion: "codex 0.150.1",
+    reasoningEffort: "high",
+    surface: "mcp",
+    server: "local",
+    guidanceProfile: "descriptors",
+    experimentalTools: false,
+    publishedPackage: null,
+    targetGit: { branch: "main", sha: "abc123", dirty: false },
+    startedAt: "2026-08-28T10:00:00.000Z",
+    completedAt: "2026-08-28T10:00:01.000Z",
+    durationMs: 1000,
+    processStatus: "success",
+    finalStatus: "success",
+    exitCode: 0,
+    timedOut: false,
+    usage: adaptAgentUsage(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          cache_write_input_tokens: 20,
+          output_tokens: 10,
+          reasoning_output_tokens: 4,
+        },
+      }),
+      "codex",
+      DEFAULT_CODEX_MODEL,
+    ),
+    toolCalls: [
+      {
+        tool: "mcp__githits__pkg_info",
+        server: "githits",
+        status: "completed",
+      },
+      { tool: "search", server: "githits-cli", status: "completed" },
+    ],
+    artifacts: {},
+    ...overrides,
+  };
+}
+
+function writeMetricsFixture(
+  runDir: string,
+  records: AgentEvalRecordInput[],
+): void {
+  writeJson(
+    join(runDir, "metrics.json"),
+    buildAgentEvalMetrics({
+      runId: "run-metrics",
+      startedAt: "2026-08-28T10:00:00.000Z",
+      completedAt: "2026-08-28T10:00:03.000Z",
+      records,
+    }),
+  );
+}
+
+describe("agent eval harness", () => {
+  const localOptions = {
+    server: "local" as const,
+    repoRoot: "/repo/githits-cli",
+    publishedPackage: "githits@latest",
+  };
+
+  it("builds local MCP config with explicit repo cwd", () => {
+    const config = buildMcpConfig(
+      {
+        server: "local",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      {},
+    );
+
+    expect(config.mcpServers.githits).toEqual({
+      command: "bun",
+      args: ["run", "--cwd", "/repo/githits-cli", "dev", "mcp", "start"],
+      env: { GITHITS_DISABLE_SKILL_UPDATE: "1" },
+    });
+  });
+
+  it("keeps measurement and target roots separate with target root parsing", () => {
+    const harnessRoot = resolve("repo", "harness");
+    const targetRoot = resolve(harnessRoot, "..", "target");
+    const expectedSchemaPath = join(
+      harnessRoot,
+      "eval",
+      "agentic",
+      "result.schema.json",
+    );
+    const expectedReportingPath = join(
+      harnessRoot,
+      "eval",
+      "agentic",
+      "workloads",
+      "REPORTING.md",
+    );
+    const expectedWorkload = join(
+      harnessRoot,
+      "eval",
+      "agentic",
+      "workloads",
+      "express-router.md",
+    );
+
+    const defaults = parseArgs(["--dry-run"], harnessRoot);
+    expect(defaults.repoRoot).toBe(harnessRoot);
+    expect(defaults.targetRoot).toBe(harnessRoot);
+    expect(defaults.schemaPath).toBe(expectedSchemaPath);
+    expect(defaults.reportingPath).toBe(expectedReportingPath);
+    expect(defaults.workloads).toEqual([expectedWorkload]);
+
+    const explicit = parseArgs(
+      ["--target-root", "../target", "--out", "runs/local", "--dry-run"],
+      harnessRoot,
+    );
+    expect(explicit.repoRoot).toBe(harnessRoot);
+    expect(explicit.targetRoot).toBe(targetRoot);
+    expect(explicit.outDir).toBe(join(harnessRoot, "runs", "local"));
+    expect(explicit.schemaPath).toBe(expectedSchemaPath);
+    expect(explicit.reportingPath).toBe(expectedReportingPath);
+    expect(explicit.workloads).toEqual([expectedWorkload]);
+  });
+
+  it("uses the target root for local launch vectors and skill installation", () => {
+    const targetRoot = createTargetFixture();
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-eval-target-work-"));
+    try {
+      const options = {
+        server: "local" as const,
+        repoRoot: "/repo/harness",
+        targetRoot,
+        publishedPackage: "githits@latest",
+        experimentalTools: true,
+      };
+      const expectedMcpArgs = [
+        "run",
+        "--cwd",
+        targetRoot,
+        "dev",
+        "mcp",
+        "start",
+        "--experimental-tools",
+      ];
+      expect(buildMcpConfig(options).mcpServers.githits.args).toEqual(
+        expectedMcpArgs,
+      );
+      expect(buildCodexConfig(options)).toContain(
+        JSON.stringify(expectedMcpArgs),
+      );
+      expect(buildCodexConfigArgs(options)).toContain(
+        `mcp_servers.githits.args=${JSON.stringify(expectedMcpArgs)}`,
+      );
+      expect(buildOpenCodeConfig(options).mcp?.githits?.command).toEqual([
+        "bun",
+        ...expectedMcpArgs,
+      ]);
+
+      const installation = prepareSkillsWorkspace(options, workspaceDir);
+      expect(installation.sourceDir).toBe(join(targetRoot, "skills"));
+      expect(
+        existsSync(join(workspaceDir, "skills", "githits-mcp", "SKILL.md")),
+      ).toBe(true);
+      expect(readFileSync(installation.cliShim, "utf8")).toContain(targetRoot);
+      expect(options.repoRoot).toBe("/repo/harness");
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses target root guidance and keeps descriptor roots harness-owned", async () => {
+    const targetRoot = createTargetFixture("Target guidance A");
+    const targetRootB = createTargetFixture("Target guidance B");
+    const descriptorTargetRoot = mkdtempSync(
+      join(tmpdir(), "agent-eval-target-descriptor-root-"),
+    );
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-eval-target-full-"));
+    const workspaceDirB = mkdtempSync(
+      join(tmpdir(), "agent-eval-target-full-b-"),
+    );
+    try {
+      const options = {
+        server: "local" as const,
+        repoRoot: "/repo/harness",
+        targetRoot,
+        publishedPackage: "githits@latest",
+      };
+      const block = await loadTargetGuidanceBlock(targetRoot);
+      const installation = prepareFullGuidanceWorkspace(
+        options,
+        workspaceDir,
+        block,
+      );
+      const content = readFileSync(join(workspaceDir, "AGENTS.md"), "utf8");
+      expect(content).toContain("Target guidance A");
+      expect(content).not.toContain(GITHITS_GUIDANCE_BLOCK);
+      expect(installation.skillInstallation.sourceDir).toBe(
+        join(targetRoot, "skills"),
+      );
+
+      const blockB = await loadTargetGuidanceBlock(targetRootB);
+      prepareFullGuidanceWorkspace(
+        { ...options, targetRoot: targetRootB },
+        workspaceDirB,
+        blockB,
+      );
+      expect(readFileSync(join(workspaceDirB, "AGENTS.md"), "utf8")).toContain(
+        "Target guidance B",
+      );
+
+      const outDir = mkdtempSync(
+        join(tmpdir(), "agent-eval-target-descriptor-"),
+      );
+      try {
+        const descriptorOptions = parseArgs(
+          [
+            "--guidance-profile",
+            "descriptors",
+            "--target-root",
+            descriptorTargetRoot,
+            "--out",
+            outDir,
+            "--dry-run",
+            "--workload",
+            "eval/agentic/workloads/express-router.md",
+          ],
+          process.cwd(),
+        );
+        await runAgentEval(descriptorOptions);
+        const workloadDir = join(outDir, "workloads", "express-router");
+        const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+        const dryRun = JSON.parse(
+          readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+        );
+        expect(run.repoRoot).toBe(process.cwd());
+        expect(run.measurementRoot).toBe(process.cwd());
+        expect(run.targetRoot).toBe(descriptorTargetRoot);
+        expect(dryRun.measurementRoot).toBe(process.cwd());
+        expect(dryRun.targetRoot).toBe(descriptorTargetRoot);
+        expect(
+          existsSync(join(workloadDir, "guidance-installation.json")),
+        ).toBe(false);
+        expect(
+          JSON.parse(readFileSync(join(workloadDir, "mcp.json"), "utf8"))
+            .mcpServers.githits.args,
+        ).toContain(descriptorTargetRoot);
+      } finally {
+        rmSync(outDir, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+      rmSync(targetRootB, { recursive: true, force: true });
+      rmSync(descriptorTargetRoot, { recursive: true, force: true });
+      rmSync(workspaceDir, { recursive: true, force: true });
+      rmSync(workspaceDirB, { recursive: true, force: true });
+    }
+  });
+
+  it("fails full target root guidance preflight before paid probes", async () => {
+    const missingRoot = mkdtempSync(
+      join(tmpdir(), "agent-eval-target-missing-"),
+    );
+    const invalidRoot = createTargetFixture();
+    const importFailureRoot = createTargetFixture();
+    writeFileSync(
+      join(invalidRoot, "src", "commands", "init", "guidance-assets.ts"),
+      "export const GITHITS_GUIDANCE_BLOCK = 42;\n",
+    );
+    writeFileSync(
+      join(importFailureRoot, "src", "commands", "init", "guidance-assets.ts"),
+      'throw new Error("target guidance import failed");\n',
+    );
+    const roots = [
+      {
+        targetRoot: missingRoot,
+        error: "Target guidance module not found",
+      },
+      {
+        targetRoot: invalidRoot,
+        error: "invalid GITHITS_GUIDANCE_BLOCK export",
+      },
+      {
+        targetRoot: importFailureRoot,
+        error: "Target guidance module failed to load",
+      },
+    ];
+    try {
+      for (const { targetRoot, error } of roots) {
+        const outDir = mkdtempSync(join(tmpdir(), "agent-eval-target-fail-"));
+        let availabilityCalls = 0;
+        let versionCalls = 0;
+        try {
+          const options = parseArgs(
+            [
+              "--guidance-profile",
+              "full",
+              "--target-root",
+              targetRoot,
+              "--out",
+              outDir,
+              "--workload",
+              "eval/agentic/workloads/express-router.md",
+            ],
+            process.cwd(),
+          );
+          await expect(
+            runAgentEval(options, {
+              assertAgentAvailable: async () => {
+                availabilityCalls += 1;
+              },
+              collectAgentVersions: async () => {
+                versionCalls += 1;
+                return ["claude", "codex", "opencode"];
+              },
+            }),
+          ).rejects.toThrow(error);
+          expect(availabilityCalls).toBe(0);
+          expect(versionCalls).toBe(0);
+        } finally {
+          rmSync(outDir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      for (const { targetRoot } of roots) {
+        rmSync(targetRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("probes target root Git metadata and records target Git in dry-run metadata", async () => {
+    const probedCwds: string[] = [];
+    const targetRoot = "/repo/target";
+    const git = await collectGitMetadata(
+      targetRoot,
+      async (_command, args, cwd) => {
+        probedCwds.push(cwd);
+        return {
+          stdout:
+            args[0] === "branch"
+              ? "target\n"
+              : args[0] === "status"
+                ? ""
+                : "target-sha\n",
+          exitCode: 0,
+        };
+      },
+    );
+    expect(probedCwds).toEqual([targetRoot, targetRoot, targetRoot]);
+    expect(git).toEqual({
+      branch: "target",
+      sha: "target-sha",
+      dirty: false,
+    });
+
+    const targetFixture = createTargetFixture();
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-target-git-"));
+    try {
+      const options = parseArgs(
+        [
+          "--target-root",
+          targetFixture,
+          "--out",
+          outDir,
+          "--dry-run",
+          "--workload",
+          "eval/agentic/workloads/express-router.md",
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options);
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      const dryRun = JSON.parse(
+        readFileSync(
+          join(outDir, "workloads", "express-router", "dry-run.json"),
+          "utf8",
+        ),
+      );
+      expect(run.targetRoot).toBe(targetFixture);
+      expect(run.git).toEqual(dryRun.targetGit);
+      expect(dryRun.measurementRoot).toBe(process.cwd());
+      expect(dryRun.targetRoot).toBe(targetFixture);
+    } finally {
+      rmSync(targetFixture, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps MCP server configuration identical across guidance profiles", () => {
+    expect(
+      buildMcpConfig({ ...localOptions, guidanceProfile: "descriptors" })
+        .mcpServers.githits.args,
+    ).not.toContain("--instruction-mode");
+    expect(
+      buildMcpConfig({ ...localOptions, guidanceProfile: "full" }).mcpServers
+        .githits.args,
+    ).not.toContain("--instruction-mode");
+  });
+
+  it("defaults automated Codex evals to Luna with high reasoning", () => {
+    const options = parseArgs(["--agent", "codex", "--dry-run"], "/repo");
+    expect(DEFAULT_CODEX_MODEL).toBe("gpt-6-luna");
+    expect(options.model).toBe(DEFAULT_CODEX_MODEL);
+    expect(options.reasoningEffort).toBe(DEFAULT_CODEX_REASONING_EFFORT);
+    expect(options.guidanceProfile).toBe("descriptors");
+    expect(options.intentProfile).toBe("neutral");
+  });
+
+  it("accepts the closed MCP scenario set and rejects unsupported intent combinations", () => {
+    expect(
+      parseArgs(["--guidance-profile", "descriptors", "--dry-run"], "/repo"),
+    ).toMatchObject({
+      guidanceProfile: "descriptors",
+      intentProfile: "neutral",
+    });
+    expect(
+      parseArgs(
+        [
+          "--guidance-profile",
+          "descriptors",
+          "--intent-profile",
+          "githits",
+          "--dry-run",
+        ],
+        "/repo",
+      ),
+    ).toMatchObject({
+      guidanceProfile: "descriptors",
+      intentProfile: "githits",
+    });
+    expect(
+      parseArgs(["--guidance-profile", "full", "--dry-run"], "/repo"),
+    ).toMatchObject({ guidanceProfile: "full", intentProfile: "neutral" });
+
+    expect(() =>
+      parseArgs(
+        [
+          "--guidance-profile",
+          "full",
+          "--intent-profile",
+          "githits",
+          "--dry-run",
+        ],
+        "/repo",
+      ),
+    ).toThrow("cannot be combined with full guidance");
+    expect(() =>
+      parseArgs(
+        ["--surface", "skills", "--intent-profile", "githits", "--dry-run"],
+        "/repo",
+      ),
+    ).toThrow("requires the MCP surface");
+    expect(() => parseArgs(["--intent-profile"], "/repo")).toThrow(
+      "must be neutral or githits",
+    );
+    expect(() => parseArgs(["--intent-profile", "unknown"], "/repo")).toThrow(
+      "must be neutral or githits",
+    );
+  });
+
+  it("places the exact intent fragment between workload and reporting prompts", () => {
+    const workload = "# Workload\n\nTask text\n";
+    const reporting = "# Reporting\n\nReturn JSON.\n";
+    expect(buildEvalPrompt(workload, reporting, "neutral")).toBe(
+      "# Workload\n\nTask text\n\n# Reporting\n\nReturn JSON.\n",
+    );
+    expect(buildEvalPrompt(workload, reporting, "githits")).toBe(
+      "# Workload\n\nTask text\n\nUse GitHits for this task.\n\n# Reporting\n\nReturn JSON.\n",
+    );
+  });
+
+  it("persists scenario and intent identity in dry-run artifacts", async () => {
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-intent-"));
+    try {
+      const options = parseArgs(
+        [
+          "--intent-profile",
+          "githits",
+          "--dry-run",
+          "--out",
+          outDir,
+          "--workload",
+          "eval/agentic/workloads/express-router.md",
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options);
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const dryRun = JSON.parse(
+        readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+      );
+      const metrics = JSON.parse(
+        readFileSync(join(outDir, "metrics.json"), "utf8"),
+      );
+      const prompt = readFileSync(join(workloadDir, "prompt.md"), "utf8");
+      expect(run).toMatchObject({
+        scenario: "intent",
+        intentProfile: "githits",
+        intentFragmentHash: GITHITS_INTENT_FRAGMENT_HASH,
+      });
+      expect(dryRun).toMatchObject({
+        scenario: "intent",
+        intentProfile: "githits",
+        intentFragmentHash: GITHITS_INTENT_FRAGMENT_HASH,
+      });
+      expect(metrics).toMatchObject({
+        schemaVersion: 3,
+        records: [
+          {
+            scenario: "intent",
+            intentProfile: "githits",
+            intentFragmentHash: GITHITS_INTENT_FRAGMENT_HASH,
+          },
+        ],
+      });
+      expect(prompt).toContain(`\n\n${GITHITS_INTENT_FRAGMENT}\n\n`);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves explicit Codex model and reasoning overrides", () => {
+    const options = parseArgs(
+      [
+        "--agent",
+        "codex",
+        "--model",
+        "gpt-custom",
+        "--reasoning-effort",
+        "ultra",
+        "--dry-run",
+      ],
+      "/repo",
+    );
+    expect(options.model).toBe("gpt-custom");
+    expect(options.reasoningEffort).toBe("ultra");
+  });
+
+  it("rejects invalid guidance and reasoning combinations before launch", () => {
+    expect(() =>
+      parseArgs(
+        ["--guidance-profile", "full", "--server", "published"],
+        "/repo",
+      ),
+    ).toThrow("requires --surface mcp --server local");
+    expect(() =>
+      parseArgs(["--surface", "skills", "--guidance-profile", "full"], "/repo"),
+    ).toThrow("cannot be used with --surface skills");
+    expect(() => parseArgs(["--reasoning-effort", "high"], "/repo")).toThrow(
+      "requires --agent codex",
+    );
+  });
+
+  it("adds the Codex reasoning effort as a TOML override", () => {
+    const options = {
+      ...localOptions,
+      reasoningEffort: "high" as const,
+    };
+    expect(buildCodexConfig(options)).toContain(
+      'model_reasoning_effort = "high"',
+    );
+    expect(buildCodexConfigArgs(options)).toContain(
+      'model_reasoning_effort="high"',
+    );
+  });
+
+  it("preserves ordinary subprocess completion", async () => {
+    const before = {
+      sigint: process.listenerCount("SIGINT"),
+      sigterm: process.listenerCount("SIGTERM"),
+    };
+    const result = await runWithTimeout(
+      [process.execPath, "-e", "process.stdout.write('complete')"],
+      process.cwd(),
+      {},
+      5,
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("complete");
+    expect(process.listenerCount("SIGINT")).toBe(before.sigint);
+    expect(process.listenerCount("SIGTERM")).toBe(before.sigterm);
+  });
+
+  it("finishes timeout reporting when no other subprocess work keeps Bun alive", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-eval-timeout-liveness-"));
+    const driverPath = join(root, "driver.ts");
+    const runnerPath = join(import.meta.dir, "agent-eval.ts");
+    writeFileSync(
+      driverPath,
+      [
+        `import { runWithTimeout } from ${JSON.stringify(runnerPath)};`,
+        'runWithTimeout([process.execPath, "-e", "setTimeout(() => {}, 10000)"], process.cwd(), {}, 0.2)',
+        "  .then(result => console.log(JSON.stringify({ timedOut: result.timedOut, finished: true })));",
+      ].join("\n"),
+    );
+    try {
+      const driver = Bun.spawn([process.execPath, driverPath], {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH ?? "",
+          SystemRoot: process.env.SystemRoot ?? "",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(driver.stdout).text(),
+        new Response(driver.stderr).text(),
+        driver.exited,
+      ]);
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({ timedOut: true, finished: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it("observes complete JSONL lines across chunks and a final unterminated line", async () => {
+    const timestamps = [
+      "2026-08-28T10:00:00.000Z",
+      "2026-08-28T10:00:01.000Z",
+      "2026-08-28T10:00:02.000Z",
+    ];
+    let timestampIndex = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('{"event":"first"}\n{"event":"sec'),
+        );
+        controller.enqueue(new TextEncoder().encode('ond"}\n{"event":"last"}'));
+        controller.close();
+      },
+    });
+
+    await expect(
+      readObservedStdout(stream, () => timestamps[timestampIndex++] ?? ""),
+    ).resolves.toEqual({
+      stdout: '{"event":"first"}\n{"event":"second"}\n{"event":"last"}',
+      lines: [
+        { line: '{"event":"first"}', observedAt: timestamps[0]! },
+        { line: '{"event":"second"}', observedAt: timestamps[1]! },
+        { line: '{"event":"last"}', observedAt: timestamps[2]! },
+      ],
+    });
+  });
+
+  it("kills a timed-out POSIX subprocess process group", async () => {
+    if (process.platform === "win32") return;
+
+    const root = mkdtempSync(join(tmpdir(), "agent-eval-timeout-"));
+    const scriptPath = join(root, "descendant.sh");
+    const before = {
+      sigint: process.listenerCount("SIGINT"),
+      sigterm: process.listenerCount("SIGTERM"),
+    };
+    writeFileSync(
+      scriptPath,
+      '#!/bin/sh\nprintf "READY\\n"\n( trap "printf \\"DESCENDANT_STOPPED\\\\n\\"; exit 0" TERM INT; while :; do sleep 1; done ) &\ntrap "printf \\"PARENT_STOPPED\\\\n\\"; exit 0" TERM INT\nwhile :; do sleep 1; done\n',
+    );
+
+    try {
+      const result = await runWithTimeout(["sh", scriptPath], root, {}, 0.2);
+
+      expect(result.timedOut).toBe(true);
+      expect(result.stdout).toContain("READY");
+      expect(result.stdout).toContain("DESCENDANT_STOPPED");
+      expect(result.stdout).toContain("PARENT_STOPPED");
+      expect(process.listenerCount("SIGINT")).toBe(before.sigint);
+      expect(process.listenerCount("SIGTERM")).toBe(before.sigterm);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("builds published MCP config with pinned package spec", () => {
+    const config = buildMcpConfig(
+      {
+        server: "published",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@0.4.2",
+      },
+      {},
+    );
+
+    expect(config.mcpServers.githits).toEqual({
+      command: "npx",
+      args: ["-y", "githits@0.4.2", "mcp", "start"],
+      env: { GITHITS_DISABLE_SKILL_UPDATE: "1" },
+    });
+  });
+
+  it("builds Codex TOML config from the same MCP command", () => {
+    const config = buildCodexConfig(
+      {
+        server: "local",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      {},
+    );
+    expect(config).toBe(
+      '[mcp_servers.githits]\nrequired = true\ncommand = "bun"\nargs = ["run","--cwd","/repo/githits-cli","dev","mcp","start"]\n\n[mcp_servers.githits.env]\nGITHITS_DISABLE_SKILL_UPDATE = "1"\n',
+    );
+    expect(config).not.toContain("env_vars");
+  });
+
+  it("builds Codex config override args", () => {
+    const args = buildCodexConfigArgs(
+      {
+        server: "published",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@0.4.2",
+      },
+      {},
+    );
+    expect(args).toEqual([
+      "-c",
+      "mcp_servers.githits.required=true",
+      "-c",
+      'mcp_servers.githits.command="npx"',
+      "-c",
+      'mcp_servers.githits.args=["-y","githits@0.4.2","mcp","start"]',
+      "-c",
+      'mcp_servers.githits.env.GITHITS_DISABLE_SKILL_UPDATE="1"',
+    ]);
+    expect(args).not.toContain("mcp_servers.githits.env_vars");
+  });
+
+  it("builds OpenCode project config from the same MCP command", () => {
+    expect(
+      buildOpenCodeConfig(
+        {
+          server: "local",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+        },
+        {},
+      ),
+    ).toEqual({
+      permission: {
+        task: "deny",
+      },
+      mcp: {
+        githits: {
+          type: "local",
+          command: [
+            "bun",
+            "run",
+            "--cwd",
+            "/repo/githits-cli",
+            "dev",
+            "mcp",
+            "start",
+          ],
+          environment: { GITHITS_DISABLE_SKILL_UPDATE: "1" },
+          enabled: true,
+          timeout: 90_000,
+        },
+      },
+    });
+  });
+
+  it("denies OpenCode task delegation in skills mode", () => {
+    expect(buildOpenCodeSkillsConfig()).toEqual({
+      permission: {
+        task: "deny",
+      },
+    });
+  });
+
+  it("adds the hidden experimental flag to every local MCP launch vector", () => {
+    const options = { ...localOptions, experimentalTools: true };
+    expect(buildMcpConfig(options).mcpServers.githits.args).toEqual([
+      "run",
+      "--cwd",
+      "/repo/githits-cli",
+      "dev",
+      "mcp",
+      "start",
+      "--experimental-tools",
+    ]);
+    expect(buildCodexConfig(options)).toContain(
+      'args = ["run","--cwd","/repo/githits-cli","dev","mcp","start","--experimental-tools"]',
+    );
+    expect(buildCodexConfigArgs(options)).toContain(
+      'mcp_servers.githits.args=["run","--cwd","/repo/githits-cli","dev","mcp","start","--experimental-tools"]',
+    );
+    expect(buildOpenCodeConfig(options).mcp?.githits?.command).toEqual([
+      "bun",
+      "run",
+      "--cwd",
+      "/repo/githits-cli",
+      "dev",
+      "mcp",
+      "start",
+      "--experimental-tools",
+    ]);
+  });
+
+  it("keeps published and unflagged launch vectors unchanged", () => {
+    expect(
+      buildMcpConfig({ ...localOptions, experimentalTools: false }),
+    ).toEqual(buildMcpConfig(localOptions));
+    expect(
+      buildMcpConfig({
+        server: "published",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@0.4.2",
+        experimentalTools: true,
+      }).mcpServers.githits.args,
+    ).toEqual(["-y", "githits@0.4.2", "mcp", "start"]);
+  });
+
+  it("forces the skill-update opt-out for local and published MCP configs", () => {
+    const servers = [
+      localOptions,
+      {
+        server: "published" as const,
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+    ];
+    const callerValues: Array<string | undefined> = [
+      undefined,
+      "",
+      "0",
+      "caller-value",
+    ];
+
+    for (const serverOptions of servers) {
+      for (const callerValue of callerValues) {
+        const baseEnv =
+          callerValue === undefined
+            ? {}
+            : { GITHITS_DISABLE_SKILL_UPDATE: callerValue };
+        const config = buildMcpConfig(serverOptions, baseEnv);
+
+        expect(
+          config.mcpServers.githits.env?.GITHITS_DISABLE_SKILL_UPDATE,
+        ).toBe("1");
+      }
+    }
+  });
+
+  it("renders the forced skill-update opt-out in Codex MCP config", () => {
+    const options = localOptions;
+
+    expect(buildCodexConfig(options, {})).toContain(
+      'GITHITS_DISABLE_SKILL_UPDATE = "1"',
+    );
+    expect(buildCodexConfigArgs(options, {})).toContain(
+      'mcp_servers.githits.env.GITHITS_DISABLE_SKILL_UPDATE="1"',
+    );
+  });
+
+  it("propagates backend selector across eval launch surfaces", () => {
+    const baseEnv = {
+      GITHITS_ENV: "dev",
+      GITHITS_CODE_NAV_URL: "http://localhost:7070",
+      GITHITS_API_TOKEN: "fake-githits-token-for-eval-test",
+    };
+    const childEnv = buildEvalEnv(baseEnv);
+    const options = {
+      server: "local" as const,
+      repoRoot: "/repo/githits-cli",
+      publishedPackage: "githits@latest",
+    };
+
+    expect(childEnv.GITHITS_ENV).toBe("dev");
+    expect(childEnv.GITHITS_CODE_NAV_URL).toBe("http://localhost:7070");
+
+    const mcpConfig = buildMcpConfig(options, childEnv);
+    expect(mcpConfig.mcpServers.githits.env).toEqual({
+      GITHITS_ENV: "dev",
+      GITHITS_CODE_NAV_URL: "http://localhost:7070",
+      GITHITS_DISABLE_SKILL_UPDATE: "1",
+    });
+    expect(JSON.stringify(mcpConfig)).not.toContain(
+      "fake-githits-token-for-eval-test",
+    );
+
+    const codexArgs = buildCodexConfigArgs(options, childEnv);
+    expect(codexArgs).toContain('mcp_servers.githits.env.GITHITS_ENV="dev"');
+    expect(codexArgs).toContain(
+      'mcp_servers.githits.env.GITHITS_CODE_NAV_URL="http://localhost:7070"',
+    );
+    expect(codexArgs.join(" ")).not.toContain(
+      "fake-githits-token-for-eval-test",
+    );
+
+    const codexConfig = buildCodexConfig(options, childEnv);
+    expect(codexConfig).toContain('GITHITS_ENV = "dev"');
+    expect(codexConfig).toContain(
+      'GITHITS_CODE_NAV_URL = "http://localhost:7070"',
+    );
+    expect(codexConfig).not.toContain("fake-githits-token-for-eval-test");
+
+    const summary = sanitizedEnvSummary(childEnv);
+    expect(summary.GITHITS_ENV).toBe("dev");
+    expect(summary.GITHITS_CODE_NAV_URL).toBe("http://localhost:7070");
+    expect(summary.GITHITS_API_TOKEN).toBe("<redacted>");
+    expect(JSON.stringify(summary)).not.toContain(
+      "fake-githits-token-for-eval-test",
+    );
+  });
+
+  it("embeds non-secret backend override env in MCP configs", () => {
+    const env = {
+      GITHITS_API_URL: "https://api-dev.githits.com",
+      GITHITS_CODE_NAV_URL: "https://oss-dev.githits.dev",
+      GITHITS_API_TOKEN: "secret-token",
+    };
+
+    const mcpConfig = buildMcpConfig(
+      {
+        server: "local",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      env,
+    );
+    expect(mcpConfig.mcpServers.githits.env).toEqual({
+      GITHITS_API_URL: "https://api-dev.githits.com",
+      GITHITS_CODE_NAV_URL: "https://oss-dev.githits.dev",
+      GITHITS_DISABLE_SKILL_UPDATE: "1",
+    });
+
+    expect(
+      buildCodexConfigArgs(
+        {
+          server: "local",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+        },
+        env,
+      ),
+    ).toContain(
+      'mcp_servers.githits.env.GITHITS_CODE_NAV_URL="https://oss-dev.githits.dev"',
+    );
+
+    const codexConfig = buildCodexConfig(
+      {
+        server: "local",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      env,
+    );
+    expect(codexConfig).toContain('env_vars = ["GITHITS_API_TOKEN"]');
+    expect(codexConfig).not.toContain("secret-token");
+    expect(codexConfig.indexOf("env_vars =")).toBeLessThan(
+      codexConfig.indexOf("[mcp_servers.githits.env]"),
+    );
+
+    const codexArgs = buildCodexConfigArgs(
+      {
+        server: "local",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      env,
+    );
+    expect(codexArgs).toContain(
+      'mcp_servers.githits.env_vars=["GITHITS_API_TOKEN"]',
+    );
+    expect(codexArgs.join(" ")).not.toContain("secret-token");
+  });
+
+  it("passes host auth roots only to the MCP child for both guidance profiles", () => {
+    const baseEnv = {
+      HOME: "/host/home",
+      USERPROFILE: "/host/profile",
+      XDG_CONFIG_HOME: "/host/config",
+      APPDATA: "/host/appdata",
+      GITHITS_AUTH_STORAGE: "keychain",
+    };
+    const descriptor = buildMcpConfig(
+      { ...localOptions, guidanceProfile: "descriptors" },
+      baseEnv,
+    );
+    const full = buildMcpConfig(
+      { ...localOptions, guidanceProfile: "full" },
+      baseEnv,
+    );
+    const published = buildMcpConfig(
+      {
+        server: "published",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+      baseEnv,
+    );
+
+    expect(descriptor.mcpServers.githits.env).toEqual({
+      GITHITS_AUTH_STORAGE: "keychain",
+      GITHITS_DISABLE_SKILL_UPDATE: "1",
+      HOME: "/host/home",
+      USERPROFILE: "/host/profile",
+      XDG_CONFIG_HOME: "/host/config",
+      APPDATA: "/host/appdata",
+    });
+    expect(full.mcpServers.githits.env).toEqual(
+      descriptor.mcpServers.githits.env,
+    );
+    expect(published.mcpServers.githits.env).toEqual(
+      descriptor.mcpServers.githits.env,
+    );
+
+    const defaults = buildMcpConfig(
+      { ...localOptions, guidanceProfile: "descriptors" },
+      {
+        HOME: "/host/home",
+        USERPROFILE: "/host/profile",
+        GITHITS_AUTH_STORAGE: "keychain",
+      },
+    ).mcpServers.githits.env;
+    if (process.platform === "win32") {
+      expect(defaults).toMatchObject({
+        APPDATA: join("/host/profile", "AppData", "Roaming"),
+      });
+      expect(defaults?.XDG_CONFIG_HOME).toBeUndefined();
+    } else {
+      expect(defaults).toMatchObject({
+        XDG_CONFIG_HOME: join("/host/home", ".config"),
+      });
+      expect(defaults?.APPDATA).toBeUndefined();
+    }
+  });
+
+  it("passes selected models to agent commands", () => {
+    expect(
+      buildClaudeCommand("prompt", "/tmp/mcp.json", "haiku", "mcp"),
+    ).toContain("haiku");
+    expect(
+      buildCodexCommand(
+        "prompt",
+        "/tmp/work",
+        "/tmp/final.txt",
+        "/tmp/schema.json",
+        {
+          server: "local",
+          surface: "mcp",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+          model: "gpt-5.4-mini",
+        },
+      ),
+    ).toContain("gpt-5.4-mini");
+    expect(
+      buildOpenCodeCommand("prompt", "/tmp/work", {
+        model: "anthropic/claude-sonnet-4-5",
+      }),
+    ).toContain("anthropic/claude-sonnet-4-5");
+  });
+
+  it("runs Codex evals without interactive approval prompts", () => {
+    const command = buildCodexCommand(
+      "prompt",
+      "/tmp/work",
+      "/tmp/final.txt",
+      "/tmp/schema.json",
+      {
+        server: "local",
+        surface: "mcp",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+    );
+
+    expect(command).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(command).not.toContain("--sandbox");
+  });
+
+  it("runs OpenCode evals in JSON mode without interactive approvals", () => {
+    const command = buildOpenCodeCommand("prompt", "/tmp/work", {});
+
+    expect(command).toContain("run");
+    expect(command).toContain("--format");
+    expect(command).toContain("json");
+    expect(command).toContain("--dangerously-skip-permissions");
+    expect(command).toContain("--dir");
+    expect(command).toContain("/tmp/work");
+  });
+
+  it("excludes Codex user config and rules while disabling external surfaces", () => {
+    const command = buildCodexCommand(
+      "prompt",
+      "/tmp/work",
+      "/tmp/final.txt",
+      "/tmp/schema.json",
+      {
+        server: "local",
+        surface: "mcp",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+      },
+    );
+
+    expect(command).toContain("--ignore-user-config");
+    expect(command).toContain("--ignore-rules");
+    expect(command.filter((arg) => arg === "--ignore-rules")).toHaveLength(1);
+    expect(command).toContain("--disable");
+    expect(command).toContain("apps");
+    expect(command).toContain("plugins");
+    expect(command).toContain("remote_plugin");
+    expect(command).toContain('mcp_servers.githits.command="bun"');
+  });
+
+  it("builds agent commands without GitHits MCP config in skills mode", () => {
+    const claude = buildClaudeCommand(
+      "prompt",
+      "/tmp/empty-mcp.json",
+      undefined,
+      "skills",
+    );
+    expect(claude).toContain("--mcp-config");
+    expect(claude).toContain("/tmp/empty-mcp.json");
+    expect(claude).toContain("--strict-mcp-config");
+    expect(claude).not.toContain("--disable-slash-commands");
+    expect(claude).toContain("--setting-sources");
+
+    const codex = buildCodexCommand(
+      "prompt",
+      "/tmp/work",
+      "/tmp/final.txt",
+      "/tmp/schema.json",
+      {
+        server: "local",
+        surface: "skills",
+        repoRoot: "/repo/githits-cli",
+        publishedPackage: "githits@latest",
+        reasoningEffort: "high",
+      },
+    );
+    expect(codex).not.toContain("mcp_servers.githits.command");
+    expect(codex).not.toContain("--ignore-rules");
+    expect(codex).toContain("--ignore-user-config");
+    expect(codex).toContain('model_reasoning_effort="high"');
+  });
+
+  it("uses the same Codex external-surface disables for descriptors, full, and skills", () => {
+    const expected: string[] = ["apps", "plugins", "remote_plugin"];
+    const commands = [
+      buildCodexCommand(
+        "prompt",
+        "/tmp/work",
+        "/tmp/final.txt",
+        "/tmp/schema.json",
+        {
+          server: "local",
+          surface: "mcp",
+          guidanceProfile: "descriptors",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+        },
+      ),
+      buildCodexCommand(
+        "prompt",
+        "/tmp/work",
+        "/tmp/final.txt",
+        "/tmp/schema.json",
+        {
+          server: "local",
+          surface: "mcp",
+          guidanceProfile: "full",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+        },
+      ),
+      buildCodexCommand(
+        "prompt",
+        "/tmp/work",
+        "/tmp/final.txt",
+        "/tmp/schema.json",
+        {
+          server: "local",
+          surface: "skills",
+          repoRoot: "/repo/githits-cli",
+          publishedPackage: "githits@latest",
+        },
+      ),
+    ];
+
+    for (const command of commands) {
+      const disabled = command.flatMap((arg, index) =>
+        arg === "--disable" ? [command[index + 1] ?? ""] : [],
+      );
+      expect(disabled).toEqual(expected);
+      expect(command.indexOf("--disable")).toBeGreaterThan(
+        command.indexOf("exec"),
+      );
+      expect(command.indexOf("remote_plugin")).toBeLessThan(
+        command.lastIndexOf("prompt"),
+      );
+      expect(command).toContain("--ignore-user-config");
+    }
+  });
+
+  it("builds interactive Claude, Codex, and OpenCode session commands", () => {
+    const claudeOptions = parseSessionArgs(
+      ["--agent", "claude", "--surface", "skills", "--model", "haiku"],
+      "/repo/githits-cli",
+    );
+    expect(buildClaudeSessionCommand(claudeOptions, "/tmp/mcp.json")).toEqual([
+      "claude",
+      "--mcp-config",
+      "/tmp/mcp.json",
+      "--strict-mcp-config",
+      "--setting-sources",
+      "project",
+      "--model",
+      "haiku",
+    ]);
+
+    const codexOptions = parseSessionArgs(
+      ["--agent", "codex", "--surface", "mcp", "--bypass-permissions"],
+      "/repo/githits-cli",
+    );
+    const codexCommand = buildCodexSessionCommand(codexOptions);
+    expect(codexCommand).toContain("mcp_servers={}");
+    expect(codexCommand).toContain('mcp_servers.githits.command="bun"');
+    expect(codexCommand).not.toContain("--ignore-rules");
+    expect(codexCommand).toContain(
+      "--dangerously-bypass-approvals-and-sandbox",
+    );
+
+    const codexSkillsOptions = parseSessionArgs(
+      ["--agent", "codex", "--surface", "skills"],
+      "/repo/githits-cli",
+    );
+    const codexSkillsCommand = buildCodexSessionCommand(codexSkillsOptions);
+    expect(codexSkillsCommand).not.toContain("--ignore-user-config");
+
+    const openCodeOptions = parseSessionArgs(
+      [
+        "--agent",
+        "opencode",
+        "--surface",
+        "mcp",
+        "--bypass-permissions",
+        "--prompt",
+        "hello",
+      ],
+      "/repo/githits-cli",
+    );
+    const openCodeCommand = buildOpenCodeSessionCommand(openCodeOptions);
+    expect(openCodeCommand).toContain("opencode");
+    expect(openCodeCommand).toContain("--dangerously-skip-permissions");
+    expect(openCodeCommand).toContain("hello");
+  });
+
+  it("suppresses Codex interactive global inputs on both surfaces", () => {
+    for (const surface of ["mcp", "skills"] as const) {
+      const options = parseSessionArgs(
+        ["--agent", "codex", "--surface", surface, "--reasoning-effort", "low"],
+        "/repo/githits-cli",
+      );
+      const command = buildCodexSessionCommand(options);
+      const disabled = command.flatMap((arg, index) =>
+        arg === "--disable" ? [command[index + 1] ?? ""] : [],
+      );
+      expect(disabled).toEqual(["apps", "plugins", "remote_plugin"]);
+      expect(command).not.toContain("--ignore-user-config");
+      expect(command).not.toContain("--ignore-rules");
+      expect(command).toContain("mcp_servers={}");
+      expect(command).toContain('model_reasoning_effort="low"');
+      if (surface === "mcp") {
+        expect(command).toContain('mcp_servers.githits.command="bun"');
+      } else {
+        expect(command).not.toContain("mcp_servers.githits.command");
+      }
+    }
+  });
+
+  it("keeps guidance profiles out of skills sessions and preserves explicit session effort", () => {
+    const skillsOptions = parseSessionArgs(
+      ["--agent", "codex", "--surface", "skills", "--reasoning-effort", "low"],
+      "/repo/githits-cli",
+    );
+    expect(skillsOptions.guidanceProfile).toBeUndefined();
+    expect(skillsOptions.reasoningEffort).toBe("low");
+    expect(buildCodexSessionCommand(skillsOptions)).toContain(
+      'model_reasoning_effort="low"',
+    );
+    expect(() =>
+      parseSessionArgs(
+        ["--surface", "skills", "--guidance-profile", "full"],
+        "/repo/githits-cli",
+      ),
+    ).toThrow("cannot be used with --surface skills");
+  });
+
+  it("prepares full guidance with canonical text and preserves existing files", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-full-guidance-"));
+    const existing = "Project instructions\n\n";
+    writeFileSync(join(workspaceDir, "CLAUDE.md"), existing);
+    writeFileSync(join(workspaceDir, "AGENTS.md"), existing);
+    try {
+      const installation = prepareFullGuidanceWorkspace(
+        {
+          server: "local",
+          repoRoot: process.cwd(),
+          publishedPackage: "githits@latest",
+        },
+        workspaceDir,
+        undefined,
+        false,
+      );
+      expect(installation.instructionPaths).toEqual([
+        join(workspaceDir, "CLAUDE.md"),
+        join(workspaceDir, "AGENTS.md"),
+      ]);
+      for (const instructionPath of installation.instructionPaths) {
+        const content = readFileSync(instructionPath, "utf8");
+        expect(content).toContain("Project instructions");
+        expect(content).toContain(GITHITS_GUIDANCE_MARKER);
+        expect(content).toContain(GITHITS_GUIDANCE_BLOCK);
+      }
+      expect(installation.skillInstallation.installedDirs).toContain(
+        join(workspaceDir, "skills"),
+      );
+      expect(
+        existsSync(join(workspaceDir, "skills", "githits-mcp", "SKILL.md")),
+      ).toBe(true);
+      expect(existsSync(join(workspaceDir, "skills", "githits-package"))).toBe(
+        false,
+      );
+      expect(existsSync(join(workspaceDir, "skills", "githits-code"))).toBe(
+        false,
+      );
+      expect(installation.skillInstallation.cliShim).toBeUndefined();
+      expect(existsSync(join(workspaceDir, ".agent-eval-bin"))).toBe(false);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a missing source skills directory before reading it", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "agent-missing-skills-"));
+    const repoRoot = join(rootDir, "repo");
+    const workspaceDir = join(rootDir, "workspace");
+    mkdirSync(repoRoot);
+    try {
+      expect(() =>
+        prepareSkillsWorkspace(
+          {
+            server: "local",
+            repoRoot,
+            publishedPackage: "githits@latest",
+          },
+          workspaceDir,
+        ),
+      ).toThrow(`Skills directory not found: ${join(repoRoot, "skills")}`);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a missing requested skill before copying it", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "agent-missing-skill-"));
+    const repoRoot = join(rootDir, "repo");
+    const workspaceDir = join(rootDir, "workspace");
+    mkdirSync(join(repoRoot, "skills"), { recursive: true });
+    try {
+      expect(() =>
+        prepareFullGuidanceWorkspace(
+          {
+            server: "local",
+            repoRoot,
+            publishedPackage: "githits@latest",
+          },
+          workspaceDir,
+        ),
+      ).toThrow(
+        `Skill source not found: ${join(repoRoot, "skills", "githits-mcp")}`,
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prepares a full Claude session with project guidance and strict MCP", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-full-"));
+    try {
+      const options = parseSessionArgs(
+        [
+          "--guidance-profile",
+          "full",
+          "--workspace",
+          workspaceDir,
+          "--dry-run",
+        ],
+        process.cwd(),
+      );
+      const prepared = prepareAgentSession(options);
+      expect(prepared.command).toContain("--strict-mcp-config");
+      expect(prepared.command).toContain("--setting-sources");
+      expect(prepared.command).toContain("project");
+      expect(prepared.command).not.toContain("--disable-slash-commands");
+      expect(prepared.guidanceInstallation?.instructionPaths).toContain(
+        join(workspaceDir, "CLAUDE.md"),
+      );
+      const session = JSON.parse(
+        readFileSync(
+          join(workspaceDir, ".agent-session", "session.json"),
+          "utf8",
+        ),
+      );
+      expect(session.guidanceProfile).toBe("full");
+      expect(session.guidanceInstallation.instructionPaths).toContain(
+        join(workspaceDir, "AGENTS.md"),
+      );
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates interactive Codex environment and keeps host MCP roots trusted", async () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-codex-"));
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-session-codex-home-"));
+    let observedCommand: string[] | undefined;
+    let observedEnv: Record<string, string> | undefined;
+    try {
+      const exitCode = await runAgentSession(
+        {
+          agent: "codex",
+          surface: "mcp",
+          server: "local",
+          experimentalTools: false,
+          workspaceDir,
+          repoRoot: process.cwd(),
+          publishedPackage: "githits@latest",
+          dryRun: false,
+          bypassPermissions: false,
+        },
+        {
+          baseEnv: {
+            PATH: "/bin",
+            HOME: "/host/home",
+            USERPROFILE: "/host/profile",
+            XDG_CONFIG_HOME: "/host/config",
+            APPDATA: "/host/appdata",
+            CODEX_HOME: codexHome,
+            GITHITS_AUTH_STORAGE: "/host/auth-root",
+            RANDOM_SECRET: "must-not-pass",
+          },
+          spawn: ((command, spawnOptions) => {
+            observedCommand = command;
+            observedEnv = (spawnOptions?.env ?? {}) as Record<string, string>;
+            return { exited: Promise.resolve(0) } as ReturnType<
+              typeof Bun.spawn
+            >;
+          }) as typeof Bun.spawn,
+        },
+      );
+      expect(exitCode).toBe(0);
+      expect(observedCommand).toContain(
+        'mcp_servers.githits.env.HOME="/host/home"',
+      );
+      expect(observedEnv?.CODEX_HOME).toBe(codexHome);
+      const isolationRoot = dirname(observedEnv?.TMPDIR ?? "never");
+      for (const [key, hostValue] of Object.entries({
+        HOME: "/host/home",
+        USERPROFILE: "/host/profile",
+        XDG_CONFIG_HOME: "/host/config",
+        APPDATA: "/host/appdata",
+      })) {
+        expect(observedEnv?.[key]).not.toBe(hostValue);
+        expect(dirname(observedEnv?.[key] ?? "never")).toBe(isolationRoot);
+      }
+      expect(observedEnv?.RANDOM_SECRET).toBeUndefined();
+      const session = JSON.parse(
+        readFileSync(
+          join(workspaceDir, ".agent-session", "session.json"),
+          "utf8",
+        ),
+      );
+      expect(session.workspaceDir).toBe(workspaceDir);
+      expect(session.isolation).toEqual({
+        root: "<ephemeral>",
+        home: "home",
+        userprofile: "home",
+        xdgConfigHome: "config",
+        appdata: "appdata",
+        temp: "tmp",
+      });
+      expect(JSON.stringify(session.isolation)).not.toContain("/host/");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid live Codex homes before spawn while allowing dry runs", async () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-codex-"));
+    const contaminatedHome = mkdtempSync(
+      join(tmpdir(), "agent-session-codex-home-"),
+    );
+    writeFileSync(join(contaminatedHome, "AGENTS.md"), "global guidance\n");
+    let spawnCalls = 0;
+    const options = {
+      agent: "codex" as const,
+      surface: "skills" as const,
+      server: "local" as const,
+      experimentalTools: false,
+      workspaceDir,
+      repoRoot: process.cwd(),
+      publishedPackage: "githits@latest",
+      dryRun: false,
+      bypassPermissions: false,
+    };
+    try {
+      for (const baseEnv of [
+        { PATH: "/bin" },
+        { PATH: "/bin", CODEX_HOME: "relative/home" },
+        { PATH: "/bin", CODEX_HOME: contaminatedHome },
+      ]) {
+        await expect(
+          runAgentSession(options, {
+            baseEnv,
+            spawn: (() => {
+              spawnCalls += 1;
+              return { exited: Promise.resolve(0) } as ReturnType<
+                typeof Bun.spawn
+              >;
+            }) as typeof Bun.spawn,
+          }),
+        ).rejects.toThrow();
+        expect(spawnCalls).toBe(0);
+        expect(existsSync(join(workspaceDir, ".agent-session"))).toBe(false);
+      }
+
+      expect(
+        await runAgentSession(
+          { ...options, dryRun: true },
+          { baseEnv: { PATH: "/bin" } },
+        ),
+      ).toBe(0);
+      const session = JSON.parse(
+        readFileSync(
+          join(workspaceDir, ".agent-session", "session.json"),
+          "utf8",
+        ),
+      );
+      expect(session.isolation.root).toBe("<ephemeral>");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+      rmSync(contaminatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it("validates interactive Codex skills and config before workspace preparation", async () => {
+    const runSession = async (
+      setup: (codexHome: string) => void,
+      expectedError?: string,
+    ): Promise<void> => {
+      const workspaceDir = mkdtempSync(
+        join(tmpdir(), "agent-session-codex-workspace-"),
+      );
+      const codexHome = mkdtempSync(
+        join(tmpdir(), "agent-session-codex-home-"),
+      );
+      setup(codexHome);
+      let spawnCalls = 0;
+      const options = {
+        agent: "codex" as const,
+        surface: "skills" as const,
+        server: "local" as const,
+        experimentalTools: false,
+        workspaceDir,
+        repoRoot: process.cwd(),
+        publishedPackage: "githits@latest",
+        dryRun: false,
+        bypassPermissions: false,
+      };
+      try {
+        let caught: unknown;
+        try {
+          await runAgentSession(options, {
+            baseEnv: { PATH: "/bin", CODEX_HOME: codexHome },
+            spawn: (() => {
+              spawnCalls += 1;
+              return { exited: Promise.resolve(0) } as ReturnType<
+                typeof Bun.spawn
+              >;
+            }) as typeof Bun.spawn,
+          });
+        } catch (error) {
+          caught = error;
+        }
+        if (expectedError === undefined) {
+          expect(caught).toBeUndefined();
+          expect(spawnCalls).toBe(1);
+        } else {
+          expect(caught).toBeInstanceOf(Error);
+          const message = (caught as Error).message;
+          expect(message).toContain(expectedError);
+          expect(message).not.toContain("fixture-secret");
+          expect(spawnCalls).toBe(0);
+          expect(existsSync(join(workspaceDir, ".agent-session"))).toBe(false);
+        }
+      } finally {
+        rmSync(workspaceDir, { recursive: true, force: true });
+        rmSync(codexHome, { recursive: true, force: true });
+      }
+    };
+
+    await runSession(() => {});
+    await runSession((codexHome) => {
+      mkdirSync(join(codexHome, "skills", ".system"), { recursive: true });
+      writeFileSync(
+        join(codexHome, "config.toml"),
+        'model = "gpt-5.6-luna"\nmodel_reasoning_effort = "low"\n[projects.eval]\ntrust_level = "trusted"\n',
+      );
+    });
+    await runSession((codexHome) => {
+      mkdirSync(join(codexHome, "skills", "personal"), { recursive: true });
+    }, "skills contains unsupported entry: personal");
+    await runSession((codexHome) => {
+      writeFileSync(
+        join(codexHome, "config.toml"),
+        'fixture_secret_key = "fixture-secret"\n',
+      );
+    }, "config.toml contains unsupported key: fixture_secret_key");
+    await runSession((codexHome) => {
+      writeFileSync(
+        join(codexHome, "config.toml"),
+        '[projects.eval]\ntrust_level = "trusted"\nfixture_secret_key = "fixture-secret"\n',
+      );
+    }, "config.toml contains unsupported key: fixture_secret_key");
+    await runSession((codexHome) => {
+      writeFileSync(join(codexHome, "config.toml"), "model = [\n");
+    }, "config.toml is not valid TOML");
+  });
+
+  it("accepts the experimental flag only for local MCP sessions", () => {
+    const options = parseSessionArgs(
+      ["--experimental-tools", "--dry-run"],
+      "/repo/githits-cli",
+    );
+    expect(options.experimentalTools).toBe(true);
+
+    expect(() =>
+      parseSessionArgs(
+        ["--experimental-tools", "--server", "published"],
+        "/repo/githits-cli",
+      ),
+    ).toThrow("--experimental-tools requires --surface mcp --server local");
+    expect(() =>
+      parseSessionArgs(
+        ["--experimental-tools", "--surface", "skills"],
+        "/repo/githits-cli",
+      ),
+    ).toThrow("--experimental-tools requires --surface mcp --server local");
+  });
+
+  it("persists the enabled flag in interactive session artifacts", () => {
+    for (const agent of ["claude", "codex", "opencode"] as const) {
+      const workspaceDir = mkdtempSync(
+        join(tmpdir(), `agent-session-experimental-${agent}-`),
+      );
+      try {
+        const prepared = prepareAgentSession({
+          agent,
+          surface: "mcp",
+          server: "local",
+          experimentalTools: true,
+          workspaceDir,
+          repoRoot: process.cwd(),
+          publishedPackage: "githits@latest",
+          dryRun: true,
+          bypassPermissions: false,
+        });
+        const session = JSON.parse(
+          readFileSync(
+            join(workspaceDir, ".agent-session", "session.json"),
+            "utf8",
+          ),
+        );
+        expect(session.experimentalTools).toBe(true);
+        expect(session.command).toEqual(prepared.command);
+        expect(readFileSync(prepared.mcpConfigPath, "utf8")).toContain(
+          "--experimental-tools",
+        );
+        if (agent === "opencode") {
+          expect(
+            readFileSync(join(workspaceDir, "opencode.json"), "utf8"),
+          ).toContain("--experimental-tools");
+        }
+      } finally {
+        rmSync(workspaceDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("prepares an interactive skills workspace", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    const prepared = prepareAgentSession({
+      agent: "claude",
+      surface: "skills",
+      server: "local",
+      experimentalTools: false,
+      workspaceDir,
+      repoRoot: process.cwd(),
+      publishedPackage: "githits@latest",
+      dryRun: true,
+      bypassPermissions: false,
+    });
+
+    expect(prepared.skillInstallation?.installedDirs).toContain(
+      join(workspaceDir, "skills"),
+    );
+    expect(readFileSync(prepared.mcpConfigPath, "utf8")).toContain(
+      '"mcpServers": {}',
+    );
+    expect(existsSync(join(workspaceDir, "opencode.json"))).toBe(false);
+  });
+
+  it("writes OpenCode project config only for OpenCode sessions", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+
+    prepareAgentSession({
+      agent: "opencode",
+      surface: "mcp",
+      server: "local",
+      experimentalTools: false,
+      workspaceDir,
+      repoRoot: process.cwd(),
+      publishedPackage: "githits@latest",
+      dryRun: true,
+      bypassPermissions: false,
+    });
+
+    expect(readFileSync(join(workspaceDir, "opencode.json"), "utf8")).toContain(
+      '"timeout": 90000',
+    );
+    expect(readFileSync(join(workspaceDir, "opencode.json"), "utf8")).toContain(
+      '"task": "deny"',
+    );
+  });
+
+  it("denies task delegation for OpenCode skills sessions", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    try {
+      prepareAgentSession({
+        agent: "opencode",
+        surface: "skills",
+        server: "local",
+        experimentalTools: false,
+        workspaceDir,
+        repoRoot: process.cwd(),
+        publishedPackage: "githits@latest",
+        dryRun: true,
+        bypassPermissions: false,
+      });
+
+      expect(
+        JSON.parse(readFileSync(join(workspaceDir, "opencode.json"), "utf8")),
+      ).toEqual({
+        permission: {
+          task: "deny",
+        },
+      });
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to overwrite existing OpenCode project config", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    const openCodeConfigPath = join(workspaceDir, "opencode.json");
+    const claudeInstructionsPath = join(workspaceDir, "CLAUDE.md");
+    const agentsInstructionsPath = join(workspaceDir, "AGENTS.md");
+    const skillSentinelPath = join(workspaceDir, "skills", "sentinel.txt");
+    writeFileSync(openCodeConfigPath, "existing config\n");
+    writeFileSync(claudeInstructionsPath, "existing Claude guidance\n");
+    writeFileSync(agentsInstructionsPath, "existing agent guidance\n");
+    mkdirSync(join(workspaceDir, "skills"), { recursive: true });
+    writeFileSync(skillSentinelPath, "existing skill\n");
+
+    expect(() =>
+      prepareAgentSession({
+        agent: "opencode",
+        surface: "mcp",
+        server: "local",
+        guidanceProfile: "full",
+        experimentalTools: false,
+        workspaceDir,
+        repoRoot: process.cwd(),
+        publishedPackage: "githits@latest",
+        dryRun: true,
+        bypassPermissions: false,
+      }),
+    ).toThrow("Refusing to overwrite existing OpenCode config");
+    expect(readFileSync(openCodeConfigPath, "utf8")).toBe("existing config\n");
+    expect(readFileSync(claudeInstructionsPath, "utf8")).toBe(
+      "existing Claude guidance\n",
+    );
+    expect(readFileSync(agentsInstructionsPath, "utf8")).toBe(
+      "existing agent guidance\n",
+    );
+    expect(readFileSync(skillSentinelPath, "utf8")).toBe("existing skill\n");
+    expect(existsSync(join(workspaceDir, ".agent-session"))).toBe(false);
+  });
+
+  it("preserves unrelated skills when preparing a reused workspace", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    const unrelatedSkillPath = join(
+      workspaceDir,
+      "skills",
+      "unrelated",
+      "SKILL.md",
+    );
+    mkdirSync(join(workspaceDir, "skills", "unrelated"), {
+      recursive: true,
+    });
+    writeFileSync(unrelatedSkillPath, "unrelated skill");
+    try {
+      prepareAgentSession({
+        agent: "claude",
+        surface: "skills",
+        server: "local",
+        experimentalTools: false,
+        workspaceDir,
+        repoRoot: process.cwd(),
+        publishedPackage: "githits@latest",
+        dryRun: true,
+        bypassPermissions: false,
+      });
+
+      expect(readFileSync(unrelatedSkillPath, "utf8")).toBe("unrelated skill");
+      expect(
+        existsSync(join(workspaceDir, "skills", "githits-code", "SKILL.md")),
+      ).toBe(true);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses full guidance skill conflicts before mutating the session workspace", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    const conflictPath = join(
+      workspaceDir,
+      "skills",
+      "githits-mcp",
+      "SKILL.md",
+    );
+    const claudeInstructionsPath = join(workspaceDir, "CLAUDE.md");
+    const agentsInstructionsPath = join(workspaceDir, "AGENTS.md");
+    mkdirSync(join(workspaceDir, "skills", "githits-mcp"), {
+      recursive: true,
+    });
+    writeFileSync(conflictPath, "existing GitHits-looking skill");
+    writeFileSync(claudeInstructionsPath, "existing Claude guidance\n");
+    writeFileSync(agentsInstructionsPath, "existing agent guidance\n");
+    try {
+      expect(() =>
+        prepareAgentSession({
+          agent: "claude",
+          surface: "mcp",
+          server: "local",
+          guidanceProfile: "full",
+          experimentalTools: false,
+          workspaceDir,
+          repoRoot: process.cwd(),
+          publishedPackage: "githits@latest",
+          dryRun: true,
+          bypassPermissions: false,
+        }),
+      ).toThrow("existing GitHits skill path");
+      expect(readFileSync(conflictPath, "utf8")).toBe(
+        "existing GitHits-looking skill",
+      );
+      expect(readFileSync(claudeInstructionsPath, "utf8")).toBe(
+        "existing Claude guidance\n",
+      );
+      expect(readFileSync(agentsInstructionsPath, "utf8")).toBe(
+        "existing agent guidance\n",
+      );
+      expect(existsSync(join(workspaceDir, ".agent-session"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".agent-eval-bin"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".opencode"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".agents"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".claude"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".codex"))).toBe(false);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an existing CLI shim before mutating skill roots", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-session-test-"));
+    const shimPath = join(
+      workspaceDir,
+      ".agent-eval-bin",
+      process.platform === "win32" ? "githits.cmd" : "githits",
+    );
+    mkdirSync(join(workspaceDir, ".agent-eval-bin"), { recursive: true });
+    writeFileSync(shimPath, "existing shim\n");
+    try {
+      expect(() =>
+        prepareAgentSession({
+          agent: "claude",
+          surface: "skills",
+          server: "local",
+          experimentalTools: false,
+          workspaceDir,
+          repoRoot: process.cwd(),
+          publishedPackage: "githits@latest",
+          dryRun: true,
+          bypassPermissions: false,
+        }),
+      ).toThrow("existing GitHits CLI shim");
+      expect(readFileSync(shimPath, "utf8")).toBe("existing shim\n");
+      expect(existsSync(join(workspaceDir, "skills"))).toBe(false);
+      expect(existsSync(join(workspaceDir, ".agent-session"))).toBe(false);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves normal Claude and GitHits auth environment while filtering unrelated vars", () => {
+    const env = buildEvalEnv({
+      PATH: "/bin",
+      HOME: "/real-home",
+      RANDOM_SECRET: "should-not-pass",
+      OPENAI_API_KEY: "openai-secret-token",
+      GITHITS_AUTH_STORAGE: "keychain",
+      GITHITS_API_TOKEN: "secret-token",
+      GITHITS_CODE_NAV_URL: "http://localhost:7070",
+    });
+
+    expect(env.HOME).toBe("/real-home");
+    expect(env.GITHITS_AUTH_STORAGE).toBe("keychain");
+    expect(env.GITHITS_API_TOKEN).toBe("secret-token");
+    expect(env.GITHITS_CODE_NAV_URL).toBe("http://localhost:7070");
+    expect(env.OPENAI_API_KEY).toBe("openai-secret-token");
+    expect(env.RANDOM_SECRET).toBeUndefined();
+  });
+
+  it("accepts managed Codex state in a dedicated eval home without reading auth material", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    try {
+      writeFileSync(join(codexHome, "auth.json"), "opaque auth material\n");
+      writeFileSync(join(codexHome, "config.toml"), "managed config\n");
+      mkdirSync(join(codexHome, "skills", ".system"), { recursive: true });
+      mkdirSync(join(codexHome, "plugins", "cache"), { recursive: true });
+      writeFileSync(
+        join(codexHome, "plugins", "cache", "AGENTS.md"),
+        "nested cache data\n",
+      );
+      expect(() =>
+        validateCodexEvalHome({ CODEX_HOME: codexHome }),
+      ).not.toThrow();
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects missing, relative, and root global-instruction Codex homes", () => {
+    expect(() => validateCodexEvalHome({})).toThrow("require CODEX_HOME");
+    expect(() =>
+      validateCodexEvalHome({ CODEX_HOME: "relative/home" }),
+    ).toThrow("absolute directory");
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    try {
+      for (const invalidSurface of ["AGENTS.override.md", "AGENTS.md"]) {
+        const path = join(codexHome, invalidSurface);
+        writeFileSync(path, "");
+        expect(() => validateCodexEvalHome({ CODEX_HOME: codexHome })).toThrow(
+          "contains global instructions",
+        );
+        rmSync(path, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts directory symlinks for Codex homes while rejecting aliased root guidance", () => {
+    const realHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    const aliasRoot = mkdtempSync(join(tmpdir(), "agent-eval-codex-alias-"));
+    const aliasHome = join(aliasRoot, "codex-home");
+    const guidanceSource = join(aliasRoot, "guidance.md");
+    try {
+      try {
+        symlinkSync(realHome, aliasHome, "dir");
+        writeFileSync(guidanceSource, "root guidance\n");
+        symlinkSync(guidanceSource, join(realHome, "AGENTS.md"), "file");
+      } catch (error) {
+        if (process.platform === "win32") return;
+        throw error;
+      }
+
+      rmSync(join(realHome, "AGENTS.md"));
+      expect(() =>
+        validateCodexEvalHome({ CODEX_HOME: aliasHome }),
+      ).not.toThrow();
+
+      symlinkSync(guidanceSource, join(realHome, "AGENTS.md"), "file");
+      expect(() => validateCodexEvalHome({ CODEX_HOME: aliasHome })).toThrow(
+        "contains global instructions",
+      );
+    } finally {
+      rmSync(aliasRoot, { recursive: true, force: true });
+      rmSync(realHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects contaminated or missing Codex homes before every live Codex launch", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-live-reject-"));
+    const workload = resolve("eval/agentic/workloads/express-router.md");
+    let availabilityCalls = 0;
+    let versionCalls = 0;
+    let commandCalls = 0;
+    const baseEnv: NodeJS.ProcessEnv = {
+      PATH: "/bin",
+      CODEX_HOME: codexHome,
+    };
+    const dependencies = {
+      baseEnv,
+      assertAgentAvailable: async () => {
+        availabilityCalls += 1;
+      },
+      collectAgentVersions: async () => {
+        versionCalls += 1;
+        return [undefined, undefined, undefined] as [
+          string | undefined,
+          string | undefined,
+          string | undefined,
+        ];
+      },
+      runCommand: async () => {
+        commandCalls += 1;
+        return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+      },
+    };
+    try {
+      for (const surface of ["mcp", "skills"] as const) {
+        writeFileSync(join(codexHome, "AGENTS.md"), "test guidance\n");
+        await expect(
+          runAgentEval(
+            parseArgs(
+              [
+                "--agent",
+                "codex",
+                "--surface",
+                surface,
+                "--out",
+                outDir,
+                "--workload",
+                workload,
+              ],
+              process.cwd(),
+            ),
+            dependencies,
+          ),
+        ).rejects.toThrow("contains global instructions");
+        expect(availabilityCalls).toBe(0);
+        expect(versionCalls).toBe(0);
+        expect(commandCalls).toBe(0);
+
+        rmSync(join(codexHome, "AGENTS.md"));
+        baseEnv.CODEX_HOME = undefined;
+        await expect(
+          runAgentEval(
+            parseArgs(
+              [
+                "--agent",
+                "codex",
+                "--surface",
+                surface,
+                "--out",
+                outDir,
+                "--workload",
+                workload,
+              ],
+              process.cwd(),
+            ),
+            dependencies,
+          ),
+        ).rejects.toThrow("require CODEX_HOME");
+        expect(availabilityCalls).toBe(0);
+        expect(versionCalls).toBe(0);
+        expect(commandCalls).toBe(0);
+        baseEnv.CODEX_HOME = codexHome;
+      }
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { skillsDirectory: null, dryRun: true },
+    { skillsDirectory: null, dryRun: false },
+    { skillsDirectory: "skills", dryRun: true },
+    { skillsDirectory: "skills", dryRun: false },
+    { skillsDirectory: join("skills", ".system"), dryRun: true },
+    { skillsDirectory: join("skills", ".system"), dryRun: false },
+  ])(
+    "accepts the direct Codex skills contract %j",
+    async ({ skillsDirectory, dryRun }) => {
+      const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+      const workload = resolve("eval/agentic/workloads/express-router.md");
+      let availabilityCalls = 0;
+      let versionCalls = 0;
+      let commandCalls = 0;
+      const runProbe = async (dryRun: boolean): Promise<void> => {
+        const outDir = mkdtempSync(
+          join(tmpdir(), "agent-eval-skills-preflight-"),
+        );
+        try {
+          await runAgentEval(
+            parseArgs(
+              [
+                "--agent",
+                "codex",
+                "--out",
+                outDir,
+                "--workload",
+                workload,
+                ...(dryRun ? ["--dry-run"] : []),
+              ],
+              process.cwd(),
+            ),
+            {
+              baseEnv: { PATH: "/bin", CODEX_HOME: codexHome },
+              assertAgentAvailable: async () => {
+                availabilityCalls += 1;
+              },
+              collectAgentVersions: async () => {
+                versionCalls += 1;
+                return [undefined, "codex-test", undefined];
+              },
+              runCommand: async () => {
+                commandCalls += 1;
+                return {
+                  stdout: JSON.stringify({
+                    status: "success",
+                    answer: "Injected result",
+                    confidence: "high",
+                  }),
+                  stderr: "",
+                  exitCode: 0,
+                  timedOut: false,
+                };
+              },
+            },
+          );
+        } finally {
+          rmSync(outDir, { recursive: true, force: true });
+        }
+      };
+
+      try {
+        if (skillsDirectory !== null) {
+          mkdirSync(join(codexHome, skillsDirectory), { recursive: true });
+        }
+        await runProbe(dryRun);
+        const expectedLiveCalls = dryRun ? 0 : 1;
+        expect(availabilityCalls).toBe(expectedLiveCalls);
+        expect(versionCalls).toBe(expectedLiveCalls);
+        expect(commandCalls).toBe(expectedLiveCalls);
+      } finally {
+        rmSync(codexHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([true, false])(
+    "rejects personal skills before direct Codex eval startup (dryRun=%s)",
+    async (dryRun) => {
+      const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+      const workload = resolve("eval/agentic/workloads/express-router.md");
+      let availabilityCalls = 0;
+      let versionCalls = 0;
+      let commandCalls = 0;
+      try {
+        mkdirSync(join(codexHome, "skills", "personal"), { recursive: true });
+        const outDir = mkdtempSync(join(tmpdir(), "agent-eval-skills-reject-"));
+        try {
+          await expect(
+            runAgentEval(
+              parseArgs(
+                [
+                  "--agent",
+                  "codex",
+                  "--out",
+                  outDir,
+                  "--workload",
+                  workload,
+                  ...(dryRun ? ["--dry-run"] : []),
+                ],
+                process.cwd(),
+              ),
+              {
+                baseEnv: { PATH: "/bin", CODEX_HOME: codexHome },
+                assertAgentAvailable: async () => {
+                  availabilityCalls += 1;
+                },
+                collectAgentVersions: async () => {
+                  versionCalls += 1;
+                  return [undefined, "codex-test", undefined];
+                },
+                runCommand: async () => {
+                  commandCalls += 1;
+                  return {
+                    stdout: "",
+                    stderr: "",
+                    exitCode: 0,
+                    timedOut: false,
+                  };
+                },
+              },
+            ),
+          ).rejects.toThrow("unsupported entry: personal");
+          expect(readdirSync(outDir)).toEqual([]);
+        } finally {
+          rmSync(outDir, { recursive: true, force: true });
+        }
+        expect(availabilityCalls).toBe(0);
+        expect(versionCalls).toBe(0);
+        expect(commandCalls).toBe(0);
+      } finally {
+        rmSync(codexHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("runs a Codex skills eval with a valid managed home and injected command", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-skills-live-"));
+    const workload = resolve("eval/agentic/workloads/express-router.md");
+    let observedCommand: string[] | undefined;
+    let observedEnv: Record<string, string> | undefined;
+    try {
+      const options = parseArgs(
+        [
+          "--agent",
+          "codex",
+          "--surface",
+          "skills",
+          "--server",
+          "local",
+          "--out",
+          outDir,
+          "--workload",
+          workload,
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options, {
+        baseEnv: { PATH: "/bin", CODEX_HOME: codexHome },
+        assertAgentAvailable: async () => {},
+        collectAgentVersions: async () => [undefined, "codex-test", undefined],
+        runCommand: async (command, _cwd, env) => {
+          observedCommand = command;
+          observedEnv = env;
+          return {
+            stdout: JSON.stringify({
+              status: "success",
+              answer: "Used the injected skills command.",
+              confidence: "high",
+            }),
+            stderr: "",
+            exitCode: 0,
+            timedOut: false,
+          };
+        },
+      });
+
+      expect(observedCommand?.[0]).toBe("codex");
+      expect(observedCommand).toContain("--ignore-user-config");
+      expect(observedEnv?.PATH).toContain(".agent-eval-bin");
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      expect(run.workloads[0].status).toBe("success");
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists streamed observation timestamps in raw and normalized artifacts", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "agent-eval-codex-home-"));
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-observed-tools-"));
+    const workload = resolve("eval/agentic/workloads/express-router.md");
+    const startedAt = "2026-08-28T10:00:00.100Z";
+    const completedAt = "2026-08-28T10:00:00.300Z";
+    const events = [
+      {
+        type: "item.started",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-1",
+          server: "githits",
+          tool: "search",
+          status: "in_progress",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-1",
+          server: "githits",
+          tool: "search",
+          status: "completed",
+        },
+      },
+      { status: "success", answer: "done", confidence: "high" },
+    ];
+    const stdout = events.map((event) => JSON.stringify(event)).join("\n");
+    try {
+      await runAgentEval(
+        parseArgs(
+          ["--agent", "codex", "--out", outDir, "--workload", workload],
+          process.cwd(),
+        ),
+        {
+          baseEnv: { PATH: "/bin", CODEX_HOME: codexHome },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [
+            undefined,
+            "codex-test",
+            undefined,
+          ],
+          runCommand: async () => ({
+            stdout,
+            stderr: "",
+            exitCode: 0,
+            timedOut: false,
+            observedStdoutLines: events.map((event, index) => ({
+              line: JSON.stringify(event),
+              observedAt:
+                index === 0
+                  ? startedAt
+                  : index === 1
+                    ? completedAt
+                    : "2026-08-28T10:00:00.400Z",
+            })),
+          }),
+        },
+      );
+
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const rawToolCalls = JSON.parse(
+        readFileSync(join(workloadDir, "tool-calls.json"), "utf8"),
+      ) as Array<{ observedAt?: string }>;
+      expect(rawToolCalls.map((call) => call.observedAt)).toEqual([
+        startedAt,
+        completedAt,
+      ]);
+      const metrics = JSON.parse(
+        readFileSync(join(outDir, "metrics.json"), "utf8"),
+      ) as {
+        records: Array<{
+          tools: { sequence: Array<Record<string, unknown>> };
+        }>;
+      };
+      expect(metrics.records[0]?.tools.sequence).toEqual([
+        {
+          tool: "search",
+          surface: "mcp",
+          status: "completed",
+          startedAt,
+          completedAt,
+        },
+      ]);
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates disposable per-workload homes and preserves caller CODEX_HOME", () => {
+    const isolation = createWorkloadIsolation({
+      PATH: "/bin",
+      HOME: "/host/home",
+      USERPROFILE: "/host/profile",
+      XDG_CONFIG_HOME: "/host/config",
+      APPDATA: "/host/appdata",
+      CODEX_HOME: "/private/dedicated-eval-home",
+    });
+    try {
+      for (const key of [
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+      ]) {
+        expect(isolation.env[key]).toStartWith(isolation.rootDir);
+      }
+      expect(isolation.env.HOME).not.toBe("/host/home");
+      expect(isolation.env.USERPROFILE).not.toBe("/host/profile");
+      expect(isolation.env.XDG_CONFIG_HOME).not.toBe("/host/config");
+      expect(isolation.env.APPDATA).not.toBe("/host/appdata");
+      expect(isolation.env.CODEX_HOME).toBe("/private/dedicated-eval-home");
+      expect(isolation.metadata).toEqual({
+        root: "<ephemeral>",
+        workspace: "workspace",
+        home: "home",
+        userprofile: "home",
+        xdgConfigHome: "config",
+        appdata: "appdata",
+        temp: "tmp",
+      });
+    } finally {
+      rmSync(isolation.rootDir, { recursive: true, force: true });
+    }
+    expect(existsSync(isolation.rootDir)).toBe(false);
+  });
+
+  it("fails MCP validation for external guidance reads and CLI fallback", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-eval-validation-"));
+    try {
+      const stdout = [
+        JSON.stringify({
+          item: {
+            type: "command_execution",
+            command: "cat /outside/.agents/skills/githits-code/SKILL.md",
+          },
+        }),
+        JSON.stringify({
+          item: {
+            type: "command_execution",
+            command: "githits search express",
+          },
+        }),
+        JSON.stringify({
+          item: {
+            type: "command_execution",
+            command: `cat ${join(workspaceDir, "skills", "githits-mcp", "SKILL.md")}`,
+          },
+        }),
+      ].join("\n");
+      expect(
+        extractEvalValidationViolations(
+          stdout,
+          { surface: "mcp", guidanceProfile: "full" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        {
+          category: "external-guidance-read",
+          path: "<external>/.../.agents/skills/githits-code/SKILL.md",
+        },
+        { category: "mcp-cli-fallback", tool: "search" },
+      ]);
+      expect(
+        extractEvalValidationViolations(
+          JSON.stringify({
+            item: {
+              type: "command_execution",
+              command: "githits search express",
+            },
+          }),
+          { surface: "mcp", guidanceProfile: "descriptors" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([{ category: "mcp-cli-fallback", tool: "search" }]);
+      expect(
+        extractEvalValidationViolations(
+          stdout,
+          { surface: "skills" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        {
+          category: "external-guidance-read",
+          path: "<external>/.../.agents/skills/githits-code/SKILL.md",
+        },
+      ]);
+      expect(
+        extractEvalValidationViolations(
+          JSON.stringify({
+            item: {
+              type: "command_execution",
+              command: "cat ../outside/AGENTS.md",
+            },
+          }),
+          { surface: "mcp", guidanceProfile: "descriptors" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        {
+          category: "external-guidance-read",
+          path: "<external>/.../AGENTS.md",
+        },
+      ]);
+      expect(
+        extractEvalValidationViolations(
+          JSON.stringify({
+            item: {
+              type: "command_execution",
+              command: `cat ${join(workspaceDir, "skills", "githits-mcp", "SKILL.md")}`,
+            },
+          }),
+          { surface: "mcp", guidanceProfile: "descriptors" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        {
+          category: "descriptor-guidance-read",
+          path:
+            "<workspace>/" +
+            join("skills", "githits-mcp", "SKILL.md").replaceAll("\\", "/"),
+        },
+      ]);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes rg filename globs from guidance content reads", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-eval-globs-"));
+    const violations = (command: string) =>
+      extractEvalValidationViolations(
+        JSON.stringify({ item: { type: "command_execution", command } }),
+        { surface: "mcp", guidanceProfile: "descriptors" },
+        workspaceDir,
+        "codex",
+      );
+    try {
+      for (const command of [
+        `/bin/bash -lc "pwd && rg --files -g 'SKILL.md' -g '*git*' | head -50 && rg -n 'GitHits|githits' . -S --hidden -g '!node_modules' | head -50"`,
+        "rg --files -g SKILL.md",
+        'rg --files --glob="SKILL.md"',
+        "rg --files --glob SKILL.md",
+      ]) {
+        expect(violations(command)).toEqual([]);
+      }
+      for (const command of [
+        "rg --files -g 'SKILL.md' && cat SKILL.md",
+        "rg --files -g 'SKILL.md'; cat SKILL.md",
+        "rg --files -g 'SKILL.md' | xargs cat SKILL.md",
+        'rg --files -g "$(cat SKILL.md)"',
+        "rg --files -g `cat SKILL.md`",
+        "rg -n instructions SKILL.md",
+        "rg instructions -g SKILL.md",
+        "rg --files-with-matches instructions -g SKILL.md",
+      ]) {
+        expect(violations(command)).toEqual([
+          {
+            category: "descriptor-guidance-read",
+            path: "<workspace>/SKILL.md",
+          },
+        ]);
+      }
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes delimiters from bare guidance references", () => {
+    const workspaceDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-bare-guidance-"),
+    );
+    try {
+      const stdout = JSON.stringify({
+        item: {
+          type: "command_execution",
+          command:
+            'cat "AGENTS.md" && cat (CLAUDE.md) && cat =GEMINI.md && cat `SKILL.md`',
+        },
+      });
+      expect(
+        extractEvalValidationViolations(
+          stdout,
+          { surface: "mcp", guidanceProfile: "descriptors" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        { category: "descriptor-guidance-read", path: "<workspace>/AGENTS.md" },
+        { category: "descriptor-guidance-read", path: "<workspace>/CLAUDE.md" },
+        { category: "descriptor-guidance-read", path: "<workspace>/GEMINI.md" },
+        { category: "descriptor-guidance-read", path: "<workspace>/SKILL.md" },
+      ]);
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses canonical paths for guidance containment through filesystem aliases", () => {
+    const workspaceDir = mkdtempSync(join(tmpdir(), "agent-eval-alias-"));
+    const aliasRoot = mkdtempSync(join(tmpdir(), "agent-eval-alias-root-"));
+    const pathJoin = process.platform === "win32" ? win32.join : join;
+    const relativeGuidancePath = pathJoin(
+      ".agents",
+      "skills",
+      "githits-mcp",
+      "SKILL.md",
+    );
+    const guidancePath = join(workspaceDir, relativeGuidancePath);
+    const aliasWorkspace = join(aliasRoot, "workspace-alias");
+    const outsideGuidancePath = join(aliasRoot, "outside", "SKILL.md");
+    mkdirSync(join(workspaceDir, ".agents", "skills", "githits-mcp"), {
+      recursive: true,
+    });
+    mkdirSync(join(aliasRoot, "outside"), { recursive: true });
+    writeFileSync(guidancePath, "workspace skill\n");
+    writeFileSync(outsideGuidancePath, "outside skill\n");
+    try {
+      try {
+        symlinkSync(workspaceDir, aliasWorkspace, "dir");
+      } catch (error) {
+        if (process.platform === "win32") return;
+        throw error;
+      }
+
+      const aliasedGuidance = pathJoin(aliasWorkspace, relativeGuidancePath);
+      const fullProfile = extractEvalValidationViolations(
+        JSON.stringify({
+          item: {
+            type: "command_execution",
+            command: `cat ${aliasedGuidance}`,
+          },
+        }),
+        { surface: "mcp", guidanceProfile: "full" },
+        workspaceDir,
+        "codex",
+      );
+      expect(fullProfile).toEqual([]);
+
+      const descriptorProfile = extractEvalValidationViolations(
+        JSON.stringify({
+          item: {
+            type: "command_execution",
+            command: `cat ${aliasedGuidance}`,
+          },
+        }),
+        { surface: "mcp", guidanceProfile: "descriptors" },
+        workspaceDir,
+        "codex",
+      );
+      expect(descriptorProfile).toEqual([
+        {
+          category: "descriptor-guidance-read",
+          path: `<workspace>/${relativeGuidancePath.replaceAll("\\", "/")}`,
+        },
+      ]);
+
+      expect(
+        extractEvalValidationViolations(
+          JSON.stringify({
+            item: {
+              type: "command_execution",
+              command: `cat ${outsideGuidancePath}`,
+            },
+          }),
+          { surface: "mcp", guidanceProfile: "full" },
+          workspaceDir,
+          "codex",
+        ),
+      ).toEqual([
+        {
+          category: "external-guidance-read",
+          path: "<external>/.../SKILL.md",
+        },
+      ]);
+    } finally {
+      rmSync(aliasRoot, { recursive: true, force: true });
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the acting prompt product-neutral", () => {
+    const reporting = readFileSync(
+      resolve("eval/agentic/workloads/REPORTING.md"),
+      "utf8",
+    );
+    expect(reporting).not.toContain("GitHits");
+    expect(reporting).not.toContain("tool");
+    expect(reporting).toContain("status");
+    expect(reporting).toContain("answer");
+    expect(reporting).toContain("confidence");
+  });
+
+  it("isolates OpenCode from external and Claude Code skills", () => {
+    const env = buildEvalEnv({
+      OPENCODE_DISABLE_EXTERNAL_SKILLS: "0",
+      OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "0",
+    });
+    isolateOpenCodeSkills(env);
+    expect(env.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe("1");
+    expect(env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS).toBe("1");
+  });
+
+  it("redacts secret values from environment summary", () => {
+    const summary = sanitizedEnvSummary({
+      HOME: "/tmp/eval-home",
+      USERPROFILE: "/tmp/eval-home",
+      XDG_CONFIG_HOME: "/tmp/eval-home/.config",
+      APPDATA: "/tmp/eval-home/AppData/Roaming",
+      GITHITS_API_TOKEN: "secret-token",
+      GITHITS_CODE_NAV_URL: "http://localhost:7070",
+      GITHITS_AUTH_STORAGE: "keychain",
+    });
+
+    expect(summary.GITHITS_API_TOKEN).toBe("<redacted>");
+    expect(summary.GITHITS_CODE_NAV_URL).toBe("http://localhost:7070");
+    expect(summary.GITHITS_AUTH_STORAGE).toBe("keychain");
+    expect(summary.HOME).toBe("<inherited>");
+  });
+
+  it("parses repeatable workloads and dry-run options", () => {
+    const repoRoot = join(tmpdir(), "githits-cli");
+    const options = parseArgs(
+      [
+        "--agent",
+        "opencode",
+        "--server",
+        "published",
+        "--surface",
+        "skills",
+        "--model",
+        "gpt-5.4-mini",
+        "--published-package",
+        "githits@0.4.2",
+        "--workload",
+        "eval/agentic/workloads/express-router.md",
+        "--timeout",
+        "12",
+        "--concurrency",
+        "3",
+        "--dry-run",
+      ],
+      repoRoot,
+    );
+
+    expect(options.agent).toBe("opencode");
+    expect(options.model).toBe("gpt-5.4-mini");
+    expect(options.server).toBe("published");
+    expect(options.surface).toBe("skills");
+    expect(options.publishedPackage).toBe("githits@0.4.2");
+    expect(options.timeoutSeconds).toBe(12);
+    expect(options.workloadConcurrency).toBe(3);
+    expect(options.dryRun).toBe(true);
+    expect(options.workloads).toEqual([
+      resolve(repoRoot, "eval/agentic/workloads/express-router.md"),
+    ]);
+  });
+
+  it("defaults concurrency to one and rejects invalid values before execution", () => {
+    const repoRoot = join(tmpdir(), "githits-cli");
+    expect(parseArgs(["--dry-run"], repoRoot).workloadConcurrency).toBe(1);
+    for (const value of ["0", "-1", "1.5", "not-a-number"]) {
+      expect(() =>
+        parseArgs(["--concurrency", value, "--dry-run"], repoRoot),
+      ).toThrow("--concurrency must be a positive integer");
+    }
+    expect(() => parseArgs(["--concurrency", "--dry-run"], repoRoot)).toThrow(
+      "--concurrency requires a value",
+    );
+  });
+
+  // Windows fixture I/O can exceed Bun's default timeout for this integration case.
+  it("runs workloads within the selected bound, preserves input order, and continues after ordinary failures", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agent-eval-concurrency-"));
+    const outDir = join(fixtureRoot, "run");
+    const workloads = ["workload-a", "workload-b", "workload-c", "workload-d"];
+    for (const id of workloads) {
+      writeFileSync(join(fixtureRoot, `${id}.md`), `# ${id}\n`);
+    }
+    const reportingPath = join(fixtureRoot, "REPORTING.md");
+    writeFileSync(reportingPath, "status\nanswer\nconfidence\n");
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    try {
+      const options = parseArgs(
+        [
+          "--agent",
+          "opencode",
+          "--concurrency",
+          "2",
+          "--out",
+          outDir,
+          "--reporting",
+          reportingPath,
+          ...workloads.flatMap((id) => [
+            "--workload",
+            join(fixtureRoot, `${id}.md`),
+          ]),
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options, {
+        baseEnv: { PATH: "/bin" },
+        assertAgentAvailable: async () => {},
+        collectAgentVersions: async () => [
+          "opencode-test",
+          undefined,
+          "opencode-test",
+        ],
+        runCommand: async () => {
+          const call = calls;
+          calls += 1;
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) =>
+            setTimeout(resolve, call === 0 ? 15 : 2),
+          );
+          active -= 1;
+          return {
+            stdout: JSON.stringify({
+              status: "success",
+              answer: `answer-${call}`,
+              confidence: "high",
+            }),
+            stderr: "",
+            exitCode: call === 1 ? 1 : 0,
+            timedOut: false,
+          };
+        },
+      });
+      const run = JSON.parse(
+        readFileSync(join(outDir, "run.json"), "utf8"),
+      ) as {
+        workloadConcurrency: number;
+        workloads: Array<{ id: string; status: string }>;
+      };
+      expect(maxActive).toBe(2);
+      expect(calls).toBe(4);
+      expect(run.workloadConcurrency).toBe(2);
+      expect(run.workloads.map((workload) => workload.id)).toEqual(workloads);
+      expect(run.workloads.map((workload) => workload.status)).toEqual([
+        "success",
+        "failed",
+        "success",
+        "success",
+      ]);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("keeps rejecting when a workload executor unexpectedly throws", async () => {
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-concurrency-error-"));
+    try {
+      const options = parseArgs(
+        [
+          "--agent",
+          "opencode",
+          "--concurrency",
+          "2",
+          "--out",
+          outDir,
+          "--workload",
+          "eval/agentic/workloads/express-router.md",
+        ],
+        process.cwd(),
+      );
+      await expect(
+        runAgentEval(options, {
+          baseEnv: { PATH: "/bin" },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [undefined, undefined, undefined],
+          runCommand: async () => {
+            throw new Error("unexpected executor failure");
+          },
+        }),
+      ).rejects.toThrow("unexpected executor failure");
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts the experimental flag only for local MCP evals", () => {
+    const repoRoot = join(tmpdir(), "githits-cli");
+    const options = parseArgs(["--experimental-tools", "--dry-run"], repoRoot);
+    expect(options.experimentalTools).toBe(true);
+    expect(options.surface).toBe("mcp");
+    expect(options.server).toBe("local");
+
+    expect(() =>
+      parseArgs(["--experimental-tools", "--server", "published"], repoRoot),
+    ).toThrow("--experimental-tools requires --surface mcp --server local");
+    expect(() =>
+      parseArgs(["--experimental-tools", "--surface", "skills"], repoRoot),
+    ).toThrow("--experimental-tools requires --surface mcp --server local");
+  });
+
+  it("builds metrics through the runner seam without persisting tool arguments", () => {
+    const metrics = buildAgentEvalMetricsArtifact({
+      runId: "run-synthetic",
+      startedAt: "2026-08-28T10:00:00.000Z",
+      completedAt: "2026-08-28T10:00:03.000Z",
+      records: [
+        {
+          workloadId: "pkg-info",
+          requestedModel: DEFAULT_CODEX_MODEL,
+          resolvedModel: null,
+          agent: "codex",
+          agentVersion: "codex 0.150.1",
+          reasoningEffort: "low",
+          surface: "mcp",
+          server: "local",
+          guidanceProfile: "descriptors",
+          experimentalTools: false,
+          publishedPackage: null,
+          targetGit: { branch: "main", sha: "abc123", dirty: true },
+          startedAt: "2026-08-28T10:00:00.000Z",
+          completedAt: "2026-08-28T10:00:03.000Z",
+          durationMs: 3000,
+          processStatus: "success",
+          finalStatus: "success",
+          exitCode: 0,
+          timedOut: false,
+          toolCalls: [
+            { tool: "search", server: "githits-cli", status: "started" },
+            {
+              tool: "mcp__githits__pkg_info",
+              server: "githits",
+              status: "completed",
+            },
+          ],
+          artifacts: {
+            toolCalls: "workloads/pkg-info/tool-calls.json",
+            final: "workloads/pkg-info/final.json",
+          },
+          stdout: [
+            JSON.stringify({
+              type: "command_execution",
+              command: "githits search express --json --token secret-value",
+            }),
+            JSON.stringify({
+              type: "item.completed",
+              item: {
+                type: "mcp_tool_call",
+                server: "githits",
+                tool: "pkg_info",
+                status: "completed",
+              },
+            }),
+            JSON.stringify({
+              type: "turn.completed",
+              usage: {
+                input_tokens: 100,
+                cached_input_tokens: 40,
+                cache_write_input_tokens: 20,
+                output_tokens: 10,
+                reasoning_output_tokens: 4,
+                diagnostic: "secret-value",
+              },
+            }),
+          ].join("\n"),
+          dryRun: false,
+        },
+      ],
+    });
+
+    expect(agentEvalMetricsSchema.parse(metrics)).toEqual(metrics);
+    expect(metrics.runId).toBe("run-synthetic");
+    expect(metrics.records[0]).toMatchObject({
+      agentVersion: "codex 0.150.1",
+      requestedModel: DEFAULT_CODEX_MODEL,
+      resolvedModel: null,
+      targetGit: { branch: "main", sha: "abc123", dirty: true },
+      processStatus: "success",
+      durationMs: 3000,
+      artifacts: {
+        toolCalls: "workloads/pkg-info/tool-calls.json",
+        final: "workloads/pkg-info/final.json",
+      },
+      usage: {
+        normalizedTokens: {
+          uncachedInputTokens: 40,
+          cachedInputTokens: 40,
+          cacheWriteInputTokens: 20,
+          outputTokens: 10,
+          reasoningOutputTokens: 4,
+        },
+      },
+    });
+    expect(metrics.records[0]?.tools.sequence).toEqual([
+      {
+        tool: "search",
+        surface: "cli",
+        status: "started",
+        startedAt: null,
+        completedAt: null,
+      },
+      {
+        tool: "pkg_info",
+        surface: "mcp",
+        status: "completed",
+        startedAt: null,
+        completedAt: null,
+      },
+    ]);
+    expect(metrics.aggregates).toMatchObject({
+      durationMs: 3000,
+      logicalToolCalls: 2,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 40,
+      cacheWriteInputTokens: 20,
+      outputTokens: 10,
+      reasoningOutputTokens: 4,
+      baseRateEstimatedCostUsd: 0.0000119,
+    });
+    const serialized = JSON.stringify(metrics);
+    expect(serialized).not.toContain("githits search express");
+    expect(serialized).not.toContain("diagnostic");
+    expect(serialized).not.toContain("secret-value");
+  });
+
+  it("writes unknown Codex dry-run metrics without probing availability or versions", async () => {
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-codex-dry-run-"));
+    let availabilityProbeCalls = 0;
+    let versionProbeCalls = 0;
+    try {
+      const options = parseArgs(
+        [
+          "--agent",
+          "codex",
+          "--dry-run",
+          "--out",
+          outDir,
+          "--workload",
+          "eval/agentic/workloads/express-router.md",
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options, {
+        baseEnv: {},
+        assertAgentAvailable: () => {
+          availabilityProbeCalls += 1;
+          return Promise.resolve();
+        },
+        collectAgentVersions: () => {
+          versionProbeCalls += 1;
+          return Promise.resolve([
+            "stub-claude-version",
+            "stub-codex-version",
+            "stub-opencode-version",
+          ]);
+        },
+      });
+
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      const metrics = JSON.parse(
+        readFileSync(join(outDir, "metrics.json"), "utf8"),
+      );
+      const report = JSON.parse(
+        readFileSync(join(outDir, "report.json"), "utf8"),
+      );
+      expect(availabilityProbeCalls).toBe(0);
+      expect(versionProbeCalls).toBe(0);
+      expect(run.runId).toEqual(metrics.runId);
+      expect(run.startedAt).toEqual(metrics.startedAt);
+      expect(run.completedAt).toEqual(metrics.completedAt);
+      expect(report.git).toEqual(run.git);
+      expect(report.git).toHaveProperty("dirty");
+      expect(metrics.records).toHaveLength(1);
+      expect(metrics.records[0]).toMatchObject({
+        agent: "codex",
+        requestedModel: DEFAULT_CODEX_MODEL,
+        resolvedModel: null,
+        agentVersion: null,
+        processStatus: "dry-run",
+        usage: {
+          normalizedTokens: {
+            uncachedInputTokens: null,
+            outputTokens: null,
+          },
+          cost: { kind: "unknown", usd: null },
+          warnings: ["dry_run_no_telemetry"],
+        },
+      });
+      expect(metrics.records[0]?.artifacts).toMatchObject({
+        dryRun: "workloads/express-router/dry-run.json",
+        discoveryEvents: "workloads/express-router/discovery-events.json",
+      });
+      expect(agentEvalMetricsSchema.parse(metrics)).toEqual(metrics);
+      expect(report.metricsWarnings).toContain("dry_run_no_telemetry");
+      expect(report.workloads[0].metrics.cost).toEqual({
+        kind: "unknown",
+        usd: null,
+        uncertainty: "unknown",
+      });
+      expect(
+        formatRunReport(report).match(/Warning: dry_run_no_telemetry/g),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes clean, dirty, and failed Git metadata probes", async () => {
+    const probe =
+      (status: CommandProbeResult): CommandProbe =>
+      async (_command, args) => {
+        if (args[0] === "status") return status;
+        return {
+          stdout: args[0] === "branch" ? "main\n" : "abc123\n",
+          exitCode: 0,
+        };
+      };
+
+    await expect(
+      collectGitMetadata("/repo", probe({ stdout: "", exitCode: 0 })),
+    ).resolves.toEqual({ branch: "main", sha: "abc123", dirty: false });
+    await expect(
+      collectGitMetadata(
+        "/repo",
+        probe({ stdout: "?? untracked.txt\n", exitCode: 0 }),
+      ),
+    ).resolves.toEqual({ branch: "main", sha: "abc123", dirty: true });
+    await expect(
+      collectGitMetadata(
+        "/repo",
+        probe({ stdout: "status details", exitCode: 1 }),
+      ),
+    ).resolves.toEqual({ branch: "main", sha: "abc123", dirty: null });
+  });
+
+  it("persists the enabled flag without probing agent versions during dry runs", async () => {
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-override-"));
+    let availabilityProbeCalls = 0;
+    let versionProbeCalls = 0;
+    try {
+      const options = parseArgs(
+        [
+          "--experimental-tools",
+          "--dry-run",
+          "--out",
+          outDir,
+          "--workload",
+          "eval/agentic/workloads/express-router.md",
+        ],
+        process.cwd(),
+      );
+      await runAgentEval(options, {
+        assertAgentAvailable: () => {
+          availabilityProbeCalls += 1;
+          return Promise.resolve();
+        },
+        collectAgentVersions: () => {
+          versionProbeCalls += 1;
+          return Promise.resolve([
+            "stub-claude-version",
+            "stub-codex-version",
+            "stub-opencode-version",
+          ]);
+        },
+      });
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const dryRun = JSON.parse(
+        readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+      );
+      const mcp = JSON.parse(
+        readFileSync(join(workloadDir, "mcp.json"), "utf8"),
+      );
+      const openCode = JSON.parse(
+        readFileSync(join(workloadDir, "opencode.json"), "utf8"),
+      );
+      expect(run.experimentalTools).toBe(true);
+      expect(run.claudeVersion).toBeUndefined();
+      expect(run.codexVersion).toBeUndefined();
+      expect(run.opencodeVersion).toBeUndefined();
+      expect(availabilityProbeCalls).toBe(0);
+      expect(versionProbeCalls).toBe(0);
+      expect(dryRun.experimentalTools).toBe(true);
+      expect(mcp.mcpServers.githits.args).toContain("--experimental-tools");
+      expect(
+        readFileSync(join(workloadDir, "codex-config.toml"), "utf8"),
+      ).toContain("--experimental-tools");
+      expect(openCode.mcp.githits.command).toContain("--experimental-tools");
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes profile-specific dry-run configs and artifacts", async () => {
+    for (const profile of ["descriptors", "full"] as const) {
+      const outDir = mkdtempSync(join(tmpdir(), `agent-eval-${profile}-`));
+      try {
+        const options = parseArgs(
+          [
+            "--guidance-profile",
+            profile,
+            "--dry-run",
+            "--out",
+            outDir,
+            "--workload",
+            "eval/agentic/workloads/express-router.md",
+          ],
+          process.cwd(),
+        );
+        await runAgentEval(options);
+        const workloadDir = join(outDir, "workloads", "express-router");
+        const mcp = JSON.parse(
+          readFileSync(join(workloadDir, "mcp.json"), "utf8"),
+        );
+        const dryRun = JSON.parse(
+          readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+        );
+        const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+        expect(run.guidanceProfile).toBe(profile);
+        expect(dryRun.guidanceProfile).toBe(profile);
+        expect(
+          readFileSync(join(workloadDir, "discovery-events.json"), "utf8"),
+        ).toContain('"status": "not_observed"');
+        if (profile === "descriptors") {
+          expect(mcp.mcpServers.githits.args).not.toContain(
+            "--instruction-mode",
+          );
+          expect(existsSync(join(workloadDir, "skill-installation.json"))).toBe(
+            false,
+          );
+          expect(
+            existsSync(join(workloadDir, "guidance-installation.json")),
+          ).toBe(false);
+        } else {
+          expect(mcp.mcpServers.githits.args).not.toContain(
+            "--instruction-mode",
+          );
+          const guidance = JSON.parse(
+            readFileSync(
+              join(workloadDir, "guidance-installation.json"),
+              "utf8",
+            ),
+          );
+          expect(guidance.instructionPaths).toHaveLength(2);
+          expect(existsSync(join(workloadDir, "skill-installation.json"))).toBe(
+            true,
+          );
+        }
+      } finally {
+        rmSync(outDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("uses injected agent probes for live run metadata", async () => {
+    const outDir = mkdtempSync(join(tmpdir(), "agent-eval-probes-"));
+    const availabilityProbes: string[] = [];
+    let versionProbeCalls = 0;
+    try {
+      const options = parseArgs(["--out", outDir], process.cwd());
+      options.workloads = [];
+      await runAgentEval(options, {
+        assertAgentAvailable: (agent) => {
+          availabilityProbes.push(agent);
+          return Promise.resolve();
+        },
+        collectAgentVersions: () => {
+          versionProbeCalls += 1;
+          return Promise.resolve([
+            "stub-claude-version",
+            "stub-codex-version",
+            "stub-opencode-version",
+          ]);
+        },
+      });
+
+      const run = JSON.parse(readFileSync(join(outDir, "run.json"), "utf8"));
+      expect(availabilityProbes).toEqual(["claude"]);
+      expect(versionProbeCalls).toBe(1);
+      expect(run.claudeVersion).toBe("stub-claude-version");
+      expect(run.codexVersion).toBe("stub-codex-version");
+      expect(run.opencodeVersion).toBe("stub-opencode-version");
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts secret values from persisted text", () => {
+    const secrets = collectSecretValues({
+      GITHITS_API_TOKEN: "secret-token-value",
+      ANTHROPIC_API_KEY: "anthropic-secret-value",
+      GITHITS_CODE_NAV_URL: "http://localhost:7070",
+    });
+
+    expect(
+      redactText(
+        "token=secret-token-value key=anthropic-secret-value",
+        secrets,
+      ),
+    ).toBe("token=<redacted> key=<redacted>");
+  });
+
+  it("redacts host homes from persisted dry-run configs and metadata", async () => {
+    const outDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-host-home-redaction-"),
+    );
+    const hostHome = "/host/home";
+    const hostProfile = "/host/profile";
+    const hostConfig = "/host/config";
+    const hostAppdata = "/host/appdata";
+    try {
+      await runAgentEval(
+        parseArgs(
+          [
+            "--agent",
+            "codex",
+            "--dry-run",
+            "--out",
+            outDir,
+            "--workload",
+            "eval/agentic/workloads/express-router.md",
+          ],
+          process.cwd(),
+        ),
+        {
+          baseEnv: {
+            PATH: "/bin",
+            HOME: hostHome,
+            USERPROFILE: hostProfile,
+            XDG_CONFIG_HOME: hostConfig,
+            APPDATA: hostAppdata,
+            GITHITS_AUTH_STORAGE: "keychain",
+          },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [undefined, undefined, undefined],
+        },
+      );
+
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const mcpConfigPath = join(workloadDir, "mcp.json");
+      const persisted = [
+        mcpConfigPath,
+        join(workloadDir, "codex-config.toml"),
+        join(workloadDir, "opencode.json"),
+      ];
+      for (const path of persisted) {
+        const content = readFileSync(path, "utf8");
+        expect(content).not.toContain(hostHome);
+        expect(content).not.toContain(hostProfile);
+        expect(content).not.toContain(hostConfig);
+        expect(content).not.toContain(hostAppdata);
+      }
+      const dryRun = JSON.parse(
+        readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+      ) as { command: string[] };
+      const run = JSON.parse(
+        readFileSync(join(outDir, "run.json"), "utf8"),
+      ) as {
+        workloads: Array<{ command: string[] }>;
+      };
+      expect(dryRun.command.join(" ")).not.toContain(hostHome);
+      expect(dryRun.command.join(" ")).not.toContain(hostProfile);
+      expect(run.workloads[0]?.command.join(" ")).not.toContain(hostHome);
+      expect(run.workloads[0]?.command.join(" ")).not.toContain(hostProfile);
+      const mcp = JSON.parse(readFileSync(mcpConfigPath, "utf8")) as {
+        mcpServers: { githits: { env?: Record<string, string> } };
+      };
+      expect(mcp.mcpServers.githits.env).toEqual({
+        GITHITS_AUTH_STORAGE: "keychain",
+        GITHITS_DISABLE_SKILL_UPDATE: "1",
+        HOME: "<redacted>",
+        USERPROFILE: "<redacted>",
+        XDG_CONFIG_HOME: "<redacted>",
+        APPDATA: "<redacted>",
+      });
+      expect(
+        collectHostHomeValues({
+          HOME: hostHome,
+          USERPROFILE: hostProfile,
+          XDG_CONFIG_HOME: hostConfig,
+          APPDATA: hostAppdata,
+        }),
+      ).toEqual([hostProfile, hostAppdata, hostConfig, hostHome]);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts the platform-default host config root from persisted configs", async () => {
+    const outDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-default-config-redaction-"),
+    );
+    const hostHome = "/host/home";
+    const hostProfile = "/host/profile";
+    const defaultConfigRoot =
+      process.platform === "win32"
+        ? join(hostProfile, "AppData", "Roaming")
+        : join(hostHome, ".config");
+    const defaultConfigKey =
+      process.platform === "win32" ? "APPDATA" : "XDG_CONFIG_HOME";
+    try {
+      await runAgentEval(
+        parseArgs(
+          [
+            "--agent",
+            "claude",
+            "--dry-run",
+            "--out",
+            outDir,
+            "--workload",
+            "eval/agentic/workloads/express-router.md",
+          ],
+          process.cwd(),
+        ),
+        {
+          baseEnv: {
+            PATH: "/bin",
+            HOME: hostHome,
+            USERPROFILE: hostProfile,
+            GITHITS_AUTH_STORAGE: "keychain",
+          },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [undefined, undefined, undefined],
+        },
+      );
+
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const mcpConfigPath = join(workloadDir, "mcp.json");
+      const mcp = JSON.parse(readFileSync(mcpConfigPath, "utf8")) as {
+        mcpServers: { githits: { env?: Record<string, string> } };
+      };
+      expect(mcp.mcpServers.githits.env?.[defaultConfigKey]).toBe("<redacted>");
+      expect(readFileSync(mcpConfigPath, "utf8")).not.toContain(
+        defaultConfigRoot,
+      );
+      expect(
+        collectHostHomeValues({
+          HOME: hostHome,
+          USERPROFILE: hostProfile,
+        }),
+      ).toContain(defaultConfigRoot);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts JSON-escaped Windows config roots from persisted configs", async () => {
+    const outDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-escaped-config-redaction-"),
+    );
+    const hostHome = win32.join("C:\\Users", "eval-host");
+    const hostProfile = win32.join("C:\\Users", "eval-profile");
+    const hostConfig = win32.join(hostHome, ".config");
+    const hostAppdata = win32.join(hostProfile, "AppData", "Roaming");
+    try {
+      await runAgentEval(
+        parseArgs(
+          [
+            "--agent",
+            "codex",
+            "--dry-run",
+            "--out",
+            outDir,
+            "--workload",
+            "eval/agentic/workloads/express-router.md",
+          ],
+          process.cwd(),
+        ),
+        {
+          baseEnv: {
+            PATH: "/bin",
+            HOME: hostHome,
+            USERPROFILE: hostProfile,
+            XDG_CONFIG_HOME: hostConfig,
+            APPDATA: hostAppdata,
+            GITHITS_AUTH_STORAGE: "keychain",
+          },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [undefined, undefined, undefined],
+        },
+      );
+
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const mcpConfigPath = join(workloadDir, "mcp.json");
+      const mcp = JSON.parse(readFileSync(mcpConfigPath, "utf8")) as {
+        mcpServers: { githits: { env?: Record<string, string> } };
+      };
+      expect(mcp.mcpServers.githits.env).toEqual({
+        GITHITS_AUTH_STORAGE: "keychain",
+        GITHITS_DISABLE_SKILL_UPDATE: "1",
+        HOME: "<redacted>",
+        USERPROFILE: "<redacted>",
+        XDG_CONFIG_HOME: "<redacted>",
+        APPDATA: "<redacted>",
+      });
+      for (const path of [
+        mcpConfigPath,
+        join(workloadDir, "codex-config.toml"),
+        join(workloadDir, "opencode.json"),
+      ]) {
+        const content = readFileSync(path, "utf8");
+        for (const value of [hostHome, hostProfile, hostConfig, hostAppdata]) {
+          expect(content).not.toContain(value);
+          expect(content).not.toContain(JSON.stringify(value).slice(1, -1));
+        }
+      }
+      const dryRun = JSON.parse(
+        readFileSync(join(workloadDir, "dry-run.json"), "utf8"),
+      ) as { command: string[] };
+      const run = JSON.parse(
+        readFileSync(join(outDir, "run.json"), "utf8"),
+      ) as {
+        workloads: Array<{ command: string[] }>;
+      };
+      for (const command of [dryRun.command, run.workloads[0]?.command ?? []]) {
+        for (const value of [hostHome, hostProfile, hostConfig, hostAppdata]) {
+          expect(command.join(" ")).not.toContain(value);
+          expect(command.join(" ")).not.toContain(
+            JSON.stringify(value).slice(1, -1),
+          );
+        }
+      }
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts host homes from persisted live configs, metadata, and output", async () => {
+    const outDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-live-home-redaction-"),
+    );
+    const codexHome = mkdtempSync(
+      join(tmpdir(), "agent-eval-live-codex-home-"),
+    );
+    const hostHome = "/host/live-home";
+    const hostProfile = "/host/live-profile";
+    const hostConfig = "/host/live-config";
+    const hostAppdata = "/host/live-appdata";
+    const apiToken = "secret-api-token";
+    let observedAgentEnv: Record<string, string> | undefined;
+    let observedCommand: string[] | undefined;
+    try {
+      await runAgentEval(
+        (() => {
+          const options = parseArgs(
+            [
+              "--agent",
+              "codex",
+              "--out",
+              outDir,
+              "--workload",
+              "eval/agentic/workloads/express-router.md",
+            ],
+            process.cwd(),
+          );
+          options.targetRoot = hostHome;
+          return options;
+        })(),
+        {
+          baseEnv: {
+            PATH: "/bin",
+            HOME: hostHome,
+            USERPROFILE: hostProfile,
+            XDG_CONFIG_HOME: hostConfig,
+            APPDATA: hostAppdata,
+            CODEX_HOME: codexHome,
+            GITHITS_AUTH_STORAGE: "keychain",
+            GITHITS_API_TOKEN: apiToken,
+          },
+          assertAgentAvailable: async () => {},
+          collectAgentVersions: async () => [undefined, undefined, undefined],
+          runCommand: async (command, _cwd, env) => {
+            observedCommand = command;
+            observedAgentEnv = env;
+            return {
+              stdout: [
+                `HOME=${hostHome} PROFILE=${hostProfile} TOKEN=${apiToken}`,
+                JSON.stringify({
+                  status: "success",
+                  answer: `Source: ${hostHome}/source.ts`,
+                  confidence: "high",
+                }),
+              ].join("\n"),
+              stderr: `HOME=${hostHome} PROFILE=${hostProfile} TOKEN=${apiToken}`,
+              exitCode: 1,
+              timedOut: false,
+            };
+          },
+        },
+      );
+
+      expect(observedAgentEnv?.HOME).not.toBe(hostHome);
+      expect(observedAgentEnv?.USERPROFILE).not.toBe(hostProfile);
+      expect(observedAgentEnv?.XDG_CONFIG_HOME).not.toBe(hostConfig);
+      expect(observedAgentEnv?.APPDATA).not.toBe(hostAppdata);
+      expect(observedCommand?.join(" ")).toContain(hostHome);
+      expect(observedCommand?.join(" ")).toContain(hostProfile);
+
+      const workloadDir = join(outDir, "workloads", "express-router");
+      const run = JSON.parse(
+        readFileSync(join(outDir, "run.json"), "utf8"),
+      ) as {
+        targetRoot: string;
+        workloads: Array<{ command: string[] }>;
+      };
+      expect(run.targetRoot).toBe(hostHome);
+      expect(run.workloads[0]?.command.join(" ")).not.toContain(hostHome);
+      expect(run.workloads[0]?.command.join(" ")).not.toContain(hostProfile);
+      const persisted = [
+        join(workloadDir, "mcp.json"),
+        join(workloadDir, "codex-config.toml"),
+        join(workloadDir, "opencode.json"),
+      ];
+      for (const path of persisted) {
+        const content = readFileSync(path, "utf8");
+        expect(content).not.toContain(hostHome);
+        expect(content).not.toContain(hostProfile);
+        expect(content).not.toContain(hostConfig);
+        expect(content).not.toContain(hostAppdata);
+      }
+      const codexConfig = readFileSync(
+        join(workloadDir, "codex-config.toml"),
+        "utf8",
+      );
+      expect(codexConfig).toContain('env_vars = ["GITHITS_API_TOKEN"]');
+      expect(codexConfig).not.toContain(apiToken);
+      expect(observedCommand?.join(" ")).toContain(
+        'mcp_servers.githits.env_vars=["GITHITS_API_TOKEN"]',
+      );
+      expect(observedCommand?.join(" ")).not.toContain(apiToken);
+      const stdout = readFileSync(join(workloadDir, "stdout.json"), "utf8");
+      const stderr = readFileSync(join(workloadDir, "stderr.txt"), "utf8");
+      const final = JSON.parse(
+        readFileSync(join(workloadDir, "final.json"), "utf8"),
+      ) as { answer: string };
+      expect(stdout).toContain(hostHome);
+      expect(stdout).toContain(hostProfile);
+      expect(stderr).toContain(hostHome);
+      expect(stderr).toContain(hostProfile);
+      expect(stdout).not.toContain(apiToken);
+      expect(stderr).not.toContain(apiToken);
+      expect(final.answer).toBe(`Source: ${hostHome}/source.ts`);
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("validates final agent report shape", () => {
+    expect(
+      isValidAgentReport({
+        status: "success",
+        answer: "Router lives in lib/router/index.js.",
+        confidence: "high",
+      }),
+    ).toBe(true);
+
+    expect(
+      isValidAgentReport({
+        status: "success",
+        answer: "Router lives in lib/router/index.js.",
+        confidence: "high",
+        expectedToolUse: ["code_read"],
+      }),
+    ).toBe(false);
+
+    expect(
+      isValidAgentReport({ status: "success", answer: "missing fields" }),
+    ).toBe(false);
+  });
+
+  it("extracts Codex MCP tool calls from JSONL events", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "mcp_tool_call",
+          server: "githits",
+          tool: "code_read",
+          status: "completed",
+          arguments: { path: "index.js" },
+        },
+      })}\n`,
+      "codex",
+    );
+
+    expect(calls).toEqual([
+      {
+        agent: "codex",
+        server: "githits",
+        tool: "code_read",
+        status: "completed",
+        arguments: { path: "index.js" },
+      },
+    ]);
+  });
+
+  it("propagates harness observation timestamps into extracted tool calls", () => {
+    const observedAt = "2026-08-28T10:00:00.000Z";
+    expect(
+      extractToolCalls(
+        [
+          {
+            line: JSON.stringify({
+              type: "item.started",
+              item: {
+                type: "mcp_tool_call",
+                id: "mcp-1",
+                server: "githits",
+                tool: "search",
+                status: "in_progress",
+              },
+            }),
+            observedAt,
+          },
+        ],
+        "codex",
+      ),
+    ).toMatchObject([{ providerCallId: "mcp-1", observedAt }]);
+  });
+
+  it.each([
+    [
+      "list",
+      "/bin/zsh -lc 'githits list npm:express lib/ --recursive --limit 100'",
+    ],
+    [
+      "read",
+      "/bin/zsh -lc 'githits read npm:express lib/express.js --lines 1-90'",
+    ],
+    ["resolve_target", "/bin/zsh -lc 'githits resolve lodahs'"],
+  ])(
+    "extracts top-level %s CLI calls from shell-wrapped events",
+    (tool, command) => {
+      const stdout = JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "command_execution",
+          id: "inventory-command",
+          command,
+          status: "completed",
+        },
+      });
+
+      expect(extractToolCalls(stdout, "codex")).toEqual([
+        {
+          agent: "codex",
+          server: "githits-cli",
+          tool,
+          providerCallId: "inventory-command",
+          status: "completed",
+          arguments: { command },
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    ["list", "list"],
+    ["read", "read"],
+    ["resolve_target", "resolve"],
+  ])(
+    "flags top-level %s as a CLI fallback in MCP evals",
+    (tool, commandName) => {
+      const stdout = JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "command_execution",
+          command: `githits ${commandName} npm:express lib/express.js`,
+          status: "completed",
+        },
+      });
+
+      expect(
+        extractEvalValidationViolations(
+          stdout,
+          { surface: "mcp", guidanceProfile: "descriptors" },
+          tmpdir(),
+          "codex",
+        ),
+      ).toEqual([{ category: "mcp-cli-fallback", tool }]);
+    },
+  );
+
+  it("preserves Codex provider IDs and statuses for paired MCP and CLI events", () => {
+    const events = [
+      {
+        type: "item.started",
+        item: {
+          type: "command_execution",
+          id: "command-1",
+          command: "githits search express",
+          status: "in_progress",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          type: "command_execution",
+          id: "command-1",
+          command: "githits search express",
+          status: "completed",
+        },
+      },
+      {
+        type: "item.started",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-1",
+          server: "githits",
+          tool: "search",
+          status: "in_progress",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-1",
+          server: "githits",
+          tool: "search",
+          status: "completed",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-2",
+          server: "githits",
+          tool: "search",
+          status: "completed",
+        },
+      },
+      {
+        type: "item.started",
+        item: {
+          type: "mcp_tool_call",
+          id: "mcp-3",
+          server: "githits",
+          tool: "search",
+          status: "in_progress",
+        },
+      },
+    ].map((event) => JSON.stringify(event));
+
+    expect(extractToolCalls(events.join("\n"), "codex")).toEqual([
+      {
+        agent: "codex",
+        server: "githits-cli",
+        tool: "search",
+        providerCallId: "command-1",
+        status: "in_progress",
+        arguments: { command: "githits search express" },
+      },
+      {
+        agent: "codex",
+        server: "githits-cli",
+        tool: "search",
+        providerCallId: "command-1",
+        status: "completed",
+        arguments: { command: "githits search express" },
+      },
+      {
+        agent: "codex",
+        server: "githits",
+        tool: "search",
+        providerCallId: "mcp-1",
+        status: "in_progress",
+        arguments: undefined,
+        error: undefined,
+      },
+      {
+        agent: "codex",
+        server: "githits",
+        tool: "search",
+        providerCallId: "mcp-1",
+        status: "completed",
+        arguments: undefined,
+        error: undefined,
+      },
+      {
+        agent: "codex",
+        server: "githits",
+        tool: "search",
+        providerCallId: "mcp-2",
+        status: "completed",
+        arguments: undefined,
+        error: undefined,
+      },
+      {
+        agent: "codex",
+        server: "githits",
+        tool: "search",
+        providerCallId: "mcp-3",
+        status: "in_progress",
+        arguments: undefined,
+        error: undefined,
+      },
+    ]);
+  });
+
+  it("extracts Claude MCP tool calls from verbose stream events", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "mcp__githits__pkg_info",
+              input: { registry: "npm", package_name: "express" },
+            },
+          ],
+        },
+      })}\n`,
+      "claude",
+    );
+
+    expect(calls).toEqual([
+      {
+        agent: "claude",
+        server: "githits",
+        tool: "pkg_info",
+        status: "started",
+        arguments: { registry: "npm", package_name: "express" },
+      },
+    ]);
+  });
+
+  it("extracts Claude ToolSearch events separately from MCP calls", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "ToolSearch",
+              id: "search-1",
+              input: { query: "package vulnerabilities" },
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "search-1",
+              content: "GitHits:pkg_vulns",
+            },
+          ],
+        },
+      }),
+    ].join("\n");
+    expect(extractToolCalls(stdout, "claude")).toEqual([]);
+    expect(extractDiscoveryEvents(stdout, "claude")).toEqual({
+      status: "observed",
+      events: [
+        {
+          type: "request",
+          tool: "ToolSearch",
+          toolUseId: "search-1",
+          query: { query: "package vulnerabilities" },
+        },
+        {
+          type: "result",
+          tool: "ToolSearch",
+          toolUseId: "search-1",
+          result: "GitHits:pkg_vulns",
+        },
+      ],
+    });
+    expect(extractDiscoveryEvents(stdout, "codex")).toEqual({
+      status: "not_exposed",
+      events: [],
+    });
+  });
+
+  it("marks Claude discovery as not observed when ToolSearch is absent", () => {
+    expect(extractDiscoveryEvents("", "claude")).toEqual({
+      status: "not_observed",
+      events: [],
+    });
+  });
+
+  it("extracts OpenCode MCP tool calls from JSON events", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "tool_use",
+        part: {
+          type: "tool",
+          tool: "githits_pkg_info",
+          state: {
+            status: "completed",
+            input: { registry: "npm", package_name: "express" },
+          },
+        },
+      })}\n`,
+      "opencode",
+    );
+
+    expect(calls).toEqual([
+      {
+        agent: "opencode",
+        server: "githits",
+        tool: "pkg_info",
+        status: "completed",
+        arguments: { registry: "npm", package_name: "express" },
+        error: undefined,
+      },
+    ]);
+  });
+
+  it("classifies OpenCode JSON error envelopes as failed tool calls", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "tool_use",
+        part: {
+          type: "tool",
+          tool: "githits_search",
+          state: {
+            status: "completed",
+            input: { query: "safeParse", target: "npm:zod" },
+            output: JSON.stringify({
+              error: "Filters not supported by any selected source",
+              code: "INVALID_ARGUMENT",
+              retryable: false,
+            }),
+          },
+        },
+      })}\n`,
+      "opencode",
+    );
+
+    expect(calls[0]?.tool).toBe("search");
+    expect(calls[0]?.status).toBe("completed");
+    expect(calls[0]?.error).toEqual({
+      error: "Filters not supported by any selected source",
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+    });
+    expect(normalizeToolStatus(calls[0]?.status, calls[0]?.error)).toBe(
+      "failed",
+    );
+  });
+
+  it("extracts GitHits CLI calls from skill-surface shell commands", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "Bash",
+              input: {
+                command:
+                  "githits pkg vulns npm:lodash@4.17.20 --severity high --json",
+              },
+            },
+          ],
+        },
+      })}\n${JSON.stringify({
+        item: {
+          type: "function_call",
+          arguments: {
+            command:
+              "npx -y githits@latest code read npm:express lib/router/index.js --lines 1-80",
+          },
+        },
+      })}\n${JSON.stringify({
+        item: {
+          type: "function_call",
+          arguments: {
+            command:
+              "bun run --cwd /repo/githits-cli dev pkg info npm:express --json",
+          },
+        },
+      })}\n`,
+      "claude",
+    );
+
+    expect(calls.map((call) => call.tool)).toEqual([
+      "pkg_vulns",
+      "code_read",
+      "pkg_info",
+    ]);
+    expect(calls[0]?.server).toBe("githits-cli");
+  });
+
+  it("extracts CLI fallback from MCP profiles and ignores unrelated shell commands", () => {
+    const stdout = [
+      JSON.stringify({
+        item: {
+          type: "command_execution",
+          command: "githits search opencode",
+        },
+      }),
+      JSON.stringify({
+        item: {
+          type: "command_execution",
+          command: "git status --short",
+        },
+      }),
+      JSON.stringify({
+        item: {
+          type: "mcp_tool_call",
+          server: "githits",
+          tool: "code_read",
+          status: "completed",
+          arguments: { path: "packages/opencode/src/session/compaction.ts" },
+        },
+      }),
+    ].join("\n");
+    const expectedCalls = [
+      {
+        agent: "codex" as const,
+        server: "githits-cli",
+        tool: "search",
+        status: "started",
+        arguments: { command: "githits search opencode" },
+      },
+      {
+        agent: "codex" as const,
+        server: "githits",
+        tool: "code_read",
+        status: "completed",
+        arguments: { path: "packages/opencode/src/session/compaction.ts" },
+      },
+    ];
+    expect(extractToolCalls(stdout, "codex")).toEqual(expectedCalls);
+  });
+
+  it("ignores non-MCP Claude tool calls", () => {
+    const calls = extractToolCalls(
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "ToolSearch",
+              input: { query: "pkg_vulns" },
+            },
+          ],
+        },
+      })}\n`,
+      "claude",
+    );
+
+    expect(calls).toEqual([]);
+  });
+
+  it("normalizes tool names and statuses for reports", () => {
+    expect(normalizeToolName("mcp__githits__pkg_vulns")).toBe("pkg_vulns");
+    expect(normalizeToolName("mcp__githits__.pkg_vulns")).toBe("pkg_vulns");
+    expect(normalizeToolName("githits.pkg_vulns")).toBe("pkg_vulns");
+    expect(normalizeToolName("pkg_vulns")).toBe("pkg_vulns");
+    expect(normalizeToolStatus("in_progress")).toBe("started");
+    expect(normalizeToolStatus("completed")).toBe("completed");
+    expect(normalizeToolStatus(undefined)).toBe("unknown");
+    expect(normalizeToolStatus("completed", "boom")).toBe("failed");
+  });
+
+  it("rejects escaped relative paths across platforms", () => {
+    expect(isContainedRelativePath("workloads/pkg/tool-calls.json")).toBe(true);
+    expect(isContainedRelativePath("../outside/tool-calls.json")).toBe(false);
+    expect(isContainedRelativePath("/outside/tool-calls.json")).toBe(false);
+    expect(
+      isContainedRelativePath(win32.join("D:\\", "outside", "tool-calls.json")),
+    ).toBe(false);
+    expect(
+      isContainedRelativePath(win32.join("..", "outside", "tool-calls.json")),
+    ).toBe(false);
+  });
+
+  it("summarizes raw tool calls without hiding duplicate status events", () => {
+    const summary = summarizeToolCalls([
+      { tool: "mcp__githits__pkg_vulns", status: "in_progress" },
+      { tool: "pkg_vulns", status: "completed" },
+      { tool: "pkg_info", status: "failed", error: { message: "bad" } },
+    ]);
+
+    expect(summary.rawCount).toBe(3);
+    expect(summary.uniqueTools).toEqual(["pkg_info", "pkg_vulns"]);
+    expect(summary.statusCounts).toEqual({
+      started: 1,
+      completed: 1,
+      failed: 1,
+      unknown: 0,
+    });
+    expect(summary.errors[0]).toContain("bad");
+  });
+
+  it("reports calls by tool with status totals and surface separation", () => {
+    const sequence: Parameters<typeof summarizeCallsByTool>[0] = [
+      {
+        tool: "mcp__githits__pkg_info",
+        surface: "mcp",
+        status: "started",
+        startedAt: null,
+        completedAt: null,
+      },
+      {
+        tool: "mcp__githits__.pkg_info",
+        surface: "mcp",
+        status: "completed",
+        startedAt: null,
+        completedAt: null,
+      },
+      {
+        tool: "pkg_info",
+        surface: "mcp",
+        status: "unknown",
+        startedAt: null,
+        completedAt: null,
+      },
+      {
+        tool: "githits.pkg_info",
+        surface: "cli",
+        status: "failed",
+        startedAt: null,
+        completedAt: null,
+      },
+      {
+        tool: "search",
+        surface: "cli",
+        status: "completed",
+        startedAt: null,
+        completedAt: null,
+      },
+    ];
+
+    expect(summarizeCallsByTool(sequence, 5)).toEqual([
+      {
+        surface: "cli",
+        tool: "pkg_info",
+        total: 1,
+        started: 0,
+        completed: 0,
+        failed: 1,
+        unknown: 0,
+      },
+      {
+        surface: "cli",
+        tool: "search",
+        total: 1,
+        started: 0,
+        completed: 1,
+        failed: 0,
+        unknown: 0,
+      },
+      {
+        surface: "mcp",
+        tool: "pkg_info",
+        total: 3,
+        started: 1,
+        completed: 1,
+        failed: 0,
+        unknown: 1,
+      },
+    ]);
+  });
+
+  it("keeps calls by tool unknown when logical telemetry is unavailable", () => {
+    const sequence: Parameters<typeof summarizeCallsByTool>[0] = [
+      {
+        tool: "pkg_info",
+        surface: "mcp",
+        status: "completed",
+        startedAt: null,
+        completedAt: null,
+      },
+    ];
+    expect(summarizeCallsByTool(sequence, null)).toBeNull();
+    expect(summarizeCallsByTool(sequence, 0)).toBeNull();
+    expect(summarizeCallsByTool([], 0)).toEqual([]);
+  });
+
+  it("summarizes final reports without treating expected tools as actual calls", () => {
+    const summary = summarizeFinalReport({
+      status: "success",
+      answer: "The package has no active vulnerabilities.",
+      githitsUsefulness: "helped",
+      githitsUsefulnessReason: "useful",
+      confidence: "high",
+      expectedToolUse: ["mcp__githits__pkg_vulns"],
+      unexpectedToolUse: ["mcp__githits__.pkg_info"],
+      toolIssues: ["issue", { tool: "pkg_vulns", issue: "unclear range" }],
+      instructionIssues: ["instruction"],
+    });
+
+    expect(summary?.expectedToolUse).toEqual(["pkg_vulns"]);
+    expect(summary?.unexpectedToolUse).toEqual(["pkg_info"]);
+    expect(summary?.toolIssues).toEqual(["issue", "pkg_vulns: unclear range"]);
+    expect(summary?.answer).toBe("The package has no active vulnerabilities.");
+    expect(
+      summarizeFinalReport({ status: "success", confidence: "low", answer: 42 })
+        ?.answer,
+    ).toBeUndefined();
+    expect(
+      summarizeFinalReport({ status: "success", confidence: "low" })?.answer,
+    ).toBeUndefined();
+  });
+
+  it("builds a portable run report from persisted artifacts", () => {
+    const runDir = createRunFixture();
+    writeFileSync(
+      join(runDir, "workloads", "pkg-vulns", "prompt.md"),
+      "Check this package for active vulnerabilities.\n",
+    );
+    const run = JSON.parse(readFileSync(join(runDir, "run.json"), "utf8"));
+    const report = buildRunReportFromMetadata(runDir, run);
+
+    expect(report.schemaVersion).toBe(1);
+    expect(report.workloads[0]?.artifacts.toolCalls).toBe(
+      "workloads/pkg-vulns/tool-calls.json",
+    );
+    expect(report.workloads[0]?.artifacts.prompt).toBe(
+      "workloads/pkg-vulns/prompt.md",
+    );
+    expect(report.workloads[0]?.toolCalls.rawCount).toBe(2);
+    expect(report.workloads[0]?.finalReport?.instructionIssues).toEqual([
+      "Package aliases were unclear",
+    ]);
+    expect(report.workloads[0]?.finalReport?.answer).toBe(
+      "No active vulnerabilities.",
+    );
+    const formatted = formatRunReport(report);
+    expect(formatted).toContain(
+      "pkg-vulns success 1.2s uniqueTools=1 rawEvents=2",
+    );
+    expect(formatted).toContain(
+      `Reopen summary: bun run agent:e2e:report ${runDir}`,
+    );
+    expect(formatted).toContain(
+      "Inspect raw calls: workloads/pkg-vulns/tool-calls.json",
+    );
+  });
+
+  it("omits the optional prompt artifact when it is absent", () => {
+    const runDir = createRunFixture();
+    const run = JSON.parse(readFileSync(join(runDir, "run.json"), "utf8"));
+    const report = buildRunReportFromMetadata(runDir, run);
+
+    expect(report.workloads[0]?.artifacts.prompt).toBeUndefined();
+  });
+
+  it("reports only the selected agent CLI version", () => {
+    const versionCases = [
+      {
+        agent: "claude",
+        expected: "claude 1.0.0",
+        claudeVersion: "claude 1.0.0",
+        codexVersion: "wrong-codex-version",
+        opencodeVersion: "wrong-opencode-version",
+      },
+      {
+        agent: "codex",
+        expected: "codex 0.151.0",
+        claudeVersion: "wrong-claude-version",
+        codexVersion: "codex 0.151.0",
+        opencodeVersion: "wrong-opencode-version",
+      },
+      {
+        agent: "opencode",
+        expected: "opencode 1.2.3",
+        claudeVersion: "wrong-claude-version",
+        codexVersion: "wrong-codex-version",
+        opencodeVersion: "opencode 1.2.3",
+      },
+    ] as const;
+
+    for (const { expected, ...metadata } of versionCases) {
+      const report = buildRunReportFromMetadata("/run", {
+        ...metadata,
+        workloads: [],
+      });
+      expect(report.agentVersion).toBe(expected);
+    }
+
+    const codexReport = buildRunReportFromMetadata("/codex", {
+      agent: "codex",
+      claudeVersion: "claude 9.9.9",
+      codexVersion: "codex 0.151.0",
+      opencodeVersion: "opencode 9.9.9",
+      workloads: [],
+    });
+    expect(JSON.stringify(codexReport, null, 2)).toContain(
+      '"agentVersion": "codex 0.151.0"',
+    );
+    expect(formatRunReport(codexReport)).toContain(
+      "agentVersion=codex 0.151.0",
+    );
+
+    const missingVersion = buildRunReportFromMetadata("/missing", {
+      agent: "codex",
+      claudeVersion: "claude 9.9.9",
+      opencodeVersion: "opencode 9.9.9",
+      workloads: [],
+    });
+    expect(missingVersion.agentVersion).toBeUndefined();
+    expect(formatRunReport(missingVersion)).toContain("agentVersion=unknown");
+  });
+
+  it("normalizes schema-v1 metrics when loading a run report", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-v1-report-"));
+    const workloadDir = join(runDir, "workloads", "pkg-info");
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), []);
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    const current = buildAgentEvalMetrics({
+      runId: "run-v1",
+      startedAt: "2026-08-28T10:00:00.000Z",
+      completedAt: "2026-08-28T10:00:01.000Z",
+      records: [createMetricsRecord("pkg-info")],
+    });
+    writeJson(join(runDir, "metrics.json"), {
+      ...current,
+      schemaVersion: 1,
+      records: current.records.map(
+        ({ scenario, intentProfile, intentFragmentHash, ...record }) => record,
+      ),
+    });
+    try {
+      const report = buildRunReportFromMetadata(runDir, {
+        runId: "run-v1",
+        agent: "codex",
+        surface: "mcp",
+        guidanceProfile: "descriptors",
+        workloads: [{ id: "pkg-info", status: "success", workloadDir }],
+      });
+      expect(report).toMatchObject({
+        scenario: "discovery",
+        intentProfile: "neutral",
+        intentFragmentHash: null,
+      });
+      expect(report.metrics.logicalToolCalls).toBe(2);
+      expect(formatRunReport(report)).toContain(
+        "intent=neutral scenario=discovery intentHash=null",
+      );
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  });
+
+  it("attaches per-workload and aggregate usage metrics to the report", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-metrics-report-"));
+    const firstWorkloadDir = join(runDir, "workloads", "pkg-info");
+    const secondWorkloadDir = join(runDir, "workloads", "docs-search");
+    mkdirSync(firstWorkloadDir, { recursive: true });
+    mkdirSync(secondWorkloadDir, { recursive: true });
+    writeJson(join(firstWorkloadDir, "tool-calls.json"), []);
+    writeJson(join(secondWorkloadDir, "tool-calls.json"), []);
+
+    const first = createMetricsRecord("pkg-info");
+    const second = createMetricsRecord("docs-search", {
+      durationMs: 2000,
+      processStatus: "timeout",
+      timedOut: true,
+      toolCalls: [
+        {
+          tool: "mcp__githits__docs_search",
+          server: "githits",
+          status: "completed",
+        },
+      ],
+      usage: adaptAgentUsage(
+        JSON.stringify({
+          type: "turn.completed",
+          usage: {
+            input_tokens: 200,
+            cached_input_tokens: 100,
+            cache_write_input_tokens: 20,
+            output_tokens: 30,
+            reasoning_output_tokens: 5,
+          },
+        }),
+        "codex",
+        DEFAULT_CODEX_MODEL,
+      ),
+    });
+    writeMetricsFixture(runDir, [first, second]);
+    const report = buildRunReportFromMetadata(runDir, {
+      agent: "codex",
+      model: DEFAULT_CODEX_MODEL,
+      surface: "mcp",
+      server: "local",
+      workloads: [
+        {
+          id: "pkg-info",
+          status: "success",
+          durationMs: 1000,
+          workloadDir: firstWorkloadDir,
+        },
+        {
+          id: "docs-search",
+          status: "timeout",
+          durationMs: 2000,
+          workloadDir: secondWorkloadDir,
+        },
+      ],
+    });
+
+    expect(report.workloads[0]?.metrics).toMatchObject({
+      normalizedTokens: {
+        uncachedInputTokens: 40,
+        cachedInputTokens: 40,
+        cacheWriteInputTokens: 20,
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+      },
+      cost: {
+        kind: "base_rate_estimate",
+        usd: 0.0000119,
+        uncertainty: "rate_based_estimate",
+      },
+      logicalToolCount: 2,
+      mcpCallCount: 1,
+      cliCallCount: 1,
+    });
+    expect(report.workloads[1]?.metrics).toMatchObject({
+      logicalToolCount: 1,
+      mcpCallCount: 1,
+      cliCallCount: 0,
+    });
+    expect(report.metrics).toMatchObject({
+      workloadCount: 2,
+      succeededCount: 1,
+      failedCount: 0,
+      timedOutCount: 1,
+      durationMs: 3000,
+      logicalToolCalls: 3,
+      uncachedInputTokens: 120,
+      cachedInputTokens: 140,
+      cacheWriteInputTokens: 40,
+      outputTokens: 40,
+      reasoningOutputTokens: 9,
+      baseRateEstimatedCostUsd: 0.0000384,
+    });
+    const formatted = formatRunReport(report);
+    expect(formatted).toContain("tokens=uncachedInput=40");
+    expect(formatted).toContain("output=10 reasoning(detail)=4");
+    expect(formatted).toContain("cost=base_rate_estimate costUsd=0.0000119");
+    expect(formatted).toContain("aggregate workloads=2");
+    expect(formatted).toContain("baseRateCostUsd=0.0000384");
+    expect(formatted).not.toContain("output=14");
+
+    const longContextRunDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-long-context-report-"),
+    );
+    writeMetricsFixture(longContextRunDir, [
+      createMetricsRecord("long-context", {
+        usage: adaptAgentUsage(
+          JSON.stringify({
+            type: "turn.completed",
+            usage: {
+              input_tokens: 272_001,
+              cached_input_tokens: 0,
+              cache_write_input_tokens: 0,
+              output_tokens: 1,
+              reasoning_output_tokens: 0,
+            },
+          }),
+          "codex",
+          DEFAULT_CODEX_MODEL,
+        ),
+      }),
+    ]);
+    const longContextReport = buildRunReportFromMetadata(longContextRunDir, {
+      agent: "codex",
+      model: DEFAULT_CODEX_MODEL,
+      surface: "mcp",
+      workloads: [{ id: "long-context", status: "success" }],
+    });
+    expect(longContextReport.workloads[0]?.metrics.cost.uncertainty).toBe(
+      "long_context_pricing_not_attributable",
+    );
+    expect(formatRunReport(longContextReport)).toContain(
+      "costUncertainty=long_context_pricing_not_attributable",
+    );
+  });
+
+  it("exposes calls by tool in workload JSON and terminal reports", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-calls-by-tool-"));
+    const workloadDir = join(runDir, "workloads", "pkg-info");
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), []);
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    writeMetricsFixture(runDir, [
+      createMetricsRecord("pkg-info", {
+        toolCalls: [
+          {
+            tool: "mcp__githits__pkg_info",
+            server: "githits",
+            status: "started",
+          },
+          {
+            tool: "mcp__githits__pkg_info",
+            server: "githits",
+            status: "completed",
+          },
+          { tool: "search", server: "githits-cli", status: "completed" },
+        ],
+      }),
+    ]);
+    const report = buildRunReportFromMetadata(runDir, {
+      agent: "codex",
+      surface: "mcp",
+      workloads: [{ id: "pkg-info", status: "success", workloadDir }],
+    });
+
+    expect(report.workloads[0]?.metrics.callsByTool).toEqual([
+      {
+        surface: "cli",
+        tool: "search",
+        total: 1,
+        started: 0,
+        completed: 1,
+        failed: 0,
+        unknown: 0,
+      },
+      {
+        surface: "mcp",
+        tool: "pkg_info",
+        total: 2,
+        started: 1,
+        completed: 1,
+        failed: 0,
+        unknown: 0,
+      },
+    ]);
+    expect(formatRunReport(report)).toContain(
+      "callsByTool=cli/search(total=1 started=0 completed=1 failed=0 unknown=0),mcp/pkg_info(total=2 started=1 completed=1 failed=0 unknown=0)",
+    );
+  });
+
+  it("reports calls by tool additions, removals, status changes, and surface moves", () => {
+    const buildReport = (toolCalls: AgentEvalRecordInput["toolCalls"]) => {
+      const runDir = mkdtempSync(join(tmpdir(), "agent-eval-tool-delta-"));
+      const workloadDir = join(runDir, "workloads", "pkg-info");
+      mkdirSync(workloadDir, { recursive: true });
+      writeJson(join(workloadDir, "tool-calls.json"), []);
+      writeFileSync(join(workloadDir, "stderr.txt"), "");
+      writeMetricsFixture(runDir, [
+        createMetricsRecord("pkg-info", { toolCalls }),
+      ]);
+      return buildRunReportFromMetadata(runDir, {
+        agent: "codex",
+        surface: "mcp",
+        workloads: [{ id: "pkg-info", status: "success", workloadDir }],
+      });
+    };
+    const before = buildReport([
+      { tool: "pkg_info", server: "githits", status: "completed" },
+      { tool: "pkg_vulns", server: "githits", status: "started" },
+    ]);
+    const after = buildReport([
+      { tool: "pkg_info", server: "githits", status: "failed" },
+      { tool: "pkg_vulns", server: "githits-cli", status: "completed" },
+      { tool: "docs_search", server: "githits", status: "completed" },
+    ]);
+
+    const comparison = compareReports(before, after);
+    const deltas = comparison.toolDeltas[0]?.deltas;
+    expect(deltas).toEqual([
+      {
+        surface: "cli",
+        tool: "pkg_vulns",
+        before: {
+          surface: "cli",
+          tool: "pkg_vulns",
+          total: 0,
+          started: 0,
+          completed: 0,
+          failed: 0,
+          unknown: 0,
+        },
+        after: {
+          surface: "cli",
+          tool: "pkg_vulns",
+          total: 1,
+          started: 0,
+          completed: 1,
+          failed: 0,
+          unknown: 0,
+        },
+        delta: {
+          total: 1,
+          started: 0,
+          completed: 1,
+          failed: 0,
+          unknown: 0,
+        },
+        change: "added",
+      },
+      {
+        surface: "mcp",
+        tool: "docs_search",
+        before: {
+          surface: "mcp",
+          tool: "docs_search",
+          total: 0,
+          started: 0,
+          completed: 0,
+          failed: 0,
+          unknown: 0,
+        },
+        after: {
+          surface: "mcp",
+          tool: "docs_search",
+          total: 1,
+          started: 0,
+          completed: 1,
+          failed: 0,
+          unknown: 0,
+        },
+        delta: {
+          total: 1,
+          started: 0,
+          completed: 1,
+          failed: 0,
+          unknown: 0,
+        },
+        change: "added",
+      },
+      {
+        surface: "mcp",
+        tool: "pkg_info",
+        before: {
+          surface: "mcp",
+          tool: "pkg_info",
+          total: 1,
+          started: 0,
+          completed: 1,
+          failed: 0,
+          unknown: 0,
+        },
+        after: {
+          surface: "mcp",
+          tool: "pkg_info",
+          total: 1,
+          started: 0,
+          completed: 0,
+          failed: 1,
+          unknown: 0,
+        },
+        delta: {
+          total: 0,
+          started: 0,
+          completed: -1,
+          failed: 1,
+          unknown: 0,
+        },
+        change: "changed",
+      },
+      {
+        surface: "mcp",
+        tool: "pkg_vulns",
+        before: {
+          surface: "mcp",
+          tool: "pkg_vulns",
+          total: 1,
+          started: 1,
+          completed: 0,
+          failed: 0,
+          unknown: 0,
+        },
+        after: {
+          surface: "mcp",
+          tool: "pkg_vulns",
+          total: 0,
+          started: 0,
+          completed: 0,
+          failed: 0,
+          unknown: 0,
+        },
+        delta: {
+          total: -1,
+          started: -1,
+          completed: 0,
+          failed: 0,
+          unknown: 0,
+        },
+        change: "removed",
+      },
+    ]);
+    const formatted = formatCompareReport(comparison);
+    expect(formatted).toContain(
+      "callsByTool cli/pkg_vulns: added before=total=0,started=0,completed=0,failed=0,unknown=0 after=total=1,started=0,completed=1,failed=0,unknown=0",
+    );
+    expect(formatted).toContain(
+      "callsByTool mcp/pkg_info: changed before=total=1,started=0,completed=1,failed=0,unknown=0 after=total=1,started=0,completed=0,failed=1,unknown=0",
+    );
+  });
+
+  it("keeps calls by tool comparison deltas unknown when one workload lacks logical telemetry", () => {
+    const buildReport = (
+      toolCalls: AgentEvalRecordInput["toolCalls"],
+      recordAgent: "codex" | "claude" = "codex",
+    ) => {
+      const runDir = mkdtempSync(join(tmpdir(), "agent-eval-tool-unknown-"));
+      const workloadDir = join(runDir, "workloads", "pkg-info");
+      mkdirSync(workloadDir, { recursive: true });
+      writeJson(join(workloadDir, "tool-calls.json"), []);
+      writeFileSync(join(workloadDir, "stderr.txt"), "");
+      writeMetricsFixture(runDir, [
+        createMetricsRecord("pkg-info", {
+          agent: recordAgent,
+          toolCalls,
+        }),
+      ]);
+      return buildRunReportFromMetadata(runDir, {
+        agent: "codex",
+        surface: "mcp",
+        workloads: [{ id: "pkg-info", status: "success", workloadDir }],
+      });
+    };
+    const before = buildReport([
+      { tool: "pkg_info", server: "githits", status: "completed" },
+    ]);
+    const after = buildReport([], "claude");
+    const comparison = compareReports(before, after);
+    expect(comparison.toolDeltas).toEqual([
+      {
+        workloadId: "pkg-info",
+        deltas: null,
+      },
+    ]);
+    expect(formatCompareReport(comparison)).toContain(
+      "callsByTool: unknown (logical tool telemetry unavailable for before or after)",
+    );
+    expect(before.workloads[0]?.metrics.callsByTool).not.toBeNull();
+    expect(after.workloads[0]?.metrics.callsByTool).toBeNull();
+    expect(after.workloads[0]?.metrics.telemetryWarnings).toContain(
+      "logical tool telemetry unavailable or inconsistent; callsByTool is unknown",
+    );
+
+    const bothUnknown = compareReports(after, after);
+    expect(bothUnknown.toolDeltas).toEqual([
+      { workloadId: "pkg-info", deltas: null },
+    ]);
+    expect(formatCompareReport(bothUnknown)).toContain(
+      "callsByTool: unknown (logical tool telemetry unavailable for before or after)",
+    );
+    const knownEmpty = buildReport([]);
+    const unknownVsKnownEmpty = compareReports(after, knownEmpty);
+    expect(unknownVsKnownEmpty.toolDeltas).toEqual([
+      { workloadId: "pkg-info", deltas: null },
+    ]);
+  });
+
+  it("binds metrics to run identity while accepting legacy run metadata", () => {
+    const runDir = createRunFixture();
+    writeMetricsFixture(runDir, [createMetricsRecord("pkg-vulns")]);
+    const workloads = [
+      {
+        id: "pkg-vulns",
+        status: "success",
+      },
+    ];
+
+    writeJson(join(runDir, "run.json"), {
+      runId: "run-other",
+      workloads,
+    });
+    const mismatch = loadRunReport(runDir);
+    expect(mismatch.metrics.baseRateEstimatedCostUsd).toBeNull();
+    expect(mismatch.workloads[0]?.metrics.logicalToolCount).toBeNull();
+    expect(mismatch.metricsWarnings).toContain(
+      "metrics.json runId mismatch; normalized usage, cost, and logical tool metrics are unknown",
+    );
+
+    const matching = buildRunReportFromMetadata(runDir, {
+      runId: "run-metrics",
+      workloads,
+    });
+    expect(matching.workloads[0]?.metrics.logicalToolCount).toBe(2);
+    expect(matching.metrics.baseRateEstimatedCostUsd).not.toBeNull();
+
+    const legacy = buildRunReportFromMetadata(runDir, { workloads });
+    expect(legacy.workloads[0]?.metrics.logicalToolCount).toBe(2);
+    expect(legacy.metrics.baseRateEstimatedCostUsd).not.toBeNull();
+  });
+
+  it("keeps old and unsafe metrics runs reportable with unknown values", () => {
+    const missingRunDir = createRunFixture();
+    const missing = buildRunReportFromMetadata(
+      missingRunDir,
+      JSON.parse(readFileSync(join(missingRunDir, "run.json"), "utf8")),
+    );
+    expect(missing.metrics.durationMs).toBeNull();
+    expect(missing.metrics.baseRateEstimatedCostUsd).toBeNull();
+    expect(missing.workloads[0]?.metrics.logicalToolCount).toBeNull();
+    expect(missing.metricsWarnings[0]).toContain("metrics.json missing");
+    expect(formatRunReport(missing)).toContain("costUsd=unknown");
+
+    const invalidRunDir = createRunFixture();
+    writeFileSync(join(invalidRunDir, "metrics.json"), "not json");
+    const invalid = buildRunReportFromMetadata(
+      invalidRunDir,
+      JSON.parse(readFileSync(join(invalidRunDir, "run.json"), "utf8")),
+    );
+    expect(invalid.metricsWarnings[0]).toContain("metrics.json invalid");
+    expect(invalid.workloads[0]?.metrics.cliCallCount).toBeNull();
+
+    const unsafeRunDir = createRunFixture();
+    const outsideDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-unsafe-metrics-"),
+    );
+    writeJson(join(outsideDir, "metrics.json"), {});
+    symlinkSync(
+      join(outsideDir, "metrics.json"),
+      join(unsafeRunDir, "metrics.json"),
+    );
+    const unsafe = buildRunReportFromMetadata(
+      unsafeRunDir,
+      JSON.parse(readFileSync(join(unsafeRunDir, "run.json"), "utf8")),
+    );
+    expect(unsafe.metricsWarnings[0]).toContain(
+      "metrics.json path outside run directory ignored",
+    );
+    expect(unsafe.workloads[0]?.metrics.normalizedTokens.outputTokens).toBe(
+      null,
+    );
+  });
+
+  it("does not attach duplicate or missing metrics records by accident", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-metric-ids-"));
+    writeMetricsFixture(runDir, [
+      createMetricsRecord("pkg-vulns"),
+      createMetricsRecord("pkg-vulns", { durationMs: 2000 }),
+      createMetricsRecord("extra"),
+    ]);
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [
+        { id: "pkg-vulns", status: "success" },
+        { id: "missing", status: "success" },
+      ],
+    });
+
+    expect(report.warnings).toContain(
+      "duplicate metrics record for workload: pkg-vulns",
+    );
+    expect(report.warnings).toContain(
+      "metrics record has no matching workload: extra",
+    );
+    expect(report.warnings).toContain(
+      "metrics record missing for workload: missing",
+    );
+    expect(report.workloads[0]?.metrics.logicalToolCount).toBeNull();
+    expect(report.workloads[1]?.metrics.logicalToolCount).toBeNull();
+  });
+
+  it("warns when any MCP profile uses CLI fallback", () => {
+    for (const guidanceProfile of ["descriptors", "full"] as const) {
+      const runDir = mkdtempSync(join(tmpdir(), "agent-eval-cli-fallback-"));
+      const workloadDir = join(runDir, "workloads", "fallback");
+      mkdirSync(workloadDir, { recursive: true });
+      writeJson(join(workloadDir, "tool-calls.json"), [
+        {
+          agent: "codex",
+          server: "githits-cli",
+          tool: "search",
+          status: "started",
+        },
+      ]);
+      writeFileSync(join(workloadDir, "stderr.txt"), "");
+      const report = buildRunReportFromMetadata(runDir, {
+        agent: "codex",
+        surface: "mcp",
+        guidanceProfile,
+        workloads: [{ id: "fallback", status: "failed", workloadDir }],
+      });
+      expect(report.workloads[0]?.warnings).toContain(
+        `MCP ${guidanceProfile} guidance run used GitHits CLI fallback: search`,
+      );
+      expect(formatRunReport(report)).toContain("CLI fallback");
+    }
+
+    const skillsRunDir = mkdtempSync(join(tmpdir(), "agent-eval-cli-skills-"));
+    const skillsWorkloadDir = join(skillsRunDir, "workloads", "fallback");
+    mkdirSync(skillsWorkloadDir, { recursive: true });
+    writeJson(join(skillsWorkloadDir, "tool-calls.json"), [
+      {
+        agent: "codex",
+        server: "githits-cli",
+        tool: "search",
+        status: "started",
+      },
+    ]);
+    const skillsReport = buildRunReportFromMetadata(skillsRunDir, {
+      agent: "codex",
+      surface: "skills",
+      workloads: [
+        { id: "fallback", status: "success", workloadDir: skillsWorkloadDir },
+      ],
+    });
+    expect(skillsReport.workloads[0]?.warnings).not.toContain("CLI fallback");
+  });
+
+  it("reports discovery status and artifact path", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-discovery-report-"));
+    const workloadDir = join(runDir, "workloads", "discovery");
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), []);
+    writeJson(join(workloadDir, "discovery-events.json"), {
+      status: "not_observed",
+      events: [],
+    });
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    const report = buildRunReportFromMetadata(runDir, {
+      agent: "claude",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [{ id: "discovery", status: "success", workloadDir }],
+    });
+    expect(report.workloads[0]?.discovery).toEqual({
+      status: "not_observed",
+      eventCount: 0,
+    });
+    expect(report.workloads[0]?.artifacts.discoveryEvents).toBe(
+      "workloads/discovery/discovery-events.json",
+    );
+    expect(formatRunReport(report)).toContain("discovery=not_observed");
+    expect(
+      report.warnings.filter((warning) => warning.includes("global CLAUDE.md")),
+    ).toEqual([]);
+  });
+
+  it("does not claim profile comparisons are contaminated without evidence", () => {
+    const before = buildRunReportFromMetadata("/before", {
+      agent: "claude",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [],
+    });
+    const after = buildRunReportFromMetadata("/after", {
+      agent: "claude",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [],
+    });
+
+    expect(compareReports(before, after).warnings).toEqual([]);
+  });
+
+  it("does not claim Codex profile comparisons are contaminated without evidence", () => {
+    const before = buildRunReportFromMetadata("/before", {
+      agent: "codex",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [],
+    });
+    const after = buildRunReportFromMetadata("/after", {
+      agent: "codex",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [],
+    });
+    expect(
+      before.warnings.filter((warning) =>
+        warning.includes("global $CODEX_HOME/AGENTS.md"),
+      ),
+    ).toEqual([]);
+    expect(compareReports(before, after).warnings).toEqual([]);
+  });
+
+  it("reports no MCP guidance profile for skills runs", () => {
+    const report = buildRunReportFromMetadata("/skills", {
+      agent: "codex",
+      model: "gpt-5.6-luna",
+      surface: "skills",
+      workloads: [],
+    });
+    expect(report.guidanceProfile).toBeUndefined();
+    expect(formatRunReport(report)).toContain("profile=n/a");
+  });
+
+  it("reports missing artifacts for dry-run workloads without crashing", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-dry-run-test-"));
+    const report = buildRunReportFromMetadata(runDir, {
+      agent: "claude",
+      server: "local",
+      dryRun: true,
+      workloads: [{ id: "express-router", status: "dry-run" }],
+    });
+
+    expect(report.status).toBe("dry-run");
+    expect(report.workloads[0]?.missingArtifacts).toContain("tool-calls.json");
+    expect(formatRunReport(report)).toContain("express-router dry-run");
+  });
+
+  it("does not read workload artifacts outside the run directory", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-safe-test-"));
+    const outsideDir = mkdtempSync(join(tmpdir(), "agent-eval-outside-test-"));
+    mkdirSync(join(runDir, "workloads", "safe"), { recursive: true });
+    writeJson(join(outsideDir, "tool-calls.json"), [
+      { tool: "pkg_vulns", status: "completed" },
+    ]);
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "safe", status: "success", workloadDir: outsideDir }],
+    });
+
+    expect(report.workloads[0]?.toolCalls.rawCount).toBe(0);
+    expect(report.workloads[0]?.missingArtifacts).toContain("tool-calls.json");
+  });
+
+  it("does not let workload ids traverse outside the run directory", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-id-safe-test-"));
+    const outsideDir = join(runDir, "..", "outside-workload");
+    mkdirSync(outsideDir, { recursive: true });
+    writeJson(join(outsideDir, "tool-calls.json"), [
+      { tool: "pkg_vulns", status: "completed" },
+    ]);
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "../outside-workload", status: "success" }],
+    });
+
+    expect(report.workloads[0]?.toolCalls.rawCount).toBe(0);
+    expect(report.workloads[0]?.warnings[0]).toContain(
+      "invalid workload id ignored",
+    );
+  });
+
+  it("does not follow workload artifact symlinks outside the run directory", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-symlink-test-"));
+    const outsideDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-symlink-outside-"),
+    );
+    mkdirSync(join(runDir, "workloads"), { recursive: true });
+    writeJson(join(outsideDir, "tool-calls.json"), [
+      { tool: "pkg_vulns", status: "completed" },
+    ]);
+    symlinkSync(outsideDir, join(runDir, "workloads", "symlinked"));
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "symlinked", status: "success" }],
+    });
+
+    expect(report.workloads[0]?.toolCalls.rawCount).toBe(0);
+    expect(report.workloads[0]?.warnings[0]).toContain(
+      "artifact path outside run directory ignored",
+    );
+  });
+
+  it("does not expose a prompt symlink outside the run directory", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-prompt-symlink-"));
+    const workloadDir = join(runDir, "workloads", "unsafe-prompt");
+    const outsideDir = mkdtempSync(
+      join(tmpdir(), "agent-eval-prompt-outside-"),
+    );
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), []);
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    writeFileSync(join(outsideDir, "prompt.md"), "outside prompt\n");
+    symlinkSync(join(outsideDir, "prompt.md"), join(workloadDir, "prompt.md"));
+
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "unsafe-prompt", status: "success", workloadDir }],
+    });
+
+    expect(report.workloads[0]?.artifacts.prompt).toBeUndefined();
+    expect(report.workloads[0]?.warnings).toContain(
+      `artifact path outside run directory ignored: prompt: ${join(
+        workloadDir,
+        "prompt.md",
+      )}`,
+    );
+  });
+
+  it("warns only on actual-use self-report drift", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-drift-test-"));
+    const workloadDir = join(runDir, "workloads", "drift");
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), [
+      { tool: "pkg_vulns", status: "completed" },
+    ]);
+    writeJson(join(workloadDir, "final.json"), {
+      status: "success",
+      githitsUsefulness: "helped",
+      githitsUsefulnessReason: "useful",
+      confidence: "high",
+      expectedToolUse: ["pkg_info"],
+      unexpectedToolUse: ["docs_read"],
+      toolIssues: [],
+      instructionIssues: [],
+    });
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "drift", status: "success", workloadDir }],
+    });
+
+    expect(report.workloads[0]?.warnings).toEqual([
+      "self-report drift: unexpectedToolUse not present in raw calls: docs_read",
+    ]);
+  });
+
+  it("does not treat fallback descriptions as self-report drift", () => {
+    const runDir = mkdtempSync(join(tmpdir(), "agent-eval-fallback-test-"));
+    const workloadDir = join(runDir, "workloads", "fallback");
+    mkdirSync(workloadDir, { recursive: true });
+    writeJson(join(workloadDir, "tool-calls.json"), [
+      { tool: "pkg_vulns", status: "completed" },
+    ]);
+    writeJson(join(workloadDir, "final.json"), {
+      status: "success",
+      githitsUsefulness: "helped",
+      githitsUsefulnessReason: "useful",
+      confidence: "high",
+      expectedToolUse: [],
+      unexpectedToolUse: ["web search fallback for public corroboration"],
+      toolIssues: [],
+      instructionIssues: [],
+    });
+    writeFileSync(join(workloadDir, "stderr.txt"), "");
+    const report = buildRunReportFromMetadata(runDir, {
+      workloads: [{ id: "fallback", status: "success", workloadDir }],
+    });
+
+    expect(report.workloads[0]?.warnings).toEqual([]);
+  });
+
+  it("parses report CLI modes and rejects invalid combinations", () => {
+    expect(parseReportArgs(["/run"])).toEqual({
+      mode: "report",
+      runDir: "/run",
+    });
+    expect(parseReportArgs(["--json", "/run"])).toEqual({
+      mode: "json",
+      runDir: "/run",
+    });
+    expect(parseReportArgs(["--compare", "/before", "/after"])).toEqual({
+      mode: "compare",
+      beforeRunDir: "/before",
+      afterRunDir: "/after",
+    });
+    expect(() => parseReportArgs(["--json"])).toThrow(
+      "--json requires exactly one run directory",
+    );
+    expect(() => parseReportArgs(["/one", "/two"])).toThrow(
+      "report mode accepts exactly one run directory",
+    );
+  });
+
+  it("compares same-agent reports with aggregate status counts", () => {
+    const before = buildRunReportFromMetadata("/before", {
+      agent: "codex",
+      model: "gpt-5.4-mini",
+      server: "local",
+      workloads: [{ id: "pkg-vulns", status: "success" }],
+    });
+    const afterRunDir = createRunFixture();
+    const after = buildRunReportFromMetadata(
+      afterRunDir,
+      JSON.parse(readFileSync(join(afterRunDir, "run.json"), "utf8")),
+    );
+    const formatted = formatCompareReport(compareReports(before, after));
+
+    expect(formatted).toContain(
+      "before=/before (codex:gpt-5.4-mini/mcp/local)",
+    );
+    expect(formatted).toContain("after=");
+    expect(formatted).toContain("(codex/mcp/local)");
+    expect(formatted).toContain("pkg-vulns status unchanged success");
+    expect(formatted).toContain("raw events 0 -> 2");
+    expect(formatted).toContain("+pkg_vulns");
+  });
+
+  it("warns when same-agent comparison metadata differs", () => {
+    const before = buildRunReportFromMetadata("/before", {
+      agent: "codex",
+      model: "gpt-5.6-luna",
+      codexVersion: "codex 0.150.1",
+      reasoningEffort: "high",
+      surface: "mcp",
+      guidanceProfile: "descriptors",
+      workloads: [],
+    });
+    const after = buildRunReportFromMetadata("/after", {
+      agent: "codex",
+      model: "gpt-custom",
+      codexVersion: "codex 0.151.0",
+      reasoningEffort: "low",
+      surface: "mcp",
+      guidanceProfile: "full",
+      workloads: [],
+    });
+    const comparison = compareReports(before, after);
+    expect(comparison.warnings).toEqual([
+      "agent CLI version differs: codex 0.150.1 -> codex 0.151.0",
+      "guidance profile differs: descriptors -> full",
+      "model differs: gpt-5.6-luna -> gpt-custom",
+      "reasoning effort differs: high -> low",
+    ]);
+    expect(formatCompareReport(comparison)).toContain(
+      "profile=descriptors effort=high",
+    );
+    expect(formatCompareReport(comparison)).toContain(
+      "agentVersion=codex 0.150.1",
+    );
+    expect(formatCompareReport(comparison)).toContain(
+      "profile=full effort=low",
+    );
+    expect(formatCompareReport(comparison)).toContain(
+      "agentVersion=codex 0.151.0",
+    );
+  });
+
+  it("degrades cross-agent comparisons to tool-name presence", () => {
+    const before = buildRunReportFromMetadata("/before", {
+      agent: "claude",
+      workloads: [{ id: "pkg-vulns", status: "success" }],
+    });
+    const after = buildRunReportFromMetadata("/after", {
+      agent: "codex",
+      workloads: [{ id: "pkg-vulns", status: "success" }],
+    });
+    const formatted = formatCompareReport(compareReports(before, after));
+
+    expect(formatted).toContain("cross-agent comparison");
+    expect(formatted).not.toContain("raw events");
+  });
+
+  it("fails fast on duplicate workload ids", () => {
+    expect(() =>
+      assertUniqueWorkloadIds(["/a/tasks/pkg.md", "/b/other/pkg.md"]),
+    ).toThrow('Duplicate workload id "pkg"');
+  });
+
+  it("keeps workload selection docs in sync", () => {
+    const repoRoot = process.cwd();
+    const workloadsDir = join(repoRoot, "eval", "agentic", "workloads");
+    const readme = readFileSync(
+      join(repoRoot, "eval", "agentic", "README.md"),
+      "utf8",
+    );
+    const workloadFiles = readdirSync(workloadsDir)
+      .filter((file) => file.endsWith(".md") && file !== "REPORTING.md")
+      .sort();
+    const missing = workloadFiles.filter(
+      (file) => !readme.includes(`\`${file}\``),
+    );
+
+    expect(missing).toEqual([]);
+    expect(workloadFiles.map((file) => basename(file))).toContain(
+      "package-overview-vulnerabilities.md",
+    );
+  });
+});

@@ -1,0 +1,218 @@
+# Release Process
+
+## Public Artifacts
+
+This repository currently releases two independently versioned public npm
+artifacts:
+
+- `githits`, whose version also owns the generated plugin and assistant
+  manifests and the `com.githits/githits` MCP registry entry
+- `@githits/mcp`, the reusable transport-neutral MCP package
+
+Add future independently versioned public artifacts, including an SDK, to this
+document and the changelog fragment schema when their package manifests are
+added. Private workspace packages do not receive changelog impact entries or
+release versions.
+
+## Changelog Fragments
+
+Every notable user-, agent-, operator-, or public-API-visible change owns one
+independent file under `changes/` following `changes/README.md`. Normal pull
+requests do not edit `CHANGELOG.md`; only release preparation consolidates the
+fragments into versioned release sections.
+
+Each fragment contains:
+
+1. YAML front matter naming every public artifact and its pending SemVer impact
+   (`none`, `patch`, `minor`, or `major`).
+2. One concise Markdown bullet whose category comes from the filename suffix:
+   `added`, `changed`, `deprecated`, `removed`, `fixed`, or `security`.
+3. User impact, compatibility, migration, or operational action, identifying
+   the affected artifact when the scope is not obvious.
+
+Keep `none` explicit for unaffected artifacts; that is the signal that an
+independent package release is not required. When another public package is
+added, add it to `changes/README.md`, fragment validation, and every new
+fragment so cross-package impact cannot remain implicit. The highest impact
+across an artifact's fragments determines its release bump.
+
+A fragment with non-`none` impact on multiple artifacts is atomic: release all
+of those artifacts together or leave the fragment untouched. A fragment with
+`none` for every artifact records repository or release-operation impact; it
+does not trigger a release and is consumed into the next `githits` release.
+
+Exclude internal refactors, test-only changes, development-dependency updates,
+and generated-file churn unless they materially affect behavior, security,
+performance, reliability, packaging, or release operation. GitHub-generated
+release notes remain useful PR-level detail, but they do not replace the curated
+changelog.
+
+## Historical Entries
+
+Dated, versioned changelog sections are historical records. Do not rewrite,
+reclassify, expand, or remove their entries after release. An omitted minor
+detail, improved wording, or a later change in preferred terminology is not a
+reason to edit release history.
+
+Change a historical entry only when it contains a blatant, demonstrable factual
+error, such as the wrong artifact, version, release date, shipped behavior,
+compatibility statement, or migration requirement. Make the smallest correction
+that restores factual accuracy. If the error could mislead current users or
+operators, also add a fragment for the correction; do not silently rely on the
+historical edit to communicate new guidance.
+
+## Package Impact Rules
+
+Use the verified changed surface, not the workspace location alone, to decide
+release impact:
+
+- Bump `githits` for CLI behavior, local auth or setup, local stdio startup,
+  root package APIs, packaged plugin/assistant assets, or root runtime
+  dependency changes.
+- Bump `@githits/mcp` only for its public API, tool behavior, MCP guidance,
+  schemas, MCP auth/error behavior, or remote-server-facing public types.
+- A shared implementation change can require both bumps when it changes both
+  shipped artifacts. CLI-only use of shared code does not by itself require an
+  MCP bump.
+- Documentation-only changes normally require no package bump. Public Agent
+  Skills are also read from `main`; when their packaged behavior changes, state
+  explicitly whether the next `githits` artifact must carry the same update.
+
+### Public Agent Skill lifecycle
+
+Behavior-dependent changes to `skills/githits-onboarding/SKILL.md` are made on
+the release branch only after the corresponding CLI behavior is included. This
+keeps the published `skills.sh` surface from advertising behavior that is not
+yet in the released CLI. A feature branch may review the public skill for stale
+or contradictory claims, but should leave it unchanged until that release
+boundary is reached.
+
+For the `githits-mcp` stable guide, exact parity is a bounded exception: when
+backing stable behavior or `buildMcpQuickStart()` changes, update the backing
+behavior, builder in `packages/mcp/src/mcp/instructions.ts`, and terminal guide
+copy in `skills/githits-mcp/SKILL.md` in the same PR, merge that PR to `main`, and
+ship it in the next applicable release cycle. This accepts the bounded
+main-to-release window for `skills.sh`; it does not require a deploy-first or
+two-PR flow. The local `buildLocalMcpQuickStart()` appendices are runtime-only
+and stay out of the public copy. This exception does not change the separate
+release-branch rule above for `githits-onboarding`.
+
+The CLI's local install marker is outside the canonical public
+`skills/githits-mcp/SKILL.md`; managed direct-init installs carry their writing
+CLI version and payload checksum. Later packaged skill bytes need no new
+historical hash entry to refresh those managed installs. Generic/plugin copies
+remain unmarked, and unrecognized unmarked payloads are preserved. If a new
+unmarked CLI release ships before this lifecycle reaches users, verify its
+tarball content and add that hash to the one-time legacy bridge before
+delivery. See the
+[installed MCP skill lifecycle](init-guidance-and-expanded-agent-support.md#installed-mcp-skill-lifecycle).
+
+Before assigning `none`, compare the delta against every public consumer and
+package export. A fragment's impact records the conclusion; it does not replace
+that review.
+
+## Release Preparation
+
+Release preparation and release execution have separate authorization
+boundaries. A request to audit, prepare, create, cut, or release a version
+authorizes the work below through opening the release PR only; it does not
+authorize merging, enabling auto-merge, tagging, or publishing.
+
+For each artifact being released:
+
+1. Inspect the complete package-specific tag-to-HEAD delta (`vX.Y.Z` for
+   `githits`, `mcp-vX.Y.Z` for `@githits/mcp`) and reconcile it with
+   all files in `changes/`; fragments do not replace range review.
+2. Confirm each fragment's impact matches the actual public surface, compute
+   the highest pending bump for each artifact, and verify every notable entry
+   states required migration or compatibility effects.
+3. Bump only the affected package manifests. When `@githits/mcp` is released,
+   align its workspace version in `bun.lock`. For a root release, also update
+   `server.json` and regenerate every plugin/assistant manifest.
+4. Group each affected artifact's fragment entries by category into its own
+   `## [<artifact> <version>] - YYYY-MM-DD` section. Keep separate sections for
+   coordinated releases so each package tag has unambiguous notes. Exclude an
+   entry from artifacts marked `none`; include all-`none` repository entries in
+   the root `githits` section.
+5. Delete every consumed fragment. Leave fragments unrelated to the artifacts
+   being released untouched, and never partially consume a cross-artifact
+   fragment.
+6. Run the release skill checklist, package validation, tests, build, and the
+   smoke or agent evaluations required by the changed surfaces.
+
+After validation, commit and push the preparation and open the release PR.
+Report its URL and check status, then stop. Merge only after receiving separate,
+explicit human approval given after the release PR exists and identifying that
+PR. Earlier release requests do not count as merge approval, and auto-merge
+must not be enabled as a substitute. Once the separately approved PR merges,
+the successful `Main` workflow triggers the root and MCP publication workflows.
+
+The release-boundary tests validate fragment names, front matter, and body
+shape during development, and require release sections for the versions
+currently declared in both public package manifests. A version bump without a
+matching changelog section must fail before release.
+
+## npm Publication Completion and Recovery
+
+CI and package-release workflows default to `permissions: {}`. Agent evals
+grant `contents: read` at workflow scope. CI jobs explicitly grant
+`contents: read`. Publishing jobs grant `contents: write` for tags and
+releases and `id-token: write` for npm trusted publishing and Azure login.
+Third-party actions are pinned to full commit SHAs with version comments, and
+these workflows install Bun 1.4.4. Dependabot's `github-actions` updates
+refresh the SHA pins.
+
+The MCP release workflow also supports manual dispatch: `dry_run` defaults to
+`true` for validation only. Set it to `false` on `main` for publication or
+recovery; publishing dispatches from other refs are rejected. The workflow
+suppresses Checkov `CKV_GHA_7` with a written justification because this boolean
+controls publication, not build inputs or commands.
+
+Both release workflows use `scripts/publish-npm.ts` from the package's working
+directory. It runs `npm publish --access public` with the existing trusted
+publishing configuration, then verifies that the exact package name and version
+are publicly readable from `registry.npmjs.org`. Successful upload alone does
+not complete the step. The root workflow waits before MCP registry registration;
+both workflows wait before creating their GitHub release.
+Both workflows create a new release tag at their checked-out commit before npm
+publication. A rerun can therefore finish a partial release without assigning
+its published version to a later `main` commit. If npm has a version but the
+matching tag is missing, the workflow stops for provenance recovery rather than
+creating a new tag. Before npm publication, a rerun also stops if an existing
+tag points away from the checked-out commit.
+
+npm scans new uploads before making them available. Its
+[publish-time scanning announcement](https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/)
+describes typical delays around five minutes and sometimes 15 minutes or more,
+without a timing guarantee. This caused the `githits` 0.12.1 and 0.14.0 release
+failures: npm accepted the uploads, but MCP registry validation still received
+404 for those versions.
+
+The shared script checks availability every 15 seconds after a 404, for at most
+20 minutes after upload. Each HTTP request has a timeout of at most 15 seconds,
+bounded by the remaining deadline. The check uses public metadata without npm
+credentials. Unexpected HTTP statuses, transport errors, malformed metadata,
+and mismatched identities fail immediately. Each workflow allows 25 minutes for
+the combined upload and availability step.
+
+Existing public versions continue to skip the upload. An immediate rerun while
+scanning is pending can instead receive npm E409 with `Cannot publish over
+previously staged version` for the exact version. The script recognizes that
+specific response and checks availability without retrying the upload. It does
+not suppress unrelated publishing errors or count a staged upload as completion.
+Recognition uses the modern npm error output shipped with the pinned Node
+runtime; incompatible output changes fail the release rather than silently
+accepting the upload.
+
+If the availability deadline expires, downstream publication stays stopped.
+Inspect npm's package status and any maintainer notifications: a public 404
+cannot distinguish pending scanning, manual review, or a blocked package. Do not
+bump the version or republish repeatedly to bypass this state. Once npm makes
+the version public, rerun the failed release job to finish the remaining
+artifacts. A rerun that publishes registry entries or creates tags/releases
+still requires the normal explicit human authorization.
+
+The availability deadline is an operational bound, not a promise that npm will
+finish scanning within 20 minutes. Unit tests simulate pending uploads and error
+states with injected HTTP, process, and clock dependencies; workflow contract
+tests verify both downstream release paths depend on publication completion.

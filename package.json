@@ -1,0 +1,135 @@
+{
+  "name": "githits",
+  "description": "The infrastructure layer connecting agents to the open-source ecosystem",
+  "version": "0.36.0",
+  "mcpName": "com.githits/githits",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "files": [
+    "dist",
+    "LICENSE",
+    ".plugin",
+    ".claude-plugin",
+    ".codex-plugin",
+    ".cursor-plugin",
+    ".mcp.json",
+    "mcp.json",
+    "server.json",
+    "gemini-extension.json",
+    "githits-icon.svg",
+    "plugin.json",
+    "mcp_config.json",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "skills"
+  ],
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "githits": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && bunup --no-clean && bun -e \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
+    "dev": "bun run ./src/cli.ts",
+    "inspector": "npx @modelcontextprotocol/inspector bun run dev mcp",
+    "smoke:cli": "bun run scripts/cli-smoke.ts",
+    "smoke:cli:built": "bun run scripts/cli-smoke.ts --mode unauthenticated --cli-entry dist/cli.js",
+    "smoke:mcp": "bun run scripts/mcp-smoke.ts",
+    "smoke:mcp:built": "bun run scripts/mcp-smoke.ts --mode registration --cli-entry dist/cli.js",
+    "smoke:proxy-node": "bun run scripts/run-proxy-node-smoke.ts",
+    "validate:packages": "bun run scripts/validate-public-packages.ts",
+    "validate:packages:mcp-publish": "bun run scripts/validate-public-packages.ts --mcp-publish-dry-run",
+    "plugins:generate": "bun run scripts/generate-plugin-assets.ts",
+    "plugins:check": "bun run scripts/generate-plugin-assets.ts --check",
+    "audit:pkg-ecosystems": "bun run scripts/pkg-ecosystem-audit.ts",
+    "bench:list-text": "bun run scripts/list-text-size-benchmark.ts",
+    "agent:e2e": "bun run scripts/agent-eval.ts",
+    "agent:e2e:suite": "bun run scripts/agent-eval-suite.ts",
+    "agent:e2e:report": "bun run scripts/agent-eval-report.ts",
+    "agent:e2e:braintrust": "bun run scripts/agent-eval-braintrust.ts",
+    "agent:e2e:ci-report": "bun run scripts/agent-eval-ci-report.ts",
+    "agent:session": "bun run scripts/agent-session.ts",
+    "eval": "bun run eval/run.ts",
+    "test": "bun test",
+    "typecheck": "tsc",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "check:gitleaks": "sh scripts/check-gitleaks.sh",
+    "prepare": "husky",
+    "prepack": "bun run plugins:check",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "githits",
+    "context layer",
+    "public open-source",
+    "open-source code",
+    "code search",
+    "package documentation",
+    "documentation search",
+    "package metadata",
+    "vulnerabilities",
+    "changelogs",
+    "dependency graphs",
+    "upgrade evidence",
+    "implementation examples"
+  ],
+  "author": "GitHits",
+  "license": "Apache-2.0",
+  "homepage": "https://docs.githits.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/githits-com/githits-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/githits-com/githits-cli/issues"
+  },
+  "engines": {
+    "node": "^20.18.1 || >=22.13.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@inquirer/checkbox": "5.2.6",
+    "@inquirer/confirm": "6.3.3",
+    "@inquirer/core": "12.0.4",
+    "@inquirer/select": "5.2.6",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@napi-rs/keyring": "^2.1.0",
+    "commander": "14.0.3",
+    "fast-string-width": "^3.0.2",
+    "jsonc-parser": "^3.3.1",
+    "open": "^11.0.4",
+    "semver": "7.8.5",
+    "smol-toml": "^1.9.0",
+    "undici": "7.30.0",
+    "ws": "^8.22.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/bun": "1.4.2",
+    "@types/semver": "^7.8.0",
+    "@types/ws": "^8.18.2",
+    "braintrust": "3.37.0",
+    "bunup": "^0.16.32",
+    "husky": "^9.1.7",
+    "lint-staged": "17.5.1",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,135 @@
+import type {
+  AgenticAskRateLimitScope,
+  AuthenticationErrorSource,
+  CodeDiffPackageInfo,
+  CodeDiffRefResolution,
+  DiscoveryIndexingEstimate,
+  IndexingDurationEstimate,
+  RecoveryRef,
+  TargetResolution,
+} from "@githits/core-internal";
+
+export type MappedErrorCode =
+  | "NOT_FOUND"
+  | "DOCUMENTATION_SECTION_UNRESOLVED"
+  | "FILE_NOT_FOUND"
+  | "FILE_PATH_EXCLUDED"
+  | "SOURCE_FILE_INVENTORY_UNKNOWN"
+  | "SOURCE_INVENTORY_SCOPE_UNAVAILABLE"
+  | "LIST_UNSUPPORTED_API"
+  | "LIST_PAGE_TOO_LARGE"
+  | "REF_NOT_FOUND"
+  | "VERSION_NOT_FOUND"
+  | "INDEXING"
+  | "UNRESOLVABLE"
+  | "ACCESS_DENIED"
+  | "AUTH_REQUIRED"
+  | "TERMS_ACCEPTANCE_REQUIRED"
+  | "NETWORK"
+  | "INVALID_ARGUMENT"
+  | "RAW_DIFF_UNAVAILABLE"
+  | "BACKEND_ERROR"
+  | "TIMEOUT"
+  | "RATE_LIMITED"
+  | "PROTOCOL_ERROR"
+  | "UPDATE_REQUIRED"
+  | "UNKNOWN";
+
+export interface MappedErrorDetails {
+  /** Bounded public unified-grep preparation issues, retaining backend keys. */
+  targetIssues?: Record<string, unknown>[];
+  availablePackageVersions?: string[];
+  latestVersion?: string;
+  inputPath?: (string | number)[];
+  targetIndex?: number;
+  targetCount?: number;
+  action?: string;
+  hint?: string;
+  availableVersions?: RecoveryRef[];
+  availableRefs?: RecoveryRef[];
+  suggestedRefs?: RecoveryRef[];
+  targetResolution?: TargetResolution;
+  indexingRef?: string;
+  indexingEstimate?: IndexingDurationEstimate;
+  indexingEstimates?: DiscoveryIndexingEstimate[];
+  status?: number;
+  retryAfterSeconds?: number;
+  /**
+   * Research rate-limit scope: `request` is the short-term limit (retry after
+   * `retryAfterSeconds`); `daily` is the daily limit, which resets at
+   * 00:00 UTC and is not retryable before then.
+   */
+  rateLimitScope?: AgenticAskRateLimitScope;
+  timeoutMs?: number;
+  graphqlCode?: string;
+  /**
+   * Populated on `VERSION_NOT_FOUND` from the backend's
+   * `extensions.latest_indexed` — the newest version that is
+   * actually indexed, suitable as the first recovery suggestion.
+   */
+  latestIndexed?: string;
+  /** The version the caller asked for (for `VERSION_NOT_FOUND`). */
+  requestedVersion?: string;
+  /** Fully-qualified package identifier (for `VERSION_NOT_FOUND`). */
+  package?: string;
+  /** Repository URL for ref recovery or a list scope alternative. */
+  repoUrl?: string;
+  /** Served commit SHA accompanying a repository-scope alternative. */
+  commitSha?: string;
+  /** Git ref the caller asked for (for `REF_NOT_FOUND`). */
+  requestedRef?: string;
+  /** The exact file path involved in a path-authority error. */
+  filePath?: string;
+  /** Why an exact path was omitted from the indexed source inventory. */
+  exclusionReason?: string;
+  /** Installed CLI version when an update is required. */
+  currentVersion?: string;
+  /** Suggested package-manager command when an update is required. */
+  updateCommand?: string;
+  /** Failure/update explanation; Ask uses a bounded resolver reason when supplied. */
+  reason?: string;
+  /** Open-ended Ask diagnostic identifier, separate from its optional reason. */
+  targetErrorCode?: string;
+  /** Whether auth failed before making a request or after backend rejection. */
+  authSource?: AuthenticationErrorSource;
+  /** Canonical legal document URL for terms-acceptance remediation. */
+  termsUrl?: string;
+  /** Authenticated web UI where the user can accept the current terms. */
+  acceptanceUrl?: string;
+  /** CodeDiff comparison side involved in a bounded resolver failure. */
+  side?: string;
+  /** Published package versions supplied for CodeDiff recovery. */
+  publishedVersions?: string[];
+  publishedVersionsTruncated?: boolean;
+  /** Canonical registry supplied by a CodeDiff resolver failure. */
+  registry?: string;
+  /** Retry delay retained at millisecond precision for CodeDiff. */
+  retryAfterMs?: number;
+  /** Bounded raw-diff failure stage and limit identifier. */
+  stage?: string;
+  limitKind?: string;
+  /** Git ref supplied by a CodeDiff resolver failure. */
+  gitRef?: string;
+  /** Ref classifications retained for ambiguous-ref recovery. */
+  refKinds?: string[];
+  /** Immutable root identity retained when only the raw field failed. */
+  codeDiffResolution?: {
+    package?: CodeDiffPackageInfo;
+    from: CodeDiffRefResolution;
+    to: CodeDiffRefResolution;
+  };
+}
+
+export interface MappedError {
+  code: MappedErrorCode;
+  message: string;
+  /**
+   * Whether the caller can retry the same request successfully.
+   * Sourced from the backend's `extensions.retryable` when present
+   * (April 2026 contract); otherwise a per-code default. Agents and
+   * automation use this directly without maintaining their own
+   * retryability tables.
+   */
+  retryable?: boolean;
+  details?: MappedErrorDetails;
+}

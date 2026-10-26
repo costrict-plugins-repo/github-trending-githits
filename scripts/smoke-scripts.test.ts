@@ -1,0 +1,1002 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  assertMcpResolveText,
+  EXPECTED_MCP_TOOLS,
+} from "@githits/mcp/smoke-test";
+import {
+  assertCliResolveText,
+  assertRootHelpStructure,
+  assertSearchTerminalText,
+  assertTransitiveVulnerabilityText,
+  buildMcpParityCommand,
+  EXPECTED_STABLE_TOP_LEVEL_COMMANDS,
+  EXPECTED_TOP_LEVEL_COMMANDS,
+  formatCliLiveCohortSummary,
+  JSON_PARITY_FIXTURES,
+  parseCliSmokeArgs,
+  parseRootHelpCommands,
+} from "./cli-smoke.ts";
+import { parseMcpCallArgs } from "./mcp-call.ts";
+import { parseMcpSmokeArgs, STABLE_MCP_SMOKE_CONFIG } from "./mcp-smoke.ts";
+import { toStdioLaunch } from "./smoke-launch-target.ts";
+
+describe("CLI search smoke contract", () => {
+  const valid = `No results available yet.
+
+- npm:n8n
+  indexing: code, repository docs; available: n8n.io docs (1,480 pages; capped);
+  indexed: versions 2.26.9, 2.26.5, 2.23.2 +2, refs HEAD, master
+
+Follow-up:
+  githits search-status smoke-ref --wait 20000`;
+  const completedWithTargetReadiness = `No results found.
+
+- npm:express@4.18.2
+  searched: repository docs
+
+Follow-up:
+  Try: shorten or broaden query; use githits grep.`;
+  const completed = `Found 1 code result.
+
+[1] npm:express@5.2.1 lib/application.js [repo code]`;
+  const completedDocs = `Found 1 documentation result.
+
+[1] page-1 [docs page] npm:express - docs.example.com/getting-started - Getting started | API - section`;
+
+  it("rejects a fractional wait in a native status action", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        valid.replace("--wait 20000", "--wait 20.5"),
+        "search",
+      ),
+    ).toThrow("invalid native status action");
+  });
+
+  it("accepts outcome-first text with CLI-native actions", () => {
+    expect(valid.split("\n")[0]).toBe("No results available yet.");
+    expect(valid).toContain("- npm:n8n");
+    expect(valid).toContain("  indexing: code, repository docs; available:");
+    expect(valid).not.toContain("Search smoke-ref");
+    expect(valid).toContain(
+      "Follow-up:\n  githits search-status smoke-ref --wait 20000",
+    );
+    expect(() => assertSearchTerminalText(valid, "search")).not.toThrow();
+    expect(() =>
+      assertSearchTerminalText(
+        "No results found.\nFollow-up:\n  Try: shorten or broaden query; use githits grep.",
+        "search",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertSearchTerminalText(
+        "No result snapshot available.\nFollow-up:\n  Search again later.",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    [`Warning: indexing\n${valid}`, "non-outcome text"],
+    [`${completed}\nstatus: indexing`, "lifecycle status"],
+    [
+      completed.replace(" lib/application.js [repo code]", ""),
+      "missing result follow-up",
+    ],
+    ["Found 1 code result.", "missing result follow-up"],
+  ])("rejects invalid search text", (text, message) => {
+    expect(() => assertSearchTerminalText(text, "search")).toThrow(message);
+  });
+
+  it("accepts completed hit text without a target group", () => {
+    expect(() => assertSearchTerminalText(completed, "search")).not.toThrow();
+  });
+
+  it("accepts unified repository headers with focused or equal evidence", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 code result.\n\n" +
+          "[1] github:owner/repo@abc123 packages/pkg/src/compact.ts:920-930 [repo code] - compact (function at lines 858-964)\n" +
+          "  // Merge into single summary",
+        "search",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 symbol result.\n\n" +
+          "[1] github:owner/repo@abc123 packages/pkg/src/compact.ts:858-964 [repo symbol] - compact (function)",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts structural search evidence text", () => {
+    const structuralText =
+      "Found 1 code result.\n\n" +
+      "[1] npm:express@4.18.2 lib/client.ts:142-145 [repo code]\n" +
+      "  - class Client | lines 20-220\n" +
+      "    - method Client.send | lines 120-165\n" +
+      "  ... lines omitted before\n" +
+      "  142 |     const indexingRef = request;\n" +
+      "> 143 | ...    if (response.status === 429) {...\n" +
+      "  144 |       return retry(request);\n" +
+      "  145 | \n" +
+      "  ... lines omitted after";
+    expect(() =>
+      assertSearchTerminalText(structuralText, "search"),
+    ).not.toThrow();
+  });
+
+  it("accepts compact path matches but rejects their arbitrary numbered snippets", () => {
+    const path =
+      "Found 1 code result.\n\n[1] npm:express@4.21.2 examples/route-middleware/index.js [repo code, path match]";
+    expect(() => assertSearchTerminalText(path, "search")).not.toThrow();
+    expect(() =>
+      assertSearchTerminalText(
+        `${path}\n  50 | function andRestrictTo(role) {`,
+        "search",
+      ),
+    ).toThrow("path-only hit contains an arbitrary source snippet");
+    expect(() =>
+      assertSearchTerminalText(
+        path +
+          "\n\n[2] npm:express@4.21.2 lib/router/index.js:303-307 [repo code]\n> 305 | // route",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts completed documentation hit text without a target group", () => {
+    expect(() =>
+      assertSearchTerminalText(completedDocs, "search"),
+    ).not.toThrow();
+  });
+
+  it("accepts documentation hits that disclose a missing source URL", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 documentation result.\n\n[1] page-1 [docs page] npm:express - source URL unavailable - README",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts wrapped documentation and repository title tails", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 code result and 1 documentation result.\n\n" +
+          "[1] page-1 [docs page] npm:express - docs.example.com/getting-started -\n" +
+          "  A long documentation title\n\n" +
+          "[2] npm:express@5.2.1 lib/application.js [repo code] -\n" +
+          "  A long repository title",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts a wrapped repository title without a documentation hit", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 code result.\n\n" +
+          "[1] npm:express@5.2.1 lib/application.js [repo code] -\n" +
+          "  A long repository title",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n  This payload mentions githits code read but has no locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n  githits code read 'npm:express@5.2.1' --lines 1-10",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code]\n  ordinary title\n  githits code read 'npm:express@5.2.1' 'index.js'",
+    ],
+    [
+      "Found 1 code result.\n\n[1] page-1 [docs page] npm:express - README\n" +
+        "  githits docs read --lines 1-10",
+    ],
+    [
+      "Found 1 code result.\n\n[1] page-1 [docs page] npm:express -\n" +
+        "  README without a source locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] page ID unavailable [docs page] npm:express - docs.example.com/readme -\n" +
+        "  Wrapped title without a page locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 location unavailable [repo code] -\n" +
+        "  Wrapped title without a locator",
+    ],
+    [
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 lib/application.js [repo code] -",
+    ],
+    [
+      "Found 1 code result.\n\n[1] compact - function defined at packages/pkg/src/compact.ts:858-964",
+    ],
+    [
+      "Found 1 code result.\n\n" +
+        "[1] compact - function defined at packages/pkg/src/compact.ts:858-964\n" +
+        "  github:owner/repo@abc123 evidence at 920-930 [repo code]",
+    ],
+    [
+      "Found 1 code result.\n\n[1] compact - function defined at location unavailable\n" +
+        "  github:owner/repo@abc123 evidence at 920-930 [repo code]",
+    ],
+  ])("rejects incomplete or prose-only hit follow-ups", (text) => {
+    expect(() => assertSearchTerminalText(text, "search")).toThrow(
+      "missing result follow-up or next action",
+    );
+  });
+
+  it.each([
+    [
+      "Fix",
+      "No results found.\n\n- npm:missing@1.0.0\n  Fix: verify the package coordinate.",
+    ],
+    [
+      "Try",
+      "No results found.\n\n- npm:missing latest\n  Try: npm:missing@1.0.0",
+    ],
+  ])(
+    "accepts target-local %s recovery without a hit or Next",
+    (_kind, text) => {
+      expect(() => assertSearchTerminalText(text, "search")).not.toThrow();
+    },
+  );
+
+  it("accepts terminal target rows with a global rerun action", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "No results found.\nSearch failed.\n\n" +
+          "- npm:express@4.18.2\n" +
+          "  searched: code; not found: symbols\n\n" +
+          "Follow-up:\n  Search again later.",
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    "ready",
+    "pending",
+    "provisional",
+    "older snapshot",
+    "package not found: code",
+  ])("recognizes grouped target state detail: %s", (detail) => {
+    expect(() =>
+      assertSearchTerminalText(
+        `No results found.\n\n- npm:express@4.18.2\n  ${detail}\n\nFollow-up:
+  Search again later.`,
+        "search",
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    "ready",
+    "pending",
+    "provisional",
+    "older snapshot",
+    "package not found: code",
+  ])("rejects ungrouped target state detail: %s", (detail) => {
+    expect(() =>
+      assertSearchTerminalText(
+        `No results found.\n  ${detail}\n\nFollow-up:
+  Search again later.`,
+        "search",
+      ),
+    ).toThrow("readiness details must be grouped under a target");
+  });
+
+  it("accepts completed target readiness without a search session", () => {
+    expect(() =>
+      assertSearchTerminalText(completedWithTargetReadiness, "search"),
+    ).not.toThrow();
+  });
+
+  it("requires using details to remain grouped under a target", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        valid.replace(
+          "- npm:n8n\n  indexing: code, repository docs; available: n8n.io docs (1,480 pages;",
+          "  using: 2.26.9 while 2.36.7 indexes",
+        ),
+        "search",
+      ),
+    ).toThrow("readiness details must be grouped under a target");
+  });
+
+  it("rejects a separate search session summary", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        `${valid}\nSearch another-ref | 0/1 target ready`,
+        "search",
+      ),
+    ).toThrow("separate Search <ref> session summary");
+  });
+
+  it.each([
+    ["Ready:", "legacy flat section Ready:"],
+    ["Waiting:", "legacy flat section Waiting:"],
+    [
+      "Available but not searched:",
+      "legacy flat section Available but not searched:",
+    ],
+    ["Indexed alternatives:", "legacy flat section Indexed alternatives:"],
+    ["Evidence may change.", "vague evidence policy prose"],
+    ["Do not repeat search.", "repeat policy prose"],
+    ["Do not poll this session.", "poll policy prose"],
+  ])("rejects superseded top-level search text %s", (line, message) => {
+    expect(() =>
+      assertSearchTerminalText(`${valid}\n${line}`, "search"),
+    ).toThrow(message);
+  });
+
+  it("rejects duplicate lifecycle, status, and Next lines", () => {
+    expect(() =>
+      assertSearchTerminalText(`${valid}\nNo results available yet.`, "search"),
+    ).toThrow("duplicate outcome lines");
+    expect(() =>
+      assertSearchTerminalText(`${valid}\nstatus: indexing`, "search"),
+    ).toThrow("duplicated lifecycle status line");
+    expect(() =>
+      assertSearchTerminalText(
+        `${valid}\nFollow-up:
+  githits search-status other --wait 20000`,
+        "search",
+      ),
+    ).toThrow("duplicated footer section");
+  });
+
+  it("rejects target diagnostics and missing target grouping", () => {
+    expect(() =>
+      assertSearchTerminalText(`${valid}\nsearchRef=leaked`, "search"),
+    ).toThrow("leaked searchRef detail");
+    expect(() =>
+      assertSearchTerminalText(`${valid}\nindexingRef=leaked`, "search"),
+    ).toThrow("leaked indexingRef");
+    expect(() =>
+      assertSearchTerminalText(
+        valid.replace(
+          "  indexing: code, repository docs; available: n8n.io docs (1,480 pages;",
+          "  available: versions 2.36.7",
+        ),
+        "search",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertSearchTerminalText(valid.replace("- npm:n8n\n", ""), "search"),
+    ).toThrow("readiness details must be grouped under a target");
+  });
+
+  it.each([
+    ["status: payload", "duplicated lifecycle status line"],
+    ["searchRef=payload", "leaked searchRef detail"],
+    ["indexingRef payload", "leaked indexingRef"],
+    ["search_ref=payload", "MCP search_ref syntax leaked into CLI output"],
+  ])("rejects target-detail diagnostic %s", (diagnostic, message) => {
+    const readinessLine =
+      "  indexing: code, repository docs; available: n8n.io docs (1,480 pages;";
+    const targetDetail = valid.replace(readinessLine, `  ${diagnostic}`);
+
+    expect(() => assertSearchTerminalText(targetDetail, "search")).toThrow(
+      message,
+    );
+  });
+
+  it("ignores formatter-like words and diagnostics in indented hit content", () => {
+    const hitText = `Found 1 code result.
+
+[1] npm:express@5.2.1 lib/application.js [repo code]
+  Ready: payload text
+  Waiting: payload text
+  Available but not searched: payload text
+  Indexed alternatives: payload text
+  Evidence may change.
+  Do not repeat this payload.
+  Do not poll this payload.
+  Next: payload text
+  Indexing: payload text
+  status: payload text
+  searchRef=payload text
+  indexingRef payload text
+  search_ref=payload text`;
+
+    expect(() => assertSearchTerminalText(hitText, "search")).not.toThrow();
+  });
+
+  it("keeps multiline hit-body diagnostics opaque after a blank line", () => {
+    const hitText =
+      "Found 1 code result.\n\n[1] npm:express@5.2.1 index.js [repo code]\n" +
+      "  First summary paragraph.\n\n" +
+      "  status: payload text\n" +
+      "  searchRef=payload text\n" +
+      "  indexingRef payload text\n" +
+      "  search_ref=payload text";
+
+    expect(() => assertSearchTerminalText(hitText, "search")).not.toThrow();
+  });
+});
+
+describe("search footer structure", () => {
+  it("rejects a status command without its Follow-up section", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "No results available yet.\n  githits search-status ref --wait 30000",
+        "search",
+      ),
+    ).toThrow("status action must be in Follow-up");
+  });
+  it("rejects out-of-order footer sections", () => {
+    expect(() =>
+      assertSearchTerminalText(
+        "Found 1 code result.\n\nMore results:\n  --offset 1\n\nRead:\n  githits read target path",
+        "search",
+      ),
+    ).toThrow("footer sections out of order");
+  });
+});
+
+describe("CLI transitive vulnerability smoke contract", () => {
+  it("accepts positive results and composite MALWARE headlines", () => {
+    const output = `Resolved dependencies
+2 affected advisory occurrences in 2 dependency packages; 2 resolved package versions checked.
+  MALWARE | critical  body-parser@1.19.0  GHSA-malware
+  high  debug@2.6.9  [non-affecting]  GHSA-history`;
+
+    expect(() =>
+      assertTransitiveVulnerabilityText(output, "positive transitive audit"),
+    ).not.toThrow();
+  });
+
+  it("accepts the clean zero-result summary", () => {
+    const output =
+      "Resolved dependencies\nNo affected advisory occurrences found; 2 resolved package versions checked.";
+
+    expect(() =>
+      assertTransitiveVulnerabilityText(output, "clean transitive audit"),
+    ).not.toThrow();
+  });
+
+  it("accepts clean non-affecting and all-scope summaries with wrapping", () => {
+    const historical =
+      "Resolved dependencies\nNo non-affecting advisory occurrences found; 1 resolved package version checked.";
+    const allScope =
+      "Resolved dependencies\nNo advisory occurrences found. 2 resolved package\n  versions checked.";
+
+    expect(() =>
+      assertTransitiveVulnerabilityText(
+        historical,
+        "historical transitive audit",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertTransitiveVulnerabilityText(allScope, "all-scope transitive audit"),
+    ).not.toThrow();
+  });
+
+  it("rejects an unrecognized advisory summary", () => {
+    const output =
+      "Resolved dependencies\nNo selected advisory rows; 2 resolved package versions checked.";
+
+    expect(() =>
+      assertTransitiveVulnerabilityText(
+        output,
+        "unrecognized transitive audit",
+      ),
+    ).toThrow("missing recognized advisory occurrence summary");
+  });
+});
+
+describe("smoke script options", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses CLI unauthenticated mode and a built target in either order", () => {
+    const entry = createEntry("built output/cli.js");
+
+    expect(
+      parseCliSmokeArgs(["--mode", "unauthenticated", "--cli-entry", entry]),
+    ).toMatchObject({ mode: "unauthenticated", target: { kind: "built" } });
+    expect(
+      parseCliSmokeArgs(["--cli-entry", entry, "--mode", "unauthenticated"])
+        .target.argv,
+    ).toEqual(["node", entry]);
+  });
+
+  it("rejects unknown and duplicate CLI smoke modes", () => {
+    expect(() => parseCliSmokeArgs(["--wat"])).toThrow(
+      "Unknown CLI smoke option",
+    );
+    expect(() =>
+      parseCliSmokeArgs(["--mode", "live", "--mode", "unauthenticated"]),
+    ).toThrow("--mode may only be specified once");
+  });
+
+  it("parses MCP registration mode with a built target", () => {
+    const entry = createEntry("dist/cli.js");
+    const options = parseMcpSmokeArgs([
+      "--mode",
+      "registration",
+      "--cli-entry",
+      entry,
+    ]);
+
+    expect(options.mode).toBe("registration");
+    expect(toStdioLaunch(options.target, ["mcp", "start"])).toEqual({
+      command: "node",
+      args: [entry, "mcp", "start"],
+    });
+    expect(
+      toStdioLaunch(options.target, ["mcp", "start", "--experimental-tools"]),
+    ).toEqual({
+      command: "node",
+      args: [entry, "mcp", "start", "--experimental-tools"],
+    });
+  });
+
+  it("uses an absolute parity script and forwards the absolute built target", () => {
+    const entry = createEntry("path with spaces/cli.js");
+    const target = parseCliSmokeArgs(["--cli-entry", entry]).target;
+    const command = buildMcpParityCommand(target, "pkg_info", {
+      target: "npm:express",
+    });
+    const scriptArgs = command.slice(3);
+
+    expect(command).toEqual([
+      "bun",
+      "run",
+      fileURLToPath(new URL("./mcp-call.ts", import.meta.url)),
+      "--cli-entry",
+      entry,
+      "pkg_info",
+      '{"target":"npm:express"}',
+    ]);
+    const nested = parseMcpCallArgs(scriptArgs);
+    expect(toStdioLaunch(nested.target, ["mcp", "start"])).toEqual({
+      command: "node",
+      args: [entry, "mcp", "start"],
+    });
+    expect(nested.toolName).toBe("pkg_info");
+  });
+
+  it("keeps curated CLI parity fixtures on compact package targets", () => {
+    const compactPackageFixtureNames = new Set([
+      "list_package",
+      "pkg_info",
+      "pkg_vulns",
+      "pkg_deps",
+      "pkg_deps_issues",
+    ]);
+    const compactPackageFixtures = JSON_PARITY_FIXTURES.filter(({ name }) =>
+      compactPackageFixtureNames.has(name),
+    );
+    expect(
+      new Set(compactPackageFixtures.map(({ mcpTool }) => mcpTool)),
+    ).toEqual(new Set(["list", "pkg_info", "pkg_vulns", "pkg_deps"]));
+
+    for (const fixture of compactPackageFixtures) {
+      expect(typeof fixture.mcpArgs.target, `${fixture.name} target`).toBe(
+        "string",
+      );
+      expect(fixture.mcpArgs, `${fixture.name} registry`).not.toHaveProperty(
+        "registry",
+      );
+      expect(
+        fixture.mcpArgs,
+        `${fixture.name} package_name`,
+      ).not.toHaveProperty("package_name");
+      expect(fixture.mcpArgs, `${fixture.name} version`).not.toHaveProperty(
+        "version",
+      );
+    }
+
+    expect(compactPackageFixtures).toEqual([
+      {
+        name: "pkg_info",
+        cliArgs: ["pkg", "info", "npm:express", "--json"],
+        mcpTool: "pkg_info",
+        mcpArgs: { target: "npm:express", format: "json" },
+      },
+      {
+        name: "pkg_deps",
+        cliArgs: ["pkg", "deps", "npm:express", "--json"],
+        mcpTool: "pkg_deps",
+        mcpArgs: { target: "npm:express", format: "json" },
+      },
+      {
+        name: "pkg_deps_issues",
+        cliArgs: ["pkg", "deps", "npm:express", "--issues", "--json"],
+        mcpTool: "pkg_deps",
+        mcpArgs: {
+          target: "npm:express",
+          include_issues: true,
+          format: "json",
+        },
+      },
+      {
+        name: "pkg_vulns",
+        cliArgs: ["pkg", "vulns", "npm:express", "--json"],
+        mcpTool: "pkg_vulns",
+        mcpArgs: { target: "npm:express", format: "json" },
+      },
+      {
+        name: "list_package",
+        cliArgs: [
+          "list",
+          "npm:express@5.2.1",
+          "package.json",
+          "--limit",
+          "1",
+          "--json",
+        ],
+        mcpTool: "list",
+        mcpArgs: {
+          target: "npm:express@5.2.1",
+          paths: ["package.json"],
+          limit: 1,
+          format: "json",
+        },
+      },
+    ]);
+
+    expect(
+      JSON_PARITY_FIXTURES.find(({ name }) => name === "list_site"),
+    ).toEqual({
+      name: "list_site",
+      cliArgs: [
+        "list",
+        "site:expressjs.com",
+        "en/resources/",
+        "--limit",
+        "20",
+        "--json",
+      ],
+      mcpTool: "list",
+      mcpArgs: {
+        target: "site:expressjs.com",
+        paths: ["en/resources/"],
+        limit: 20,
+        format: "json",
+      },
+    });
+
+    expect(
+      JSON_PARITY_FIXTURES.find(({ name }) => name === "pkg_changelog")
+        ?.mcpArgs,
+    ).toEqual({
+      target: "npm:express",
+      limit: 1,
+      format: "json",
+    });
+    expect(
+      JSON_PARITY_FIXTURES.find(({ name }) => name === "pkg_upgrade_review")
+        ?.mcpArgs,
+    ).toEqual({
+      registry: "npm",
+      package_name: "express",
+      current_version: "5.0.0",
+      target_version: "5.2.1",
+      skip_transitive_security: true,
+      format: "json",
+    });
+  });
+
+  it("parses the default mcp-call target with an absolute source CLI entry", () => {
+    const options = parseMcpCallArgs(["get_example", '{"query":"go"}']);
+
+    expect(toStdioLaunch(options.target, ["mcp", "start"])).toEqual({
+      command: "bun",
+      args: [
+        "run",
+        fileURLToPath(new URL("../src/cli.ts", import.meta.url)),
+        "mcp",
+        "start",
+      ],
+    });
+    expect(options.args).toEqual({ query: "go" });
+  });
+
+  it("rejects invalid mcp-call positional and JSON arguments", () => {
+    expect(() => parseMcpCallArgs(["pkg_info"])).toThrow("usage:");
+    expect(() => parseMcpCallArgs(["pkg_info", "{}", "extra"])).toThrow(
+      "usage:",
+    );
+    expect(() => parseMcpCallArgs(["pkg_info", "[]"])).toThrow(
+      "must be a JSON object",
+    );
+  });
+
+  function createEntry(relativePath: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "githits smoke script "));
+    tempDirs.push(dir);
+    const entry = resolve(dir, relativePath);
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "export {};\n");
+    return entry;
+  }
+});
+
+describe("CLI root help smoke contract", () => {
+  it("keeps the stable command cohort exact", () => {
+    expect(EXPECTED_TOP_LEVEL_COMMANDS).toEqual(
+      EXPECTED_STABLE_TOP_LEVEL_COMMANDS,
+    );
+    expect(EXPECTED_STABLE_TOP_LEVEL_COMMANDS).toContain("uninstall");
+    expect(EXPECTED_STABLE_TOP_LEVEL_COMMANDS).toContain("research");
+    expect(EXPECTED_STABLE_TOP_LEVEL_COMMANDS).toContain("resolve");
+  });
+
+  it("accepts the complete product command set and ignores generated help", () => {
+    const help = rootHelpFixture(EXPECTED_TOP_LEVEL_COMMANDS);
+
+    expect(parseRootHelpCommands(help)).toEqual([
+      ...EXPECTED_TOP_LEVEL_COMMANDS,
+    ]);
+    expect(() => assertRootHelpStructure(help)).not.toThrow();
+  });
+
+  it("fails when a command disappears even if prose still mentions it", () => {
+    const commands = EXPECTED_TOP_LEVEL_COMMANDS.filter(
+      (command) => command !== "search",
+    );
+    const help = `${rootHelpFixture(commands)}\nGetting started: use githits search.`;
+
+    expect(() => assertRootHelpStructure(help)).toThrow("missing: search");
+  });
+
+  it("fails when an unexpected product command appears", () => {
+    const help = rootHelpFixture([
+      ...EXPECTED_TOP_LEVEL_COMMANDS,
+      "unexpected-command",
+    ]);
+
+    expect(() => assertRootHelpStructure(help)).toThrow(
+      "unexpected: unexpected-command",
+    );
+  });
+
+  function rootHelpFixture(commands: readonly string[]): string {
+    const rows = commands.map(
+      (command) => `  ${command} [options]  ${command} description`,
+    );
+    return [
+      "Usage: githits [options] [command]",
+      "",
+      "Commands:",
+      ...rows,
+      "  help [command]  display help for command",
+      "",
+      "Examples:",
+      "  githits example express",
+    ].join("\n");
+  }
+});
+
+describe("MCP smoke cohorts", () => {
+  it("keeps research in the stable MCP inventory without its alias", () => {
+    expect(EXPECTED_MCP_TOOLS).toContain("research");
+    expect(EXPECTED_MCP_TOOLS).not.toContain("ask");
+  });
+
+  it("pins every stable cohort to an explicit disabled experimental config", () => {
+    expect(STABLE_MCP_SMOKE_CONFIG).toBe("[experimental]\ntools = false\n");
+  });
+});
+
+describe("resolve smoke guidance", () => {
+  const cliMixed = `Targets:
+  1. npm:express [exact] · package
+     Related targets:
+       npm:express-lookalike · related package
+         Warning: Malicious content affects the latest version. Do not use this target.
+
+Next: githits search '<query>' --in 'npm:express'
+`;
+  const mcpMixed = `Best match: npm:express [exact; package].
+Targets:
+  1. npm:express [exact; package]
+     Related targets:
+       npm:express-lookalike [related; package]
+         Warning: Malicious content affects the latest version. Do not use this target.
+Next: pass the canonical target "npm:express" to the next MCP tool.
+`;
+
+  it("allows a verified best action when only an alternative is warned", () => {
+    expect(() => assertCliResolveText(cliMixed)).not.toThrow();
+    expect(() => assertMcpResolveText(mcpMixed)).not.toThrow();
+  });
+
+  it("accepts a warning-free direct best nested under Related targets", () => {
+    const nestedBest = `Targets:
+  1. npm:project [exact] · package
+     Related targets:
+       github:owner/project [high] · repository
+
+Next: githits search '<query>' --in 'github:owner/project'
+`;
+
+    expect(() => assertCliResolveText(nestedBest)).not.toThrow();
+    expect(() =>
+      assertCliResolveText(
+        nestedBest.replace(
+          "       github:owner/project [high] · repository\n",
+          "       github:owner/project [high] · repository\n         Warning: Malicious content affects this target.\n",
+        ),
+      ),
+    ).toThrow("without a warning");
+
+    const nestedMcpBest = `Best match: github:owner/project [high; repository].
+Targets:
+  1. npm:express [exact; package]
+     Related targets:
+       github:owner/project [high; repository]
+Next: pass the canonical target "github:owner/project" to the next MCP tool.
+`;
+    expect(() => assertMcpResolveText(nestedMcpBest)).not.toThrow();
+
+    const relatedCliAction = nestedBest.replace(
+      "github:owner/project [high] · repository",
+      "github:owner/project · related repository",
+    );
+    expect(() => assertCliResolveText(relatedCliAction)).toThrow(
+      "without a warning",
+    );
+
+    const relatedMcpAction = nestedMcpBest.replace(
+      "       github:owner/project [high; repository]",
+      "       github:owner/project [related; repository]",
+    );
+    expect(() => assertMcpResolveText(relatedMcpAction)).toThrow(
+      "listed direct candidate without a warning",
+    );
+
+    const relatedCliLead = relatedCliAction
+      .replace(
+        "  1. npm:project [exact] · package",
+        "  1. github:owner/project · related repository",
+      )
+      .replace(
+        "\n     Related targets:\n       github:owner/project · related repository",
+        "",
+      );
+    expect(() => assertCliResolveText(relatedCliLead)).toThrow(
+      "listed direct candidate without a warning",
+    );
+
+    const relatedMcpLead = relatedMcpAction
+      .replace(
+        "  1. npm:express [exact; package]",
+        "  1. github:owner/project [related; repository]\n  2. npm:express [exact; package]",
+      )
+      .replace(
+        "\n     Related targets:\n       github:owner/project [related; repository]",
+        "",
+      );
+    expect(() => assertMcpResolveText(relatedMcpLead)).toThrow(
+      "listed direct candidate without a warning",
+    );
+  });
+
+  it("accepts a warning-only blocked result with no normal action", () => {
+    const cliBlocked = cliMixed.replace(/\nNext: githits search[^\n]+\n/, "\n");
+    const mcpBlocked = mcpMixed.replace(
+      /Next: pass the canonical target[^\n]+\n/,
+      "",
+    );
+
+    expect(() => assertCliResolveText(cliBlocked)).not.toThrow();
+    expect(() => assertMcpResolveText(mcpBlocked)).not.toThrow();
+  });
+
+  it("requires explicit-choice guidance for unconfirmed targets", () => {
+    const cli = `Targets:\n  1. npm:express [medium] · package\n\nNext: narrow the name or filters, or explicitly choose a candidate before running githits search '<query>' --in '<target>'\n`;
+    const mcp = `Targets:\n  1. npm:express [medium; package]\nNext: narrow the name or filters, or explicitly choose a candidate; never auto-select the best match.\n`;
+
+    expect(() => assertCliResolveText(cli)).not.toThrow();
+    expect(() => assertMcpResolveText(mcp)).not.toThrow();
+    expect(() =>
+      assertCliResolveText(
+        cli.replace("explicitly choose a candidate", "choose a candidate"),
+      ),
+    ).toThrow("require an explicit choice");
+    expect(() =>
+      assertMcpResolveText(
+        mcp.replace("never auto-select the best match", "choose one"),
+      ),
+    ).toThrow("require an explicit choice");
+    expect(() =>
+      assertMcpResolveText(
+        mcp.replace("explicitly choose a candidate", "continue"),
+      ),
+    ).toThrow("require an explicit choice");
+  });
+
+  it("requires explicit choice and no automatic selection for ambiguity", () => {
+    const text =
+      "Ambiguous: low confidence.\nTargets:\n  1. npm:express [low; package]\nNext: narrow the name or filters, or explicitly choose a candidate; pass its exact canonical target to the next MCP tool, never auto-select.\n";
+    expect(() => assertMcpResolveText(text)).not.toThrow();
+    expect(() =>
+      assertMcpResolveText(text.replace("never auto-select", "continue")),
+    ).toThrow("require an explicit choice");
+    expect(() =>
+      assertMcpResolveText(
+        text.replace("explicitly choose a candidate", "continue"),
+      ),
+    ).toThrow("require an explicit choice");
+  });
+
+  it("rejects a direct action for the warned candidate", () => {
+    const cliWarnedBest = cliMixed.replace(
+      "  1. npm:express [exact] · package\n",
+      "  1. npm:express [exact] · package\n     Warning: Malicious content affects the latest version. Do not use this target.\n",
+    );
+    const mcpWarnedBest = mcpMixed.replace(
+      "  1. npm:express [exact; package]\n",
+      "  1. npm:express [exact; package]\n     Warning: Malicious content affects the latest version. Do not use this target.\n",
+    );
+
+    expect(() => assertCliResolveText(cliWarnedBest)).toThrow(
+      "without a warning",
+    );
+    expect(() => assertMcpResolveText(mcpWarnedBest)).toThrow(
+      "without a warning",
+    );
+  });
+
+  it("rejects aggregate restrictions and ambiguous actions with warnings", () => {
+    const aggregate =
+      "Warning: Some candidates are not actionable. Narrow the result before continuing.\n";
+    expect(() => assertCliResolveText(`${cliMixed}${aggregate}`)).toThrow(
+      "without a warning",
+    );
+    expect(() => assertMcpResolveText(`${mcpMixed}${aggregate}`)).toThrow(
+      "without a warning",
+    );
+
+    const cliAmbiguous = `${cliMixed.replace(
+      /\nNext: githits search[^\n]+\n/,
+      "\n",
+    )}Next after choosing: githits search '<query>' --in '<target>'\n`;
+    expect(() => assertCliResolveText(cliAmbiguous)).toThrow(
+      "omit the normal next action",
+    );
+  });
+});
+
+describe("CLI live smoke cohort reporting", () => {
+  it("reports the stable live outcome after experimental registration checks", () => {
+    expect(formatCliLiveCohortSummary("passed")).toContain(
+      "stable live cohort passed",
+    );
+    expect(formatCliLiveCohortSummary("skipped")).toContain(
+      "CLI smoke skipped",
+    );
+    expect(formatCliLiveCohortSummary("skipped")).not.toContain(
+      "CLI smoke passed",
+    );
+  });
+});
+
+it("keeps cargo metadata parity smoke on the client-normalized path", () => {
+  expect(
+    JSON_PARITY_FIXTURES.find(({ name }) => name === "pkg_info_cargo"),
+  ).toEqual({
+    name: "pkg_info_cargo",
+    cliArgs: ["pkg", "info", "cargo:serde", "--json"],
+    mcpTool: "pkg_info",
+    mcpArgs: { target: "cargo:serde", format: "json" },
+  });
+});

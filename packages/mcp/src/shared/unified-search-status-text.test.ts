@@ -1,0 +1,482 @@
+import { describe, expect, it } from "bun:test";
+import type {
+  UnifiedSearchHitPresentation,
+  UnifiedSearchStatusCompletedPresentation,
+  UnifiedSearchStatusIncompletePresentation,
+  UnifiedSearchStatusResultPresentation,
+} from "./unified-search-response.js";
+import { renderUnifiedSearchStatusText } from "./unified-search-status-text.js";
+
+function hit(): UnifiedSearchHitPresentation {
+  return {
+    type: "documentation_page",
+    target: "npm:express@5.2.1",
+    title: "Routing",
+    locator: { pageId: "express/routing" },
+    readTarget: { target: "express/routing" },
+  };
+}
+
+function result(
+  overrides: Partial<UnifiedSearchStatusResultPresentation> = {},
+): UnifiedSearchStatusResultPresentation {
+  return {
+    query: { raw: "router" },
+    partialResults: false,
+    hasMore: false,
+    results: [],
+    ...overrides,
+  };
+}
+
+function active(
+  overrides: Partial<UnifiedSearchStatusIncompletePresentation> = {},
+): UnifiedSearchStatusIncompletePresentation {
+  return {
+    completed: false,
+    searchRef: "search-ref-status",
+    progress: {
+      status: "INDEXING",
+      targetsReady: 0,
+      targetsTotal: 1,
+      elapsedMs: 100,
+    },
+    ...overrides,
+  };
+}
+
+function firstLine(text: string): string {
+  return text.split("\n")[0] ?? "";
+}
+
+describe("renderUnifiedSearchStatusText", () => {
+  it("uses the same lookup-first outcome as initial search", () => {
+    const payload: UnifiedSearchStatusIncompletePresentation = active({
+      result: result({ results: [hit()] }),
+    });
+    const text = renderUnifiedSearchStatusText(payload);
+
+    expect(firstLine(text)).toBe("Found 1 documentation result.");
+    expect(text).toContain(
+      "express/routing [docs page] npm:express - source URL unavailable - Routing",
+    );
+    expect(text).toContain(
+      'search_status search_ref="search-ref-status" wait_timeout_ms=30000',
+    );
+    expect(text).not.toContain("search_status |");
+    expect(text).not.toContain("searchRef=");
+  });
+
+  it("keeps status and initial rendering aligned for equivalent partial evidence", () => {
+    const statusText = renderUnifiedSearchStatusText(
+      active({
+        result: result({ partialResults: true, results: [hit()] }),
+      }),
+    );
+    expect(firstLine(statusText)).toBe("Found 1 documentation result.");
+  });
+
+  it("distinguishes status snapshots with partialResults true", () => {
+    const payload = active({
+      result: result({ partialResults: true, results: [hit()] }),
+    });
+    const text = renderUnifiedSearchStatusText(payload);
+    expect(firstLine(text)).toContain("Found 1 documentation result.");
+    expect(text).not.toContain("interim");
+  });
+
+  it.each([false, true])(
+    "offers one read from active stored results (completed=%s)",
+    (completed) => {
+      const actionHit: UnifiedSearchHitPresentation = {
+        ...hit(),
+        readTarget: { target: "opaque-page", selector: "Routing heading" },
+      };
+      const payload = completed
+        ? {
+            completed: true as const,
+            searchRef: "stored",
+            result: result({
+              results: [actionHit],
+              hasMore: true,
+              nextOffset: 5,
+            }),
+          }
+        : active({
+            result: result({
+              results: [actionHit],
+              hasMore: true,
+              nextOffset: 5,
+            }),
+          });
+      const mcp = renderUnifiedSearchStatusText(payload);
+      const cli = renderUnifiedSearchStatusText(payload, {
+        actionSyntax: "cli",
+      });
+      expect(mcp).toContain("[1] opaque-page [docs page]");
+      expect(mcp.includes("read target=")).toBe(true);
+      expect(cli.includes("githits read ")).toBe(true);
+      expect(mcp).toContain("offset=5");
+      expect(cli).toContain("--offset 5");
+      if (!completed) {
+        expect(mcp).toContain("Use these results");
+        expect(cli).toContain("Use these results");
+      }
+    },
+  );
+
+  it("preserves backend read selections in the active status next action", () => {
+    const actionHit: UnifiedSearchHitPresentation = {
+      ...hit(),
+      type: "repository_code",
+      readTarget: {
+        target: "served-revision",
+        path: "actual.ts",
+        startLine: 1,
+        endLine: 900,
+      },
+    };
+    const payload = active({ result: result({ results: [actionHit] }) });
+    expect(renderUnifiedSearchStatusText(payload)).toContain("read target=");
+    expect(
+      renderUnifiedSearchStatusText(payload, { actionSyntax: "cli" }),
+    ).toContain("githits read ");
+  });
+
+  it("keeps pathless docs preview ranges distinct from the read action", () => {
+    const actionHit: UnifiedSearchHitPresentation = {
+      ...hit(),
+      type: "repository_doc",
+      locator: {
+        ...hit().locator,
+        filePath: "guide.md",
+        startLine: 42,
+        endLine: 48,
+      },
+      readTarget: {
+        target: "opaque-page",
+        selector: "chapter",
+        startLine: 1,
+        endLine: 900,
+      },
+    };
+    const text = renderUnifiedSearchStatusText(
+      active({ result: result({ results: [actionHit] }) }),
+    );
+    expect(text).toContain("npm:express@5.2.1 guide.md:42-48 [repo doc]");
+    expect(text).toContain(
+      'read target="opaque-page" selector="chapter" start_line=1 end_line=900',
+    );
+  });
+
+  it("retains package attribution and producer preview despite a different canonical action", () => {
+    const actionHit: UnifiedSearchHitPresentation = {
+      type: "repository_code",
+      target: "npm:package@1.2.3",
+      locator: {
+        registry: "npm",
+        packageName: "package",
+        filePath: "src/view.ts",
+        repositoryFilePath: "packages/package/src/view.ts",
+        startLine: 90,
+        endLine: 95,
+      },
+      repositoryEvidence: {
+        semanticContext: null,
+        matchedSource: {
+          startLine: 90,
+          endLine: 95,
+          matchLine: 90,
+          rangeKind: "syntax_context",
+          matchSpansTruncated: false,
+          lines: [
+            {
+              lineNumber: 90,
+              text: "export const view = 1",
+              highlights: [[0, 6]],
+              prefixTruncated: false,
+              suffixTruncated: false,
+            },
+          ],
+          linesOmittedBefore: false,
+          linesOmittedAfter: false,
+        },
+      },
+      readTarget: {
+        target: "github:owner/monorepo@served-sha",
+        path: "packages/package/src/view.ts",
+        startLine: 1,
+        endLine: 500,
+      },
+    };
+    const text = renderUnifiedSearchStatusText(
+      active({ result: result({ results: [actionHit] }) }),
+      { actionSyntax: "cli" },
+    );
+    expect(text).toContain(
+      "[1] npm:package@1.2.3 src/view.ts:90-95 [repo code]",
+    );
+    expect(text).toContain("> 90 | export const view = 1");
+    expect(text).toContain("githits read ");
+  });
+
+  it("renders progress-only status without inventing sources or a no-hits claim", () => {
+    const text = renderUnifiedSearchStatusText(
+      active({
+        progress: {
+          status: "PENDING",
+          targetsReady: 0,
+          targetsTotal: 1,
+          elapsedMs: 100,
+          targets: [{ requested: "npm:express", freshness: "PENDING" }],
+        },
+      }),
+    );
+    expect(firstLine(text)).toBe("No results available yet.");
+    expect(text).not.toContain("Indexing:");
+    expect(text).not.toContain("No hits");
+    expect(text).toContain("- npm:express");
+    expect(text).toContain(
+      'search_status search_ref="search-ref-status" wait_timeout_ms=30000',
+    );
+  });
+
+  it("renders a completed empty stored result with one applicable action", () => {
+    const payload: UnifiedSearchStatusCompletedPresentation = {
+      completed: true,
+      searchRef: "search-ref-empty",
+      result: result({
+        sourceStatus: [
+          {
+            source: "code",
+            targetLabel: "npm:express@5.2.1",
+            resultCount: 0,
+          },
+        ],
+      }),
+    };
+    const text = renderUnifiedSearchStatusText(payload);
+    expect(firstLine(text)).toBe("No results found.");
+    expect(text).toContain(
+      "Sources:\n  - npm:express@5.2.1 (code, no results)",
+    );
+    expect(text).toContain(
+      'Try: shorten or broaden query; use source="symbol"; use grep.',
+    );
+    expect(text).not.toContain("Search search-ref-empty | completed");
+  });
+
+  it("terminal target recovery renders typed guidance for stored results", () => {
+    const payload: UnifiedSearchStatusCompletedPresentation = {
+      completed: true,
+      searchRef: "search-ref-terminal",
+      result: result({
+        sourceStatus: [
+          {
+            source: "CODE",
+            targetLabel: "npm:express@4.18.2",
+            codeIndexState: "NOT_FOUND",
+          },
+          {
+            source: "CODE",
+            targetLabel: "github:owner/repo@main",
+            indexingStatus: "UNRESOLVABLE",
+            targetResolution: {
+              freshness: "indexing",
+              freshnessReason: "no_current_fallback",
+              requested: { repoUrl: "https://github.com/owner/repo" },
+              availableVersions: [],
+              availableRefs: [],
+            },
+          },
+          {
+            source: "DOCS",
+            targetLabel: "site:docs.example.com",
+            codeIndexState: "UNRESOLVABLE",
+          },
+          {
+            source: "CODE",
+            targetLabel: "opaque:target",
+            indexingStatus: "NOT_FOUND",
+          },
+        ],
+      }),
+    };
+    const text = renderUnifiedSearchStatusText(payload);
+
+    expect(text).toContain(
+      "Fix: verify registry coordinate/version; use its public repository for",
+    );
+    expect(text).toContain("repo-wide search.");
+    expect(text).toContain("Fix: verify public repository/ref.");
+    expect(text).toContain("Fix: verify site host/path.");
+    expect(text).toContain("Fix: verify or replace target.");
+    expect(text).not.toContain("Search again later");
+    expect(text).not.toContain("searchRef=");
+  });
+
+  it("uses completed mutable evidence now and searches again for updates", () => {
+    const payload: UnifiedSearchStatusCompletedPresentation = {
+      completed: true,
+      searchRef: "search-ref-evidence",
+      result: result({
+        results: [hit()],
+        evidenceNotice: "opaque backend notice",
+      }),
+    };
+    const text = renderUnifiedSearchStatusText(payload);
+    expect(firstLine(text)).toContain("Found 1");
+    expect(text).not.toContain("Search search-ref-evidence | completed");
+    expect(text).toContain("For updated results, search again.");
+    expect(text).not.toContain("opaque backend notice");
+    expect(text).not.toContain("Evidence may change.");
+    expect(text).not.toContain("Do not repeat");
+  });
+
+  it.each(["DEFERRED", "TIMEOUT", "FAILED"] as const)(
+    "does not poll a terminal stored status: %s",
+    (status) => {
+      const text = renderUnifiedSearchStatusText(
+        active({
+          progress: {
+            status,
+            targetsReady: 0,
+            targetsTotal: 1,
+            elapsedMs: 60_000,
+          },
+        }),
+      );
+      expect(firstLine(text)).toBe("No result snapshot available.");
+      expect(text).toContain("Search again later.");
+      expect(text).not.toContain("Do not poll");
+      expect(text).not.toContain("search_status");
+    },
+  );
+
+  it("preserves unknown status without polling", () => {
+    const text = renderUnifiedSearchStatusText(
+      active({
+        progress: {
+          status: "FUTURE_SESSION_STATE",
+          targetsReady: 0,
+          targetsTotal: 1,
+          elapsedMs: 60_000,
+        },
+      }),
+    );
+    expect(firstLine(text)).toBe("No result snapshot available.");
+    expect(text).toContain("Search again later.");
+    expect(text).not.toContain("Do not poll");
+    expect(text).not.toContain("search_status");
+  });
+});
+
+describe("search preparation sections", () => {
+  it.each(["PENDING", "INDEXING", "SEARCHING"] as const)(
+    "retains %s lifecycle and readable snapshot beside multiple pending scopes",
+    (status) => {
+      const estimates = [
+        {
+          kind: "REPOSITORY" as const,
+          targets: ["npm:express@1.0.3"],
+          estimate: { lowerSeconds: 33, upperSeconds: 85, elapsedSeconds: 4 },
+        },
+        {
+          kind: "DOCUMENTATION" as const,
+          targets: ["site:expressjs.com"],
+          unavailableReason: "UNSUPPORTED_WORK" as const,
+        },
+      ];
+      const text = renderUnifiedSearchStatusText(
+        active({
+          progress: {
+            status,
+            targetsReady: 1,
+            targetsTotal: 2,
+            elapsedMs: 20,
+            indexingEstimates: estimates,
+          },
+          result: result({ results: [hit()] }),
+        }),
+        { width: 60 },
+      );
+      expect(text.split("\n")[0]).toMatch(/^Found 1 .* result\.$/);
+      expect(text).toContain("\n\nPreparing:\n  - ");
+      const section = text.split("Preparing:\n")[1]!.split("\n\n")[0]!;
+      const lines = section.split("\n");
+      expect(lines.filter((line) => line.startsWith("  - "))).toHaveLength(2);
+      expect(lines.some((line) => line.startsWith("    "))).toBe(true);
+      expect(lines.every((line) => line.length <= 60)).toBe(true);
+      expect(section).toContain("indexing");
+      expect(section).toContain("preparing documentation");
+      expect(text).toContain("Found 1");
+      expect(text).toContain("search_status");
+      expect(text).not.toContain("remaining ETA");
+    },
+  );
+});
+
+describe("pending package preparation aliases", () => {
+  it("does not repeat an unresolved package tag beside its actual work on either surface", () => {
+    const target = "npm:n8n@2.36.7";
+    const repoUrl = "https://github.com/n8n-io/n8n";
+    const payload = active({
+      progress: {
+        status: "INDEXING",
+        targetsReady: 0,
+        targetsTotal: 1,
+        elapsedMs: 100,
+        targets: [
+          {
+            requested: target,
+            resolvedRequested: "n8n@2.36.7",
+            freshness: "INDEXING",
+            targetResolution: {
+              requested: {
+                kind: "package_exact_version",
+                registry: "npm",
+                packageName: "n8n",
+                version: "2.36.7",
+              },
+              resolvedRequested: {
+                registry: "npm",
+                packageName: "n8n",
+                version: "2.36.7",
+                repoUrl,
+                gitRef: "n8n@2.36.7",
+              },
+              freshness: "indexing",
+              freshnessReason: "no_current_fallback",
+              availableVersions: [],
+              availableRefs: [],
+            },
+          },
+        ],
+        indexingEstimates: [
+          {
+            kind: "REPOSITORY",
+            repositoryUrl: repoUrl,
+            commitSha: "f09fcad454339ae8d16d88c85e2e4a38f85b1217",
+            targets: [target],
+            estimate: { lowerSeconds: 52, upperSeconds: 64 },
+          },
+        ],
+      },
+    });
+    for (const actionSyntax of ["mcp", "cli"] as const) {
+      const text = renderUnifiedSearchStatusText(payload, { actionSyntax });
+      expect(text).toContain(
+        "  - github:n8n-io/n8n@f09fcad4 (indexing, estimated total: 52-64s)",
+      );
+      expect(text.match(/Requested:/g)).toHaveLength(1);
+      expect(text).toContain(`    Requested: ${target}`);
+      expect(text).not.toContain("github:n8n-io/n8n@n8n@2.36.7");
+      expect(text).not.toContain("Requested target is being indexed");
+      expect(text).not.toContain("committed");
+      expect(text).not.toContain("observed HEAD");
+      expect(text).toContain(
+        actionSyntax === "mcp" ? "wait_timeout_ms=80000" : "--wait 80000",
+      );
+    }
+  });
+});

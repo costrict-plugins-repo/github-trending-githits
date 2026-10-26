@@ -1,0 +1,691 @@
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import { win32 } from "node:path";
+import { createMockFileSystemService } from "../services/test-helpers.js";
+import {
+  buildDoctorReport,
+  type DoctorDependencies,
+  doctorAction,
+} from "./doctor.js";
+
+function createDeps(
+  overrides: Partial<DoctorDependencies> = {},
+): DoctorDependencies {
+  return {
+    fs: createMockFileSystemService(),
+    env: { HOME: "/home/test", PATH: "/usr/local/bin:/usr/bin" },
+    argv: ["node", "/repo/node_modules/githits/dist/cli.js"],
+    execPath: "/usr/local/bin/node",
+    cwd: "/work/project",
+    platform: "linux",
+    arch: "arm64",
+    nodeVersion: "v22.13.0",
+    version: "0.0.0-test",
+    now: () => new Date("2026-05-27T12:00:00.000Z"),
+    realpath: mock((path: string) => Promise.resolve(`${path}.real`)),
+    ...overrides,
+  };
+}
+
+describe("doctor", () => {
+  it("reports development defaults and the matching auth metadata namespace", async () => {
+    const createdAt = "2026-05-27T10:00:00.000Z";
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path.endsWith("metadata.json")),
+      ),
+      readFile: mock(() =>
+        Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            sessions: {
+              "https://mcp.githits.com": {
+                createdAt: "2026-01-01T00:00:00.000Z",
+                expiresAt: null,
+                updatedAt: createdAt,
+              },
+              "https://mcp-dev.githits.com": {
+                createdAt,
+                expiresAt: null,
+                updatedAt: createdAt,
+              },
+            },
+          }),
+        ),
+      ),
+    });
+    const deps = createDeps({
+      fs,
+      env: { HOME: "/home/test", GITHITS_ENV: "dev" },
+    });
+    const report = await buildDoctorReport(deps);
+    expect(report.environment.backendEnvironment).toEqual({
+      status: "present",
+      value: "dev",
+      source: "env",
+    });
+    expect(report.services.mcpUrl.value).toBe("https://mcp-dev.githits.com");
+    expect(report.services.apiUrl.value).toBe("https://api-dev.githits.com");
+    expect(report.services.codeNavigationUrl.value).toBe(
+      "https://oss-dev.githits.dev",
+    );
+    expect(report.services.accountsUrl.value).toBe(
+      "https://zcwquvryvmjuwckxdevg.supabase.co",
+    );
+    expect(report.auth.files[0]?.metadata.value?.createdAt).toBe(createdAt);
+    const consoleSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await doctorAction({}, deps);
+      const output = String(consoleSpy.mock.calls[0]?.[0]);
+      expect(output).toContain("GITHITS_ENV: dev");
+      expect(output).toContain(
+        "MCP URL: default development: https://mcp-dev.githits.com",
+      );
+      expect(output).not.toContain("default production");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+    const production = await buildDoctorReport(createDeps({ fs }));
+    expect(production.auth.files[0]?.metadata.value?.createdAt).toBe(
+      "2026-01-01T00:00:00.000Z",
+    );
+  });
+
+  it("reports an invalid selector without failing local diagnostics or exposing its value", async () => {
+    const report = await buildDoctorReport(
+      createDeps({
+        env: {
+          HOME: "/home/test",
+          GITHITS_ENV: "private-selector-value",
+          GITHITS_CODE_NAV_URL: "http://localhost:4000",
+        },
+      }),
+    );
+    expect(report.environment.backendEnvironment.status).toBe("invalid");
+    expect(report.services.mcpUrl.error?.message).toContain("GITHITS_ENV");
+    expect(report.services.codeNavigationUrl).toEqual({
+      source: "env",
+      value: "http://localhost:4000",
+    });
+    expect(report.recommendations).toContain(
+      "Fix GITHITS_ENV before using network commands: use prod or dev.",
+    );
+    expect(JSON.stringify(report)).not.toContain("private-selector-value");
+  });
+
+  it("hides default service URLs in text output", async () => {
+    const consoleSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await doctorAction({}, createDeps());
+
+    const output = String(consoleSpy.mock.calls[0]?.[0]);
+    expect(output).toContain("MCP URL: default production");
+    expect(output).toContain("API URL: default production");
+    expect(output).toContain("Code navigation URL: default production");
+    expect(output).not.toContain("https://mcp.githits.com");
+    expect(output).not.toContain("https://api.githits.com");
+    expect(output).not.toContain("https://oss.githits.dev");
+
+    consoleSpy.mockRestore();
+  });
+
+  it("hides empty legacy auth dirs in text output", async () => {
+    const consoleSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await doctorAction({}, createDeps());
+
+    const output = String(consoleSpy.mock.calls[0]?.[0]);
+    expect(output).toContain(
+      "Active file storage dir: /home/test/.config/githits/auth",
+    );
+    expect(output).toContain(
+      "Active auth dir: /home/test/.config/githits/auth",
+    );
+    expect(output).not.toContain("Legacy auth dir: /home/test/.githits");
+
+    consoleSpy.mockRestore();
+  });
+
+  it("shows legacy auth dirs in text output when they contain auth files", async () => {
+    const consoleSpy = spyOn(console, "log").mockImplementation(() => {});
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path === "/home/test/.githits/auth.json"),
+      ),
+      readFile: mock(() =>
+        Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            tokens: {
+              "https://mcp.githits.com": {
+                accessToken: "secret-access-token",
+                refreshToken: "secret-refresh-token",
+                createdAt: "2026-05-27T10:00:00.000Z",
+                expiresAt: "2026-05-27T14:00:00.000Z",
+              },
+            },
+          }),
+        ),
+      ),
+    });
+
+    await doctorAction({}, createDeps({ fs }));
+
+    const output = String(consoleSpy.mock.calls[0]?.[0]);
+    expect(output).toContain("Legacy auth dir: /home/test/.githits");
+    expect(output).toContain("token: present");
+    expect(output).not.toContain("secret-access-token");
+    expect(output).not.toContain("secret-refresh-token");
+
+    consoleSpy.mockRestore();
+  });
+
+  it("reports overridden service URLs", async () => {
+    const report = await buildDoctorReport(
+      createDeps({
+        env: {
+          HOME: "/home/test",
+          GITHITS_MCP_URL: "https://mcp.example.test",
+          GITHITS_API_URL: "https://api.example.test",
+          GITHITS_ACCOUNTS_URL: "https://accounts.example.test",
+          GITHITS_CODE_NAV_URL: "https://code.example.test",
+        },
+      }),
+    );
+
+    expect(report.services.mcpUrl).toEqual({
+      source: "env",
+      value: "https://mcp.example.test",
+    });
+    expect(report.services.apiUrl).toEqual({
+      source: "env",
+      value: "https://api.example.test",
+    });
+    expect(report.services.accountsUrl).toEqual({
+      source: "env",
+      value: "https://accounts.example.test",
+    });
+    expect(report.services.codeNavigationUrl).toEqual({
+      source: "env",
+      value: "https://code.example.test",
+    });
+  });
+
+  it("reports blank service URL overrides as overrides", async () => {
+    const report = await buildDoctorReport(
+      createDeps({
+        env: {
+          HOME: "/home/test",
+          GITHITS_MCP_URL: "",
+          GITHITS_API_URL: "   ",
+        },
+      }),
+    );
+
+    expect(report.services.mcpUrl).toEqual({ source: "env", value: "" });
+    expect(report.services.apiUrl).toEqual({ source: "env", value: "   " });
+  });
+
+  it("uses the provided XDG_CONFIG_HOME for diagnostic paths", async () => {
+    const report = await buildDoctorReport(
+      createDeps({
+        env: { HOME: "/home/test", XDG_CONFIG_HOME: "/tmp/xdg" },
+      }),
+    );
+
+    expect(report.config.appConfigDir).toBe("/tmp/xdg/githits");
+    expect(report.config.configPath).toBe("/tmp/xdg/githits/config.toml");
+    expect(report.auth.activeFileStorageDir).toBe("/tmp/xdg/githits/auth");
+    expect(report.environment.xdgConfigHome).toEqual({
+      status: "present",
+      value: "/tmp/xdg",
+      source: "env",
+    });
+  });
+
+  it("uses the provided HOME fallback for diagnostic paths", async () => {
+    const report = await buildDoctorReport(
+      createDeps({
+        env: { HOME: "/custom/home" },
+      }),
+    );
+
+    expect(report.config.appConfigDir).toBe("/custom/home/.config/githits");
+    expect(report.config.configPath).toBe(
+      "/custom/home/.config/githits/config.toml",
+    );
+    expect(report.auth.activeFileStorageDir).toBe(
+      "/custom/home/.config/githits/auth",
+    );
+    expect(report.auth.files.at(-1)?.dir).toBe("/custom/home/.githits");
+  });
+
+  it("uses the provided HOME for legacy macOS diagnostic paths", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(
+          path ===
+            "/custom/home/Library/Application Support/githits/config.toml",
+        ),
+      ),
+      readFile: mock(() => Promise.resolve('[auth]\nstorage = "file"\n')),
+    });
+
+    const report = await buildDoctorReport(
+      createDeps({
+        fs,
+        platform: "darwin",
+        env: { HOME: "/custom/home" },
+      }),
+    );
+
+    expect(report.config.configPath).toBe(
+      "/custom/home/Library/Application Support/githits/config.toml",
+    );
+    expect(report.auth.files[1]?.dir).toBe(
+      "/custom/home/Library/Application Support/githits/auth",
+    );
+  });
+
+  it("uses Windows PATH delimiters when resolving githits", async () => {
+    const githitsCmd = win32.join("C:\\b", "githits.cmd");
+    const fs = createMockFileSystemService({
+      joinPath: mock((...segments: string[]) => win32.join(...segments)),
+      exists: mock((path: string) => Promise.resolve(path === githitsCmd)),
+    });
+
+    const report = await buildDoctorReport(
+      createDeps({
+        fs,
+        platform: "win32",
+        env: {
+          USERPROFILE: "C:\\Users\\test",
+          PATH: "C:\\a;C:\\b",
+          PATHEXT: ".CMD;.EXE",
+        },
+      }),
+    );
+
+    expect(report.runtime.pathGithits).toEqual({
+      status: "present",
+      value: githitsCmd,
+      source: "env",
+    });
+  });
+
+  it("reads file auth timestamps without writing auth state", async () => {
+    const writes = {
+      writeFile: mock(() => Promise.resolve()),
+      deleteFile: mock(() => Promise.resolve()),
+      ensureDir: mock(() => Promise.resolve()),
+      atomicWriteFile: mock(() => Promise.resolve()),
+    };
+    const fs = createMockFileSystemService({
+      ...writes,
+      exists: mock((path: string) =>
+        Promise.resolve(
+          path.endsWith("config.toml") ||
+            path.endsWith("auth.json") ||
+            path.endsWith("client.json") ||
+            path.endsWith("metadata.json"),
+        ),
+      ),
+      readFile: mock((path: string) => {
+        if (path.endsWith("config.toml")) {
+          return Promise.resolve('[auth]\nstorage = "file"\n');
+        }
+        if (path.endsWith("auth.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              tokens: {
+                "https://mcp.githits.com": {
+                  accessToken: "secret-access-token",
+                  refreshToken: "secret-refresh-token",
+                  createdAt: "2026-05-27T10:00:00.000Z",
+                  expiresAt: "2026-05-27T14:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        if (path.endsWith("client.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              clients: {
+                "https://mcp.githits.com": {
+                  clientId: "secret-client-id",
+                  clientSecret: "secret-client-secret",
+                  redirectUri: "http://127.0.0.1:8080/callback",
+                  registeredAt: "2026-05-20T09:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        return Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            sessions: {
+              "https://mcp.githits.com": {
+                createdAt: "2026-05-27T10:00:00.000Z",
+                expiresAt: "2026-05-27T14:00:00.000Z",
+                updatedAt: "2026-05-27T10:05:00.000Z",
+              },
+            },
+          }),
+        );
+      }),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+    const active = report.auth.files[0];
+
+    expect(report.auth.storageMode).toMatchObject({
+      status: "present",
+      value: "file",
+      source: "config",
+    });
+    expect(active?.token).toEqual({
+      status: "present",
+      source: "file",
+      value: {
+        createdAt: "2026-05-27T10:00:00.000Z",
+        expiresAt: "2026-05-27T14:00:00.000Z",
+      },
+    });
+    expect(active?.client).toEqual({
+      status: "present",
+      source: "file",
+      value: { registeredAt: "2026-05-20T09:00:00.000Z" },
+    });
+    expect(active?.metadata).toEqual({
+      status: "present",
+      source: "file",
+      value: {
+        createdAt: "2026-05-27T10:00:00.000Z",
+        expiresAt: "2026-05-27T14:00:00.000Z",
+        updatedAt: "2026-05-27T10:05:00.000Z",
+      },
+    });
+    expect(JSON.stringify(report)).not.toContain("secret-access-token");
+    expect(JSON.stringify(report)).not.toContain("secret-refresh-token");
+    expect(JSON.stringify(report)).not.toContain("secret-client-secret");
+    expect(writes.writeFile).not.toHaveBeenCalled();
+    expect(writes.deleteFile).not.toHaveBeenCalled();
+    expect(writes.ensureDir).not.toHaveBeenCalled();
+    expect(writes.atomicWriteFile).not.toHaveBeenCalled();
+  });
+
+  it("recommends login when file mode has metadata but no token", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(
+          path.endsWith("config.toml") ||
+            path.endsWith("client.json") ||
+            path.endsWith("metadata.json"),
+        ),
+      ),
+      readFile: mock((path: string) => {
+        if (path.endsWith("config.toml")) {
+          return Promise.resolve('[auth]\nstorage = "file"\n');
+        }
+        if (path.endsWith("client.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              clients: {
+                "https://mcp.githits.com": {
+                  clientId: "secret-client-id",
+                  clientSecret: "secret-client-secret",
+                  redirectUri: "http://127.0.0.1:8080/callback",
+                  registeredAt: "2026-05-20T09:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        return Promise.resolve(
+          JSON.stringify({
+            version: 1,
+            sessions: {
+              "https://mcp.githits.com": {
+                createdAt: "2026-05-27T10:00:00.000Z",
+                expiresAt: "2026-05-27T14:00:00.000Z",
+                updatedAt: "2026-05-27T10:05:00.000Z",
+              },
+            },
+          }),
+        );
+      }),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    expect(report.recommendations).toContain(
+      "File auth token is missing but client/session metadata remains. Run `githits login` in this environment.",
+    );
+  });
+
+  it("surfaces the last-clear breadcrumb and explains a missing token", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path.endsWith("diagnostics.json")),
+      ),
+      readFile: mock((path: string) => {
+        if (path.endsWith("diagnostics.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              events: {
+                "https://mcp.githits.com": {
+                  reason: "terminal_invalid_refresh_token",
+                  at: "2026-05-27T08:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        return Promise.reject(new Error("File not found"));
+      }),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    expect(report.auth.files[0]?.lastClear).toMatchObject({
+      status: "present",
+      value: {
+        reason: "terminal_invalid_refresh_token",
+        at: "2026-05-27T08:00:00.000Z",
+      },
+    });
+    expect(
+      report.recommendations.some(
+        (line) =>
+          line.includes("terminal_invalid_refresh_token") &&
+          line.includes("githits login"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not throw on a diagnostics file with non-object events", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path.endsWith("diagnostics.json")),
+      ),
+      readFile: mock((path: string) =>
+        path.endsWith("diagnostics.json")
+          ? Promise.resolve(JSON.stringify({ version: 1, events: null }))
+          : Promise.reject(new Error("File not found")),
+      ),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    // events:null fails the file-shape guard, so the file is reported, not crashed.
+    expect(report.auth.files[0]?.lastClear.status).not.toBe("present");
+    expect(
+      report.recommendations.some((line) => line.includes("last clear")),
+    ).toBe(false);
+  });
+
+  it("suppresses the stale clear recommendation when a newer session exists", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(
+          path.endsWith("diagnostics.json") || path.endsWith("metadata.json"),
+        ),
+      ),
+      readFile: mock((path: string) => {
+        if (path.endsWith("diagnostics.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              events: {
+                "https://mcp.githits.com": {
+                  reason: "terminal_invalid_refresh_token",
+                  at: "2026-05-27T08:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        if (path.endsWith("metadata.json")) {
+          // Session created after the clear — keychain re-login already happened.
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              sessions: {
+                "https://mcp.githits.com": {
+                  createdAt: "2026-05-27T09:00:00.000Z",
+                  expiresAt: "2026-05-27T13:00:00.000Z",
+                  updatedAt: "2026-05-27T09:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        return Promise.reject(new Error("File not found"));
+      }),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    // Breadcrumb still shown, but no stale "run login" recommendation.
+    expect(report.auth.files[0]?.lastClear.status).toBe("present");
+    expect(
+      report.recommendations.some((line) => line.includes("last clear")),
+    ).toBe(false);
+  });
+
+  it("still recommends login when the clear is newer than the session", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(
+          path.endsWith("diagnostics.json") || path.endsWith("metadata.json"),
+        ),
+      ),
+      readFile: mock((path: string) => {
+        if (path.endsWith("diagnostics.json")) {
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              events: {
+                "https://mcp.githits.com": {
+                  reason: "terminal_invalid_refresh_token",
+                  at: "2026-05-27T10:00:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        if (path.endsWith("metadata.json")) {
+          // Session predates the clear — credentials were cleared after login.
+          return Promise.resolve(
+            JSON.stringify({
+              version: 1,
+              sessions: {
+                "https://mcp.githits.com": {
+                  createdAt: "2026-05-27T08:00:00.000Z",
+                  expiresAt: "2026-05-27T12:00:00.000Z",
+                  updatedAt: "2026-05-27T08:30:00.000Z",
+                },
+              },
+            }),
+          );
+        }
+        return Promise.reject(new Error("File not found"));
+      }),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    expect(
+      report.recommendations.some(
+        (line) =>
+          line.includes("terminal_invalid_refresh_token") &&
+          line.includes("githits login"),
+      ),
+    ).toBe(true);
+  });
+
+  it("flags a malformed last-clear event as invalid instead of surfacing it", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path.endsWith("diagnostics.json")),
+      ),
+      readFile: mock((path: string) =>
+        path.endsWith("diagnostics.json")
+          ? Promise.resolve(
+              JSON.stringify({
+                version: 1,
+                events: {
+                  "https://mcp.githits.com": { reason: "bogus", at: 123 },
+                },
+              }),
+            )
+          : Promise.reject(new Error("File not found")),
+      ),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    expect(report.auth.files[0]?.lastClear.status).toBe("invalid");
+    expect(
+      report.recommendations.some((line) => line.includes("last clear")),
+    ).toBe(false);
+  });
+
+  it("reports invalid auth config instead of throwing", async () => {
+    const fs = createMockFileSystemService({
+      exists: mock((path: string) =>
+        Promise.resolve(path.endsWith("config.toml")),
+      ),
+      readFile: mock(() => Promise.resolve('[auth]\nstorage = "plaintext"\n')),
+    });
+
+    const report = await buildDoctorReport(createDeps({ fs }));
+
+    expect(report.config.authStorageMode.status).toBe("invalid");
+    expect(report.config.authStorageMode.error?.message).toContain(
+      "Invalid auth storage mode",
+    );
+    expect(report.recommendations).toContain(
+      "Fix the auth storage configuration before logging in again.",
+    );
+  });
+
+  it("emits JSON diagnostics", async () => {
+    const consoleSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await doctorAction({ json: true }, createDeps());
+
+    const output = String(consoleSpy.mock.calls[0]?.[0]);
+    const parsed = JSON.parse(output);
+    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.currentTime).toBe("2026-05-27T12:00:00.000Z");
+    expect(parsed.environment.envApiToken.status).toBe("missing");
+
+    consoleSpy.mockRestore();
+  });
+});

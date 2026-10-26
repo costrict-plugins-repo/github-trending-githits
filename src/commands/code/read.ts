@@ -1,0 +1,410 @@
+import type { CodeNavigationService } from "@githits/core-internal";
+import { toPkgseerRegistryLowercase } from "@githits/core-internal";
+import {
+  buildReadFileParams,
+  buildReadFileSuccessPayload,
+  buildSourceCorrespondenceNotes,
+  DEFAULT_WAIT_TIMEOUT_MS,
+  formatReadFileTerminal,
+  InvalidPackageSpecError,
+  MAX_WAIT_TIMEOUT_MS,
+  parseLinesOption,
+  type ReadFileRequestBuildResult,
+  type ReadFileRequestInput,
+  requireAuth,
+  shouldUseColors,
+  wrapTerminalProse,
+} from "@githits/mcp/internal";
+import type { Command } from "commander";
+import { createContainer } from "../../container.js";
+import { startSpinner } from "../../shared/spinner.js";
+import { SPINNER_MESSAGES } from "../../shared/spinner-messages.js";
+import {
+  buildCliListRecoveryCommand,
+  formatFileErrorWithFilesHint,
+  handleCodeNavCommandError,
+  parseIntCliOption,
+  resolveCliCodeNavTarget,
+  withCliReadFileRecovery,
+} from "./code-nav-cli-helpers.js";
+
+export interface PkgReadCommandOptions {
+  selector?: string;
+  repoUrl?: string;
+  gitRef?: string;
+  lines?: string;
+  start?: string;
+  end?: string;
+  wait?: string;
+  verbose?: boolean;
+  json?: boolean;
+}
+
+export interface PkgReadCommandDependencies {
+  codeNavigationService: Pick<CodeNavigationService, "readFile"> | undefined;
+  codeNavigationUrl: string | undefined;
+  hasValidToken: boolean;
+  mcpUrl: string;
+}
+
+/**
+ * Core `code read` action. Accepts `<spec>` OR
+ * `--repo-url <url> [--git-ref <ref>]` (mutually exclusive) and a
+ * required `<path>` positional.
+ *
+ * Line-range grammar:
+ *  `--lines 10-40`   → start=10, end=40
+ *  `--lines 10-`     → start=10, end=EOF
+ *  `--lines -40`     → start=1, end=40
+ *  `--lines 10`      → rejected (did you mean `--lines 10-` or `--start 10`?)
+ *  `--lines 40-10`   → rejected (reversed)
+ *  `--start N --end M` → equivalent
+ *  `--lines` combined with `--start`/`--end` → rejected
+ */
+export async function pkgReadAction(
+  firstArg: string | undefined,
+  secondArg: string | undefined,
+  options: PkgReadCommandOptions,
+  deps: PkgReadCommandDependencies,
+): Promise<void> {
+  let requestedFilePath = "";
+  let requestedTarget: string | undefined;
+
+  try {
+    requireAuth(deps);
+  } catch (error) {
+    if (options.json) {
+      handleCodeNavCommandError(error, true, formatFileErrorWithFilesHint);
+    }
+    throw error;
+  }
+
+  try {
+    if (!deps.codeNavigationUrl || !deps.codeNavigationService) {
+      throw new InvalidPackageSpecError(
+        "Code navigation is not configured for this environment.",
+      );
+    }
+
+    // Commander binds two optional positionals left-to-right.
+    // Resolve our (spec, path) pair based on whether repo-URL mode
+    // is active:
+    //   `code read <spec> <path>`         → firstArg=spec, secondArg=path
+    //   `code read --repo-url X [--git-ref Y] <path>`
+    //                                     → firstArg=path, secondArg=undefined
+    const hasRepoUrl = Boolean(options.repoUrl);
+    const { spec, path } = resolvePositionals(firstArg, secondArg, hasRepoUrl);
+    requestedTarget = spec ?? options.repoUrl;
+    if (!path || path.trim().length === 0) {
+      throw new InvalidPackageSpecError(
+        "A <path> argument is required — pass the path to the file within the package or repo.",
+      );
+    }
+
+    const target = resolveCliCodeNavTarget(spec, options);
+    const pathWithRange = parsePathWithOptionalRange(path.trim());
+    requestedFilePath = pathWithRange.filePath;
+    const range = resolveLineRange(options, pathWithRange);
+    const wait = parseIntCliOption(
+      options.wait,
+      "--wait",
+      0,
+      MAX_WAIT_TIMEOUT_MS,
+    );
+
+    const build = buildCliReadFileParams({
+      target,
+      filePath: pathWithRange.filePath,
+      startLine: range.startLine,
+      endLine: range.endLine,
+      waitTimeoutMs: wait,
+    });
+    const spinner = startSpinner(SPINNER_MESSAGES.code, !options.json);
+    const result = await deps.codeNavigationService
+      .readFile(build.params)
+      .finally(() => spinner.stop());
+
+    const payload = buildReadFileSuccessPayload(result, {
+      registry: target.registry
+        ? toPkgseerRegistryLowercase(target.registry)
+        : undefined,
+      name: target.packageName,
+      repoUrl: target.repoUrl,
+      gitRef: target.gitRef,
+      requestedFilePath: build.params.filePath,
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify(payload));
+      return;
+    }
+
+    if (!options.verbose)
+      for (const note of buildSourceCorrespondenceNotes(
+        payload.targetResolution,
+      ))
+        console.error(
+          wrapTerminalProse(note, process.stderr.columns).join("\n"),
+        );
+    process.stdout.write(
+      formatReadFileTerminal(payload, {
+        width: process.stdout.columns,
+        useColors: shouldUseColors(),
+        verbose: options.verbose ?? false,
+      }),
+    );
+  } catch (error) {
+    handleCodeNavCommandError(
+      error,
+      options.json ?? false,
+      (mapped) =>
+        formatFileErrorWithFilesHint(mapped, { target: requestedTarget }),
+      1,
+      (mapped) => withCliReadFileRecovery(mapped, requestedFilePath),
+    );
+  }
+}
+
+/**
+ * Translate shared validation failures to CLI-native argument names and
+ * listing syntax. Unchanged errors are rethrown at this boundary.
+ */
+export function buildCliReadFileParams(
+  input: ReadFileRequestInput,
+): ReadFileRequestBuildResult {
+  try {
+    return buildReadFileParams(input);
+  } catch (error) {
+    if (!(error instanceof InvalidPackageSpecError)) throw error;
+    const filePath = input.filePath.trim();
+    if (filePath.endsWith("/")) {
+      throw new InvalidPackageSpecError(
+        `\`<path>\` must be an exact file path, not a directory prefix. Use \`${buildCliListRecoveryCommand(filePath)}\` to list files, then pass an emitted path to \`githits read\`.`,
+      );
+    }
+    const rewritten = error.message
+      .replace(/^`file_path`/, "`<path>`")
+      .replace("start_line (", "--start (")
+      .replace("end_line (", "--end (")
+      .replace(/emitted `path`/g, "emitted path")
+      .replace(/`read`/g, "`githits read`");
+    if (rewritten === error.message) throw error;
+    throw new InvalidPackageSpecError(rewritten);
+  }
+}
+
+function resolvePositionals(
+  firstArg: string | undefined,
+  secondArg: string | undefined,
+  hasRepoUrl: boolean,
+): { spec: string | undefined; path: string | undefined } {
+  if (hasRepoUrl) {
+    // In repo-URL mode the package spec doesn't apply. A single
+    // positional is the path; a second one is an error.
+    if (secondArg !== undefined) {
+      throw new InvalidPackageSpecError(
+        "In --repo-url mode, pass only the <path> positional — the package spec is replaced by --repo-url.",
+      );
+    }
+    return { spec: undefined, path: firstArg };
+  }
+  // Spec mode: require both positionals to avoid Commander's
+  // left-bind-ambiguous single-positional case.
+  return { spec: firstArg, path: secondArg };
+}
+
+export interface LineRange {
+  startLine?: number;
+  endLine?: number;
+}
+
+export interface ParsedPathWithRange {
+  filePath: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+export function resolveLineRange(
+  options: PkgReadCommandOptions,
+  pathWithRange: ParsedPathWithRange,
+): LineRange {
+  const hasLines = Boolean(options.lines);
+  const hasStart = Boolean(options.start);
+  const hasEnd = Boolean(options.end);
+  const hasPathRange =
+    pathWithRange.startLine !== undefined ||
+    pathWithRange.endLine !== undefined;
+
+  if ((hasLines || hasPathRange) && (hasStart || hasEnd)) {
+    throw new InvalidPackageSpecError(
+      "Use one line-range form only — path:start-end, --lines, or --start / --end. Pick one.",
+    );
+  }
+
+  if (hasLines && hasPathRange) {
+    throw new InvalidPackageSpecError(
+      "Use one line-range form only — path:start-end or --lines. Pick one.",
+    );
+  }
+
+  if (hasPathRange) {
+    return {
+      startLine: pathWithRange.startLine,
+      endLine: pathWithRange.endLine,
+    };
+  }
+
+  if (hasLines) {
+    const range = parseLinesOption(options.lines as string);
+    return range.startLine === undefined && range.endLine !== undefined
+      ? { startLine: 1, endLine: range.endLine }
+      : range;
+  }
+
+  return {
+    startLine: parseIntCliOption(
+      options.start,
+      "--start",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    endLine: parseIntCliOption(
+      options.end,
+      "--end",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+  };
+}
+
+export function parsePathWithOptionalRange(path: string): ParsedPathWithRange {
+  const match = path.match(/^(.*):(\d+)(?:-(\d+)?)?$/);
+  if (!match) {
+    return { filePath: path };
+  }
+
+  const filePath = match[1]?.trim();
+  const startRaw = match[2];
+  const endRaw = match[3];
+
+  if (!filePath) {
+    throw new InvalidPackageSpecError(
+      `Invalid path with range: '${path}'. Use <path>:<start>-<end>.`,
+    );
+  }
+  if (!startRaw) {
+    throw new InvalidPackageSpecError(
+      `Invalid path with range: '${path}'. Use <path>:<start>-<end>.`,
+    );
+  }
+
+  const startLine = requirePositiveInteger(startRaw, "path range start");
+  const endLine =
+    endRaw !== undefined && endRaw.length > 0
+      ? requirePositiveInteger(endRaw, "path range end")
+      : startLine;
+
+  if (startLine > endLine) {
+    throw new InvalidPackageSpecError(
+      `Path range is reversed: ${startLine} > ${endLine}.`,
+    );
+  }
+
+  return { filePath, startLine, endLine };
+}
+
+function requirePositiveInteger(raw: string, label: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new InvalidPackageSpecError(
+      `${label} must be a positive integer. Got '${raw}'.`,
+    );
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (parsed < 1) {
+    throw new InvalidPackageSpecError(
+      `${label} must be ≥ 1 (lines are 1-indexed). Got ${parsed}.`,
+    );
+  }
+  return parsed;
+}
+
+const PKG_READ_DESCRIPTION = `Read a file from an indexed dependency.
+
+Default output is the raw file content — pipe-friendly for
+downstream tools (\`code read … | grep …\`). Pass --verbose for a
+header and a line-number gutter.
+
+Use --lines for a bounded range (e.g. \`--lines 10-40\`) or append a
+range directly to the path (e.g. \`src/index.js:10-40\`). The \`path\`
+comes directly from \`githits code files\`.
+
+Addressing: <target> accepts registry:name[@version], github:org/repo[@ref], codeberg:owner/repo[@ref], gitlab:group[/subgroup...]/project[@ref],
+launchpad:~owner/+git/repo[@ref], launchpad:~owner/project/+git/repo[@ref],
+or launchpad:~owner/distro/+source/source/+git/repo[@ref] (lp:PROJECT also accepted).
+Full HTTPS repository URLs are accepted on github.com, codeberg.org, gitlab.com, git.launchpad.net or code.launchpad.net.
+Launchpad also accepts lp:PROJECT and owner-scoped or distribution-source defaults.
+HTTPS code.launchpad.net and git.launchpad.net accept the same paths;
+git://git.launchpad.net requires a complete owner-qualified path.
+GitHub also accepts github.com/org/repo and HTTP. Alternatively, use
+--repo-url <url> [--git-ref <ref>]. <path> is package-relative for package targets
+and repo-relative for repo targets.
+
+Binary files show a one-line sentinel instead of content. If an exact path is
+missing, excluded, or cannot be verified by the source inventory, use
+\`code files\` to inspect the indexed paths.`;
+
+export function registerCodeReadCommand(pkgCommand: Command): Command {
+  return pkgCommand
+    .command("read")
+    .summary("Deprecated: use githits read <target> <path>")
+    .description(
+      "Deprecated: use githits read <target> <path>.\n\n" +
+        PKG_READ_DESCRIPTION,
+    )
+    .argument(
+      "[spec-or-path]",
+      "Target mode: package spec or repo shorthand. With --repo-url: the file path. See examples in `--help`.",
+    )
+    .argument(
+      "[path]",
+      "File path (spec mode only — in --repo-url mode use the first positional).",
+    )
+    .option(
+      "--repo-url <url>",
+      "Repository URL addressing (defaults to the repo default branch)",
+    )
+    .option(
+      "--git-ref <ref>",
+      "Optional tag, commit, branch, or HEAD for --repo-url.",
+    )
+    .option(
+      "--lines <start-end>",
+      "Line range (e.g. `10-40`, `10-` for open end, `-40` for open start)",
+    )
+    .option("--start <n>", "Starting line (1-indexed). Alternative to --lines.")
+    .option("--end <n>", "Ending line (inclusive). Alternative to --lines.")
+    .option(
+      "--wait <ms>",
+      `Indexing wait timeout (0-${MAX_WAIT_TIMEOUT_MS}, default ${DEFAULT_WAIT_TIMEOUT_MS})`,
+    )
+    .option(
+      "-v, --verbose",
+      "Render a header and a line-number gutter alongside the content",
+    )
+    .option("--json", "Emit the JSON envelope")
+    .action(
+      async (
+        spec: string | undefined,
+        path: string | undefined,
+        options: PkgReadCommandOptions,
+      ) => {
+        const deps = await createContainer();
+        await pkgReadAction(spec, path, options, {
+          codeNavigationService: deps.codeNavigationService,
+          codeNavigationUrl: deps.codeNavigationUrl,
+          hasValidToken: deps.hasValidToken,
+          mcpUrl: deps.mcpUrl,
+        });
+      },
+    );
+}

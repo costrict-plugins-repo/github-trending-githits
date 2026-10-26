@@ -1,0 +1,37 @@
+export {
+  type AgentDefinition,
+  agentDefinitions,
+  buildCheckboxChoices,
+  type CliCommand,
+  type CliSetup,
+  type CliUninstall,
+  type ConfigFileFormat,
+  type ConfigFileSetup,
+  detectAgents,
+  type SetupConfig,
+  type UninstallConfig,
+} from "./agent-definitions.js";
+export {
+  type InitDependencies,
+  type InitOptions,
+  type InitUninstallOptions,
+  initAction,
+  initUninstallAction,
+  registerInitCommand,
+} from "./init.js";
+export {
+  type ConfigUninstallCheckResult,
+  executeCliSetup,
+  executeCliUninstall,
+  executeConfigFileSetup,
+  executeConfigFileUninstall,
+  getConfigUninstallCheckStatus,
+  hasServerConfigEntry,
+  isConfiguredForUninstall,
+  type MergeResult,
+  mergeServerConfig,
+  type RemoveResult,
+  removeServerConfig,
+  type SetupResult,
+  type UninstallResult,
+} from "./setup-handlers.js";

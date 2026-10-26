@@ -1,0 +1,828 @@
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import {
+  PackageIntelligenceTargetNotFoundError,
+  PackageIntelligenceVersionNotFoundError,
+} from "@githits/core-internal";
+import { AuthRequiredError } from "@githits/mcp/internal";
+import { Command } from "commander";
+import {
+  createMockPackageIntelligenceService,
+  defaultVulnerabilityReport,
+} from "../../services/test-helpers.js";
+import {
+  type PkgVulnsCommandDependencies,
+  pkgVulnsAction,
+  registerPkgVulnsCommand,
+} from "./vulns.js";
+
+function transitiveVulnerabilityReport() {
+  const report = structuredClone(defaultVulnerabilityReport);
+  report.transitive = {
+    affectedCount: 1,
+    nonAffectingCount: 0,
+    unknownCount: 0,
+    totalCount: 1,
+    advisoryScope: "AFFECTED",
+    totalPackagesAnalyzed: 2,
+    packageCount: 1,
+    occurrenceCount: 1,
+    packages: [
+      {
+        affectedCount: 1,
+        nonAffectingCount: 0,
+        unknownCount: 0,
+        totalCount: 1,
+        registry: "NPM",
+        name: "body-parser",
+        occurrenceCount: 1,
+        occurrences: [
+          {
+            version: "1.19.0",
+            affectsResolvedVersion: true,
+            matchedAffectedVersionRanges: ["< 2.0.0"],
+            fixVersionsAboveResolved: ["2.0.0"],
+            nearestFixedVersion: "2.0.0",
+            advisory: {
+              osvId: "GHSA-body-parser",
+              aliases: ["CVE-body-parser"],
+              summary: "Body parser issue",
+              severityScore: 8.0,
+            },
+          },
+        ],
+      },
+    ],
+  };
+  return report;
+}
+
+describe("pkg vulns help", () => {
+  it("describes row-complete CLI text and additive verbose detail", () => {
+    const command = registerPkgVulnsCommand(new Command().command("pkg"));
+    const description = command.description();
+    const singleLineDescription = description.replace(/\s+/g, " ");
+    const verboseOption = command.options.find(
+      (option) => option.long === "--verbose",
+    );
+
+    expect(singleLineDescription).not.toContain("capped");
+    expect(singleLineDescription).toContain(
+      "CLI text shows every selected direct and transitive advisory row",
+    );
+    expect(singleLineDescription).toContain(
+      "without changing row completeness. --json emits the complete structured envelope",
+    );
+    expect(verboseOption?.description).toContain("complete range/fix evidence");
+    expect(verboseOption?.description).toContain("row count is unchanged");
+  });
+
+  it("registers --transitive with truthful opt-in guidance", () => {
+    const command = registerPkgVulnsCommand(new Command().command("pkg"));
+    const help = command.helpInformation();
+    expect(help).toContain("--transitive");
+    expect(command.description()).toContain(
+      "npm-audit-style evidence covering vulnerabilities in versions",
+    );
+    expect(command.description()).toContain("adds graph-analysis cost");
+    expect(command.description()).toContain(
+      "--severity and --scope apply to direct",
+    );
+    expect(command.description()).toContain(
+      "--include-withdrawn affects direct package rows only",
+    );
+  });
+});
+
+describe("pkgVulnsAction", () => {
+  const mcpUrl = "https://mcp.githits.com";
+
+  function createDeps(
+    overrides: Partial<PkgVulnsCommandDependencies> = {},
+  ): PkgVulnsCommandDependencies {
+    return {
+      packageIntelligenceService: createMockPackageIntelligenceService(),
+      codeNavigationUrl: "https://pkgseer.dev",
+      hasValidToken: true,
+      mcpUrl,
+      ...overrides,
+    };
+  }
+
+  it("renders every selected advisory row in the default terminal block", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgVulnsAction("npm:express", {}, createDeps());
+
+    const combined = writes.join("");
+    expect(combined).toContain("express @ 4.18.0 | npm");
+    expect(combined).toContain("6 vulnerabilities affect this version");
+    expect(combined).toContain("MALWARE");
+    expect(combined).toContain("Fix version: 4.18.2.");
+    expect(combined).toContain("GHSA-nnnn-nnnn-nnnn");
+    writeSpy.mockRestore();
+  });
+
+  it("--verbose renders all advisory rows", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgVulnsAction("npm:express", { verbose: true }, createDeps());
+
+    const combined = writes.join("");
+    expect(combined).toContain("GHSA-nnnn-nnnn-nnnn");
+    expect(combined).not.toContain("... (+1 more; use -v)");
+    writeSpy.mockRestore();
+  });
+
+  it.each([undefined, false, true] as const)(
+    "passes transitive=%s to the service without changing direct filters",
+    async (transitive) => {
+      const packageVulnerabilities = mock(() =>
+        Promise.resolve(defaultVulnerabilityReport),
+      );
+      const service = createMockPackageIntelligenceService({
+        packageVulnerabilities,
+      });
+      const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+        (() => true) as typeof process.stdout.write,
+      );
+
+      await pkgVulnsAction(
+        "npm:express",
+        {
+          severity: "high",
+          scope: "all",
+          includeWithdrawn: true,
+          ...(transitive === undefined ? {} : { transitive }),
+        },
+        createDeps({ packageIntelligenceService: service }),
+      );
+
+      const params = (
+        packageVulnerabilities.mock.calls as unknown as Array<
+          [
+            {
+              minSeverity?: number;
+              advisoryScope?: string;
+              includeWithdrawn?: boolean;
+              includeTransitive?: boolean;
+            },
+          ]
+        >
+      )[0]?.[0] as {
+        minSeverity?: number;
+        advisoryScope?: string;
+        includeWithdrawn?: boolean;
+        includeTransitive?: boolean;
+      };
+      expect(params).toMatchObject({
+        minSeverity: 7.0,
+        advisoryScope: "ALL",
+        includeWithdrawn: true,
+      });
+      expect(params.includeTransitive).toBe(transitive);
+      writeSpy.mockRestore();
+    },
+  );
+
+  it.each([
+    ["normal text", { transitive: true }, false],
+    ["verbose affected text", { transitive: true, verbose: true }, false],
+    [
+      "verbose all text",
+      { transitive: true, verbose: true, scope: "all" },
+      true,
+    ],
+    [
+      "verbose historical text",
+      { transitive: true, verbose: true, scope: "non_affecting" },
+      true,
+    ],
+    ["JSON affected", { transitive: true, json: true }, true],
+  ] as const)(
+    "passes transitive advisory details for %s",
+    async (_label, options, expected) => {
+      const packageVulnerabilities = mock(() =>
+        Promise.resolve(defaultVulnerabilityReport),
+      );
+      const service = createMockPackageIntelligenceService({
+        packageVulnerabilities,
+      });
+      const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+        (() => true) as typeof process.stdout.write,
+      );
+      const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        await pkgVulnsAction(
+          "npm:express",
+          options,
+          createDeps({ packageIntelligenceService: service }),
+        );
+
+        const params = (
+          packageVulnerabilities.mock.calls as unknown as Array<
+            [
+              {
+                includeTransitive?: boolean;
+                includeTransitiveAdvisoryDetails?: boolean;
+              },
+            ]
+          >
+        )[0]?.[0];
+        expect(params).toMatchObject({
+          includeTransitive: true,
+          includeTransitiveAdvisoryDetails: expected,
+        });
+      } finally {
+        writeSpy.mockRestore();
+        logSpy.mockRestore();
+      }
+    },
+  );
+
+  it("renders and emits the additive transitive audit for --transitive", async () => {
+    const report = transitiveVulnerabilityReport();
+    const packageVulnerabilities = mock(() => Promise.resolve(report));
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (chunk: string | Uint8Array) => {
+        writes.push(
+          typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+        );
+        return true;
+      },
+    );
+
+    await pkgVulnsAction(
+      "npm:express",
+      { transitive: true, verbose: true },
+      createDeps({ packageIntelligenceService: service }),
+    );
+    expect(writes.join("")).toContain("Resolved dependencies");
+    expect(writes.join("")).toContain("body-parser@1.19.0");
+    expect(writes.join("")).toContain("nearest fix     2.0.0");
+    expect(writes.join("")).not.toContain("higher fixes");
+    expect(
+      (
+        packageVulnerabilities.mock.calls as unknown as Array<
+          [Record<string, unknown>]
+        >
+      )[0]?.[0],
+    ).toMatchObject({
+      includeTransitive: true,
+    });
+    writeSpy.mockRestore();
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    await pkgVulnsAction(
+      "npm:express",
+      { transitive: true, json: true },
+      createDeps({ packageIntelligenceService: service }),
+    );
+    const payload = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as {
+      transitive?: { packages: Array<{ name: string }> };
+    };
+    expect(payload.transitive?.packages[0]?.name).toBe("body-parser");
+    logSpy.mockRestore();
+  });
+
+  it("passes combined filters through and preserves transitive scope and withdrawal semantics", async () => {
+    const report = transitiveVulnerabilityReport();
+    report.transitive = {
+      affectedCount: 0,
+      nonAffectingCount: 0,
+      unknownCount: 0,
+      totalCount: 0,
+      advisoryScope: "ALL",
+      totalPackagesAnalyzed: 0,
+      packageCount: 0,
+      occurrenceCount: 0,
+      packages: [],
+    };
+    const packageVulnerabilities = mock(() => Promise.resolve(report));
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await pkgVulnsAction(
+      "npm:express",
+      {
+        severity: "HIGH",
+        scope: "all",
+        includeWithdrawn: true,
+        transitive: true,
+        json: true,
+      },
+      createDeps({ packageIntelligenceService: service }),
+    );
+    const params = (
+      packageVulnerabilities.mock.calls as unknown as Array<
+        [Record<string, unknown>]
+      >
+    )[0]?.[0] as {
+      registry: string;
+      packageName: string;
+      version?: string;
+      minSeverity?: number;
+      advisoryScope?: string;
+      includeWithdrawn?: boolean;
+      includeTransitive?: boolean;
+      includeTransitiveAdvisoryDetails?: boolean;
+    };
+    expect(params).toEqual({
+      registry: "NPM",
+      packageName: "express",
+      version: undefined,
+      minSeverity: 7.0,
+      includeWithdrawn: true,
+      includeTransitive: true,
+      advisoryScope: "ALL",
+      includeTransitiveAdvisoryDetails: true,
+    });
+    const payload = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as {
+      filter?: unknown;
+      transitive?: {
+        advisoryScope: string;
+        withdrawnAdvisoriesIncluded: boolean;
+      };
+    };
+    expect(payload.filter).toEqual({
+      minSeverity: "high",
+      advisoryScope: "all",
+      includeWithdrawn: true,
+    });
+    expect(payload.transitive?.advisoryScope).toBe("all");
+    expect(payload.transitive?.withdrawnAdvisoriesIncluded).toBe(false);
+    logSpy.mockRestore();
+  });
+
+  it("prints the lean JSON envelope when --json is set", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await pkgVulnsAction("npm:express", { json: true }, createDeps());
+
+    const output = logSpy.mock.calls[0]?.[0] as string;
+    const payload = JSON.parse(output);
+    expect(payload.name).toBe("express");
+    expect(payload.summary.total).toBe(6);
+    expect(payload.summary.bySeverity.malware).toBe(1);
+    logSpy.mockRestore();
+  });
+
+  it("--json --verbose matches --json", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await pkgVulnsAction("npm:express", { json: true }, createDeps());
+    await pkgVulnsAction(
+      "npm:express",
+      { json: true, verbose: true },
+      createDeps(),
+    );
+
+    expect(JSON.parse(logSpy.mock.calls[1]?.[0] as string)).toEqual(
+      JSON.parse(logSpy.mock.calls[0]?.[0] as string),
+    );
+    logSpy.mockRestore();
+  });
+
+  it("echoes filters in terminal text and JSON", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgVulnsAction(
+      "npm:express",
+      { severity: "HIGH", includeWithdrawn: true },
+      createDeps(),
+    );
+
+    const combined = writes.join("");
+    expect(combined).toContain("Filter  severity >= high");
+    expect(combined).toContain("Filter  include withdrawn");
+    writeSpy.mockRestore();
+
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    await pkgVulnsAction(
+      "npm:express",
+      { severity: "HIGH", includeWithdrawn: true, json: true },
+      createDeps(),
+    );
+    const payload = JSON.parse(logSpy.mock.calls[0]?.[0] as string);
+    expect(payload.filter).toEqual({
+      minSeverity: "high",
+      includeWithdrawn: true,
+    });
+    logSpy.mockRestore();
+  });
+
+  it("passes --scope through and echoes it", async () => {
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgVulnsAction(
+      "npm:express",
+      { scope: "non_affecting" },
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ advisoryScope?: string }]
+    >;
+    expect(calls[0]?.[0]?.advisoryScope).toBe("NON_AFFECTING");
+    expect(writes.join("")).toContain("Scope   non-affecting advisories only");
+    writeSpy.mockRestore();
+  });
+
+  it("passes version from spec to the service", async () => {
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgVulnsAction(
+      "npm:express@4.17.0",
+      {},
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ version?: string }]
+    >;
+    expect(calls[0]?.[0]?.version).toBe("4.17.0");
+    writeSpy.mockRestore();
+  });
+
+  it("uses the canonical Go version for wire and response comparisons", async () => {
+    const goReport = structuredClone(defaultVulnerabilityReport);
+    goReport.package = {
+      name: "example.com/mod",
+      registry: "GO",
+      version: "v1.2.3",
+    };
+    const packageVulnerabilities = mock(() => Promise.resolve(goReport));
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgVulnsAction(
+      "go:example.com/mod@1.2.3",
+      { json: true },
+      createDeps({ packageIntelligenceService: service }),
+    );
+    await pkgVulnsAction(
+      "go:example.com/mod@1.2.3",
+      {},
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ version?: string }]
+    >;
+    expect(calls.map(([params]) => params.version)).toEqual([
+      "v1.2.3",
+      "v1.2.3",
+    ]);
+    const payload = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as {
+      requestedVersion?: string;
+    };
+    expect(payload.requestedVersion).toBeUndefined();
+    expect(writes.join("")).not.toContain("(requested");
+    logSpy.mockRestore();
+    writeSpy.mockRestore();
+  });
+
+  it("passes --severity → minSeverity float on the wire", async () => {
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgVulnsAction(
+      "npm:express",
+      { severity: "high" },
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ minSeverity?: number }]
+    >;
+    expect(calls[0]?.[0]?.minSeverity).toBe(7.0);
+    writeSpy.mockRestore();
+  });
+
+  it("tolerates uppercase --severity input", async () => {
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgVulnsAction(
+      "npm:express",
+      { severity: "CRITICAL" },
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ minSeverity?: number }]
+    >;
+    expect(calls[0]?.[0]?.minSeverity).toBe(9.0);
+    writeSpy.mockRestore();
+  });
+
+  it("passes --include-withdrawn through to the wire", async () => {
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgVulnsAction(
+      "npm:express",
+      { includeWithdrawn: true },
+      createDeps({ packageIntelligenceService: service }),
+    );
+
+    const calls = packageVulnerabilities.mock.calls as unknown as Array<
+      [{ includeWithdrawn?: boolean }]
+    >;
+    expect(calls[0]?.[0]?.includeWithdrawn).toBe(true);
+    writeSpy.mockRestore();
+  });
+
+  it("rejects unsupported registry (vcpkg) client-side with bare message", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgVulnsAction("vcpkg:foo", {}, createDeps());
+    } catch {
+      // expected exit
+    }
+
+    expect(errorSpy.mock.calls[0]?.[0]).toBe(
+      "pkg vulns only supports npm, pypi, hex, crates, nuget, maven, packagist, rubygems, go, and swift. Got: vcpkg.",
+    );
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects bad --severity label with INVALID_ARGUMENT", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgVulnsAction("npm:express", { severity: "severe" }, createDeps());
+    } catch {
+      // expected
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("Unsupported severity 'severe'");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects tag-style versions with an actionable INVALID_ARGUMENT message", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgVulnsAction("npm:express@v4.18.0", {}, createDeps());
+    } catch {
+      // expected
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("Invalid version 'v4.18.0'");
+    expect(msg).toContain("without a leading 'v'");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("routes service NOT_FOUND through --json error envelope", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: mock(() =>
+        Promise.reject(
+          new PackageIntelligenceTargetNotFoundError("Package not found"),
+        ),
+      ),
+    });
+
+    try {
+      await pkgVulnsAction(
+        "npm:ghost",
+        { json: true, transitive: true },
+        createDeps({ packageIntelligenceService: service }),
+      );
+    } catch {
+      // expected
+    }
+
+    const output = errorSpy.mock.calls[0]?.[0] as string;
+    const payload = JSON.parse(output);
+    expect(payload.code).toBe("NOT_FOUND");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("preserves backend VERSION_NOT_FOUND prose without recovery suggestions", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: mock(() =>
+        Promise.reject(
+          new PackageIntelligenceVersionNotFoundError(
+            "No matching version found",
+            "npm:lodash",
+            "99.99.99",
+            undefined,
+          ),
+        ),
+      ),
+    });
+
+    try {
+      await pkgVulnsAction(
+        "npm:lodash@99.99.99",
+        {},
+        createDeps({ packageIntelligenceService: service }),
+      );
+    } catch {
+      // expected exit
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("No matching version found");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("includes available-versions sample line when backend returns them", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: mock(() =>
+        Promise.reject(
+          new PackageIntelligenceVersionNotFoundError(
+            "No matching version found",
+            "express",
+            "99.0.0",
+            ["4.18.2", "4.18.1", "4.18.0", "4.17.4", "4.17.3", "4.17.2"],
+          ),
+        ),
+      ),
+    });
+
+    try {
+      await pkgVulnsAction(
+        "npm:express@99.0.0",
+        {},
+        createDeps({ packageIntelligenceService: service }),
+      );
+    } catch {
+      // expected exit
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain(
+      "Did you mean 4.18.2, 4.18.1, 4.18.0, 4.17.4, 4.17.3",
+    );
+    expect(msg).toContain("(+1 more)");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("throws AuthRequiredError before calling service when unauthenticated", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const packageVulnerabilities = mock(() =>
+      Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities,
+    });
+
+    await expect(
+      pkgVulnsAction(
+        "npm:express",
+        {},
+        createDeps({
+          packageIntelligenceService: service,
+          hasValidToken: false,
+        }),
+      ),
+    ).rejects.toThrow(AuthRequiredError);
+
+    expect(packageVulnerabilities).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
+  it("errors when pkgseer URL / service are missing", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgVulnsAction(
+        "npm:express",
+        {},
+        createDeps({
+          packageIntelligenceService: undefined,
+          codeNavigationUrl: undefined,
+        }),
+      );
+    } catch {
+      // expected
+    }
+
+    const combined = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(combined).toContain("Package intelligence is not configured");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+});

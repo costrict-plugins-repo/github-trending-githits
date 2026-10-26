@@ -1,0 +1,1332 @@
+# MCP Tools
+
+## Purpose
+
+This document explains the shared MCP tool architecture, its host boundaries,
+and how to add or modify tools.
+
+## Background
+
+GitHits has one shared MCP tool implementation and two server hosts. The public
+`@githits/mcp` package owns stable tool registration, descriptors,
+`quick_start`, schemas, handlers, and response formatting. The hosts are:
+
+- **Hosted** (`remote-mcp`) — serves `https://mcp.githits.com` and consumes a
+  released `@githits/mcp` version. It owns HTTP transport, request-scoped
+  service composition, auth/session handling, deployment, and observability.
+- **Local** (`githits-cli`) — runs via `githits mcp start` over stdio and adds
+  local auth/storage, CLI startup, and a config-gated experimental seam (with no
+  tools registered) around the shared stable package surface.
+
+Do not copy or independently implement package-owned MCP behavior in
+`remote-mcp`. A change here reaches hosted clients after `@githits/mcp` is
+released, `remote-mcp` updates the dependency, and the hosted server is
+deployed; no second tool implementation change is required.
+
+## Tool-selection contract
+
+MCP clients may receive only a truncated catalog before loading a tool
+definition. The verified claude.ai deferred-tool catalog renders the first
+description sentence, capped at 80 displayed characters: sentences longer than
+79 characters appear as their first 79 plus an ellipsis. Every tool description
+therefore starts with a compact, benefit-specific sentence. Do not spend that
+sentence on generic phrasing such as “Use when the user asks” or “Use when the
+user needs”. The first sentence prioritizes the user's likely question and the
+tool's distinct role; keep it within 79 characters when it must render whole.
+Keep the first 80 raw characters useful for clients that expose a raw prefix.
+Keep registry counts and enumerations in the loaded definition because they
+crowd out trigger language and can imply incomplete or inconsistent catalog
+boundaries. The selected description plus schema owns the distinct job, minimum
+call shape, supported target family, operation-specific exceptions, and callable
+follow-up mapping. It must not require a neighboring evidence descriptor to
+explain its own arguments. The guide/skill owns recurring cross-tool policy;
+retain short local reminders rather than copying full policy or parameter lists.
+
+The raw 80-character boundary comes from an August 2026 Claude Desktop connector
+session with no GitHits memories or user instruction to use GitHits. Its
+unguided selection context contained the tool name and first 80 description
+characters; the connector description and MCP server instructions were absent.
+A separate September 2026 claude.ai session exposed the first-sentence renderer
+described above. These observations are host-specific rather than MCP protocol
+guarantees, but together define the catalog surfaces GitHits designs and tests.
+Other clients may expose different amounts or kinds of discovery context.
+
+Write the opening sentence as the answer to “why would an agent choose this tool
+now?”:
+
+- Match natural questions such as “is this version vulnerable?” or “what does
+  this package depend on?”, rather than catalog taxonomy or implementation
+  mechanics.
+- For mutable facts, cover broad qualitative questions as well as exact
+  lookups, and explain why current evidence outranks model memory. Describe the
+  stable mechanism without asserting an unverified update cadence or a
+  model-specific amount of staleness. The complete `pkg_vulns` description, for
+  example, must cover both “is this version vulnerable?” and “does this package
+  have a lot of vulnerabilities?”.
+- Distinguish sibling tools before adding shared corpus terms. For example,
+  package health, advisory detail, dependency graphs, changelog history, and
+  upgrade review need visibly different openings.
+- Make every opening sentence stand alone. Do not assume ordering, adjacency, a
+  shared connector description, `quick_start`, or server instructions supply
+  context.
+- Keep exhaustive registry coverage, schemas, limits, handoffs, and safety
+  detail in the remainder of the loaded definition. Do not pad the opening
+  sentence toward the catalog limit.
+- Avoid internal periods in the opening sentence, including abbreviations,
+  version literals, and filenames; the observed host sentence boundary is
+  otherwise ambiguous, and the descriptor contract rejects it.
+
+GitHits intentionally omits MCP initialize instructions because clients treat
+them inconsistently: some hide them, some promote them, and some repeat them
+with every tool. Guidance has two delivery paths: a loaded `githits-mcp` skill
+already carries the stable guide and skips `quick_start`,
+while plain MCP clients use the no-argument, read-only `quick_start` tool once
+per session. The `quick_start` catalog sentence states the required first call
+and the untrusted-content safety rules it loads in 72 characters, so claude.ai
+renders it whole; the skill-loaded exception remains in the full description.
+Every evidence or preparatory descriptor repeats the prerequisite as an
+MCP-composed footer without changing its distinct opening sentence or raw
+prefix. There are no
+tool-specific exceptions. The stable guide is owned by
+`packages/mcp/src/mcp/instructions.ts`; the terminal skill section must stay
+byte-for-byte aligned under `src/skills-packaging.test.ts`. Local
+`buildLocalMcpQuickStart()` appendices are runtime-only and excluded from that
+public copy; they do not change when `quick_start` is called. Individual tool
+descriptions remain self-contained so direct tool selection can still find the
+right evidence tool before the bootstrap. The footer is guidance, not proof that
+the guide loaded: current Haiku descriptor-only baselines sometimes skip it.
+The shared guide owns general wait and indexing-recovery guidance using the
+estimates, indexed alternatives, and suggested actions visible in the output,
+without requiring JSON field paths. Wait parameter
+descriptions contain only units, default, and maximum; numeric values come from
+the shared wait constants. Tool descriptions retain tool-specific continuation
+rules without repeating the general wait policy.
+Transport-neutral callable descriptions do not receive the footer because that
+surface does not guarantee a `quick_start` tool exists.
+
+The `quick_start` catalog sentence was corrected after a September 2026
+claude.ai session skipped `quick_start`: exact-name retrieval matched the
+prerequisite footer repeated by the dependent tools, while `quick_start`'s own
+catalog sentence included the loaded-skill exception and omitted both the
+literal `quick_start` token and the safety consequence. The literal-name fix
+shipped in `6e7b4e8` but was reverted by `2a02a2e` without correcting these docs.
+The current 72-character sentence restores the token, first-call purpose, and
+safety benefit because the observed retrieval matched description bodies rather
+than tool names. This is a discovery correction, not enforced bootstrap. The
+transcript-derived probe in
+`eval/agentic/probes/claude-ai-deferred-catalog.md` preserves that catalog layout
+and substitutes the current rendered `quick_start` sentence.
+
+Use the tools in these roles:
+
+- **Known-target discovery:** Start with `search` for relevance-ranked,
+  open-ended investigation across documentation, specifications, source,
+  symbols, tests, and examples. Omit `source` for broad discovery.
+- **Exact source matching:** Use `grep` when the literal or regex pattern is
+  already known. It returns one deterministic page across ordered package,
+  repository, and site targets. Use `search` for conceptual discovery, `read`
+  for an exact returned locator, and `list` for path enumeration. The retained
+  `githits code grep` command is a CLI-only compatibility surface.
+- **Navigation and documentation:** Use `list` to browse files or documentation
+  pages in a package, repository, or explicit site inventory, then `read` an
+  exact returned file or page. Package and repository targets include their own
+  documentation files. Search package documentation first and reuse an emitted
+  explicit `site:` target when hosted documentation needs browsing.
+  The routing guide selects among these tools; selected descriptions and schemas
+  retain callable follow-up mapping.
+  `get_example` is for code examples
+  from projects across open source and unknown-target/global patterns; for a known
+  package or repository, use `search`, `list`, `read`, or `grep` according to
+  the task.
+- **Conditional search continuation:** Use visible hits for lookup now. Call
+  `search_status` only when updated results matter and the preceding `search`
+  response explicitly supplies both a `searchRef` and a `search_status` action.
+  The initial `search` call can complete directly; never repeat it to poll.
+  A completed or terminal reference is stored; do not poll it or an unrecognized
+  status. Start a later search when a fresh session is needed.
+- **Package intelligence:** Use `pkg_info` for a latest-version health and
+  adoption overview, `pkg_vulns` for CVEs/advisories and affected or fixed
+  versions, `pkg_deps` for dependency graphs, `pkg_changelog` for release and
+  changelog evidence, and `pkg_upgrade_review` for current-versus-target
+  evidence. The routing guide selects among package tools; descriptions retain
+  their own call contract rather than neighboring-tool menus.
+  `pkg_changelog` does not promise newest-first ordering or any other date
+  ordering; callers should use the returned dates and versions.
+- **Language selection:** Omit `get_example.language` to infer it. If GitHits cannot match it, retry with a suggested language from the error or omit `language`.
+
+For locator selection, fragment precedence, Ask adaptation, and CLI compatibility,
+see [Unified read](unified-read.md).
+
+## Current Tools
+
+The CLI and MCP expose the same `list` contract backed by `Query.list`. It
+lists package/repository source inventories, including package-local
+documentation files, or an explicitly targeted `site:` inventory. Legacy
+grouped CLI commands remain available, but their former MCP tools are no longer
+callable.
+
+| Tool | Parameters | Description |
+|---|---|---|
+| `quick_start` | none | Required first call for a plain GitHits MCP session. Loads shared safety, routing, target, output, and evidence rules. Skip only when the loaded `githits-mcp` skill already supplies the guide; descriptor reminders do not enforce loading. |
+| `get_example` | `query`, `language?`, `license_mode?`, `format?` | Find code examples from projects across open source. Use when no single target is the answer. Also use when target-scoped search came up short; verify version-sensitive patterns against source/docs. Markdown includes source provenance, generated references and optional `solution_id`; the language field owns correction guidance. |
+| `search` | `query`, `target?` (compact string), `targets?` (compact strings), `source?`, `public_only?`, `allow_partial_results?`, `limit?`, `offset?`, `wait_timeout_ms?`, `format?` | Discover relevant docs, code, and symbols in a known public target. Pass `query` and either `target` or `targets`, not both. Constraints belong in `query`; inspect qualifier/source warnings. Continue only with an explicit `searchRef` and `search_status` action. |
+| `search_status` | `search_ref`, `wait_timeout_ms?`, `format?` | Continue an explicit search reference for progress and results. Pass the returned `searchRef` as `search_ref` only with an explicit continuation action. Partial hits require the original opt-in; terminal or unrecognized statuses are not polled. |
+| `list` | `target`, `paths?`, `recursive?`, `file_types?`, `languages?`, `intents?`, `limit?`, `after?`, `wait_timeout_ms?`, `format?` | List files or documentation pages in one package, repository, or explicit site inventory. Target-relative literal paths and globs form a union for every target. Selected directories show immediate children unless `recursive` expands them; glob depth is independent. Default text is one path per line with direct read and continuation guidance. JSON preserves exact actions and metadata for programmatic consumers. |
+| `pkg_info` | `target` (unpinned package string), `verbose?`, `format?` | Assess latest package health and adoption: license, downloads, and activity. Requires an unpinned package target and always returns latest; latest-affected and package-wide history counts are distinct. |
+| `pkg_vulns` | `target` (package string), `min_severity?`, `advisory_scope?`, `include_withdrawn?`, `include_transitive?`, `verbose?`, `format?` | Check current package advisories. Use current evidence, not memory or cutoff disclaimers; distinguish selected-version risk from package history. Transitive evidence is opt-in and adds graph-analysis cost; selected fields define filter/scope limits. |
+| `pkg_deps` | `target` (package string), `lifecycle?`, `include_importers?`, `include_issues?`, `max_depth?`, `format?` | Inspect what a package depends on, directly or transitively. Direct runtime dependencies are the default; fields opt into other groups, transitive footprint, importer provenance or issue analysis. Public graphs are not application lockfile/reachability evidence. |
+| `pkg_changelog` | `target`, `limit?`, `changes?`, `omit_bodies?`, `verbatim?`, `verbose?`, `body_lines?`, `format?` | All parsed statements with available classifications; `changes` filters before pagination. `verbatim` shows original notes instead; `verbose` is its deprecated alias. Body omission shows only the timeline. Latest mode caps entries; pins select one release; `@from..to` excludes `from` and includes `to`. Empty selections succeed. |
+| `pkg_upgrade_review` | `registry?`, `package_name?`, `current_version?`, `target_version?`, `packages?`, `changes?: string`, `skip_transitive_security?`, `include_dependency_issues?`, `min_severity?`, `verbose?`, `format?` | Review a package upgrade: vulnerabilities, release statements, compatibility, and dependency changes. `changes` accepts `actionable`, `important`, or `all`; omitted or blank means focused. Filters affect detailed quotes, not whole-range counters or batch ranking. Reports facts without an upgrade verdict; supports up to 30 packages. |
+| `read` | `target` (string), `path?`, `selector?`, `start_line?`, `end_line?`, `wait_timeout_ms?`, `format?` | Pass a code file target + path, an explicit `site:` target + target-relative page path, a compact `target#symbol` or selector, or another emitted docs target to unified backend read; the returned type determines code/docs presentation. Preserve emitted site action values exactly; do not repeat the target's scope in the path. `/` reads the site's landing page. HTTP(S) docs fragments select sections unless explicit bounds override them. Text displays 150/300 lines; exact-file code caps before fetching, while docs JSON keeps the backend selection. The backend applies wait where relevant. See [unified read](unified-read.md). |
+| `grep` | `targets` (ordered `{target, corpus?, path_selectors?}` objects), `pattern`, `pattern_type?`, `ignore_case?`, `context_lines_before?`, `context_lines_after?`, `max_matches?`, `cursor?`, `wait_timeout_ms?`, `format?` | Search known regex or literal matches across package, repository, and explicit site targets. Regex, case-sensitive matching, zero context, all indexed repository files, 100 matches, and a 30,000 ms first-page preparation wait are the defaults. Package targets also include selected hosted docs. Follow exact read locators and replay partial pages with the same targets and controls. Legacy repository-file filters remain on CLI `githits code grep`. See [unified grep](unified-grep.md). |
+
+`get_example` explicitly requests MCP source-read syntax from the backend.
+Supported code references include `read({...})` calls alongside their original
+links and licenses; unsupported references remain links. Both text and JSON use
+MCP syntax, with the existing `{result, solution_id?}` JSON envelope and trailing
+text solution ID unchanged. Calls inspect cited sources and are never executed
+automatically. `GetExampleSearchParams.sourceFormat` and the client service's
+`SearchParams.sourceFormat` accept optional `"cli" | "mcp" | "url"`; omission
+leaves server defaults in effect. This is service configuration, not a new tool
+argument.
+
+`quick_start`, `get_example`, `search`, `search_status`, `list`, `read`,
+`grep`, `pkg_info`, `pkg_vulns`, `pkg_deps`, `pkg_changelog`, and
+`pkg_upgrade_review` are registered by default. The package/source service URL
+defaults to the GitHits-managed endpoint and can be overridden via
+`GITHITS_CODE_NAV_URL` for local development.
+
+`pkg_vulns`, `pkg_deps`, and `pkg_changelog` require
+`target: "registry:name[@version]"`, for example `npm:express@5.2.1`; omit the
+pin for latest. `pkg_changelog` also accepts `@from..to` intervals.
+`pkg_info` requires an unpinned target such as `npm:express`. These tools accept
+package coordinates, not repository, site, or read locators. Scoped npm and Maven
+names retain their `@` and `:` respectively. Their old separate coordinate inputs
+are removed, not aliases. `pkg_upgrade_review` still uses the structured inputs
+listed above; CLI positional specs and options for it are unchanged.
+
+Package input spelling accepts `cargo:` as an alias for `crates:` (public
+crates.io), including structured registry inputs. Canonical identities remain
+`crates` / `CRATES`; see [registry input aliases](package-registry-aliases.md).
+
+## Transitive vulnerability audits
+
+`pkg_vulns` remains direct-only by default. Set MCP `include_transitive: true`
+or CLI `--transitive` to opt into npm-audit-style evidence for vulnerabilities
+affecting versions resolved in the dependency graph; the extra graph analysis is
+intentional and can cost more. `advisory_scope` / `--scope` and `min_severity` /
+`--severity` apply to both direct and transitive rows: `affected` checks resolved
+versions, `non_affecting` returns historical dependency advisories, and `all`
+returns both. `include_withdrawn` / `--include-withdrawn` applies only to direct
+package rows; transitive withdrawn advisories are always excluded.
+
+The additive JSON `transitive` object has `scope: "resolved_dependencies"`,
+`advisoryScope`, `withdrawnAdvisoriesIncluded: false`, a numeric `summary`
+containing `totalPackagesAnalyzed`, `packageCount`, `occurrenceCount`, and an
+optional `bySeverity` partition of every row selected by `advisoryScope`, plus a
+`packages` array. `bySeverity` is not an affected-only risk histogram under
+`all` or `non_affecting`; each occurrence preserves `affectsResolvedVersion` so
+callers can distinguish current from historical evidence. Affected
+rows include non-empty `matchedAffectedVersionRanges` plus higher-fix candidates,
+while historical rows have empty matched-range and fix arrays. The required
+`fixVersionsAboveResolved` array may also be empty on affected rows when no
+higher fix is known; `nearestFixedVersion` is omitted in that case.
+Optional advisory-wide `affectedRanges` and `fixedIn` arrays are omitted when
+unavailable and remain distinct from those occurrence-specific fields. JSON is
+complete and lossless. CLI compact text shows every selected direct and
+transitive row; MCP compact text caps selected rows at five and uses the
+MCP-native `use verbose=true or format=json` hint. Verbose text changes detail,
+not CLI row completeness, and shows every selected occurrence. Transitive
+detail labels align at the package coordinate: affected rows show `matched`,
+`nearest fix`, non-redundant `higher fixes`, then aliases; historical verbose
+rows show `advisory ranges`, `advisory fixes`, then aliases. CLI `--json` and
+MCP `format: "json"` use the same envelope. Compact transitive text and
+affected-only verbose text omit the transitive advisory-wide arrays from the
+wire; historical/all-scope verbose text and JSON conditionally select,
+validate, and preserve them in the field-minimal transitive query. The service
+performs one sequential dependency query with the resolved root version and
+fails closed on malformed identity/count/fix evidence instead of returning
+partial direct-only results.
+
+## Ecosystem Audit
+
+Use `bun run audit:pkg-ecosystems` to run a live CLI audit across representative packages from every package registry supported by package metadata tools. The script checks `pkg_info`, `pkg_changelog`, `pkg_vulns`, and `pkg_deps` with JSON output so ecosystem regressions are visible without hand-running dozens of commands.
+
+The fixture matrix lives in `scripts/pkg-ecosystem-audit.ts` and covers npm, PyPI, Hex, Crates, NuGet, Maven, Zig, vcpkg, Packagist, RubyGems, Go, and Swift. Each registry has three representative packages. `pkg_vulns` failures for vcpkg and Zig are expected and are reported as `expected-unsupported`; all 12 registries are expected to work for `pkg_deps`. Any other failure exits non-zero, including backend data anomalies that should be fixed and rechecked later.
+
+Useful invocations:
+
+```bash
+bun run audit:pkg-ecosystems
+bun run audit:pkg-ecosystems --registry zig
+bun run audit:pkg-ecosystems --tool pkg_vulns
+bun run audit:pkg-ecosystems --limit-packages-per-registry 1
+bun run audit:pkg-ecosystems --out tmp/pkg-ecosystem-audit.jsonl
+```
+
+Treat failures as live backend or contract findings, not deterministic unit-test failures. Before filing a backend issue, reproduce the failing package with `npx githits@latest` and include the command, JSON error envelope, registry/package name, and whether comparable packages in the same registry pass.
+
+**Unified `search` query syntax.** The `search.query` field is the backend discovery query syntax, not a raw pass-through to a per-source search engine. It supports implicit `AND`, uppercase `OR`, parentheses, unary `-`, quoted phrases, semantic qualifiers (`kind:`, `category:`, `path:`, `lang:`, `name:`, `intent:`), and routing qualifiers (`registry:`, `package:`, `version:`, `repo:`). MCP callers put these constraints directly in `query`; the backend owns parsing, current enum validation, recovery warnings, and per-source compilation. Per-source support, ignored features, and incompatibilities are reported in `sourceStatus`. CLI users retain `--kind`, `--category`, `--path-prefix`, `--intent`, `--name`, and `--lang`; the shared request builder adapts those human-facing flags to the same backend operation.
+
+**Partial-result truth.** Search defaults to partial results so ready sources can contribute while other target/source pairs prepare. Explicit `allow_partial_results: false` requires atomic evidence across runnable pairs. Every result-bearing initial `search` payload and stored `search_status.result` carries the backend's exact `partialResults: boolean`, including `false` for an atomic serveable interim snapshot and `true` for a subset of requested evidence. A progress-only response with no result snapshot omits the field. This additive field is retained unchanged in CLI `--json` and MCP `format: "json"`; text-v1 explains missing scope through attributed source/preparation notes or a short full-request warning, including completed empty snapshots; it does not label headlines `partial`.
+
+**Repository search evidence locators.** Repository code and symbol hits keep the legacy target-relative `locator.filePath` and evidence `startLine` / `endLine` while also exposing the repository-root `repositoryFilePath`, exact served `commitSha`, explicit `evidenceRange`, original `indexedRange`, and optional `symbolContext`. Evidence includes `matchLine`, backend `rangeKind`, and `matchSpansTruncated`; symbol context keeps backend identity/kind plus the fixed lowercase relation `encloses_match` or `associated_with_indexed_chunk`. A proven enclosing relation always has one complete `definitionRange` containing both target-relative and repository-root paths. Associated or identity-only context may omit that range. Malformed partial definition locators invalidate the search response instead of being repaired or dropped.
+
+Initial, partial, and stored search results carry
+`repositoryEvidence.bm25MatchFields`, `repositoryEvidence.matchedSource`, and
+`documentationPreview`, including nulls and empty preview highlight lists.
+Search and `search_status` no longer select or emit hit `summary`, summary
+highlights, hit `contentSafety`, or compatibility `focusedSource` in text or JSON.
+Legacy locator ranges and title highlights remain.
+
+`bm25MatchFields` names the indexed fields that contributed positive terms:
+`SYMBOL_NAME`, `FILE_PATH`, `DOCUMENTATION`, and `SOURCE_IDENTIFIER`. A known list
+is complete, ordered and nonempty; null means unknown/unsupported, not no matches.
+It is neither a term-to-field map nor proof of a source span. `matchedSource`
+independently carries producer-proven, numbered source: inclusive line bounds,
+nullable match anchor, non-null range kind, grapheme highlights, and crop flags.
+The old compatibility source was navigation context and was never match proof.
+
+Repository code/docs text shows matched source with the existing outer-to-inner
+semantic scope hierarchy, without routine authority captions or field inventories.
+Scopes are declaration metadata, not reconstructed source signatures.
+Producer target attribution and target-relative paths stay in the evidence
+header; source bounds own its range. Source indentation, line numbering, and line
+boundaries are preserved without prose wrapping or client cropping. The `>` gutter
+marks highlighted lines without color. Whole-line omissions, inline crops,
+truncated scope chains, and incomplete highlights retain separate ASCII notices.
+
+When matched source is absent, repository text shows one candidate header with
+the backend's bounded read window as `file:start-end`; `candidate` makes clear
+that those coordinates do not prove a match. For a bare identifier query, the
+formatter splits camel-case/underscore fragments and reports only literal
+fragments visible in the returned title when `SYMBOL_NAME` contributed or path
+when `FILE_PATH` contributed. These `visible terms` are
+observed substrings of the returned text, not the producer's exact BM25 term
+list or a term-to-field map. If no fragment is visible, the header names the
+contributing indexed fields instead. Unknown
+field provenance stays a plain candidate. Scope blocks are not rendered as
+matched lines; older injected results
+without repository evidence still show `Snippet unavailable`. A present matched
+snippet always wins regardless of indexed-field provenance.
+When the returned symbol definition shares the displayed file and contains the
+candidate window, its kind and qualified name appear at the end of that header.
+This identifies the enclosing declaration without asserting a query match.
+Ranking and pagination remain backend-owned; the client does not deduplicate hits
+sharing a file.
+
+Crawled pages use `documentationPreview` text and zero-based half-open grapheme
+ranges. Convert offsets against the original preview before duplicate-heading
+removal and wrapping. A null preview leaves the actionable header. Repository
+docs use repository evidence, and explicit symbol hits retain title and locator
+navigation without a summary body.
+
+Backend `readTarget` owns each copyable action, including its target/path pair,
+selector and full bounds. Headers retain attribution and producer preview/source
+coordinates; one unwrapped action follows each hit. Shared presentation quotes
+CLI arguments and MCP JSON values without reconstructing fragments or choosing
+addresses from semantic/package/repository metadata. `selector` can be a code
+symbol or docs anchor. CLI text retains full selected ranges. Search JSON keeps
+MCP syntax/caps on both surfaces, and explicit path actions keep the existing
+300-line evidence-centered window. Pathless docs bounds remain uncapped.
+Null/absent actions get unavailable guidance, including missing exact revision
+for repository symbol hits whose only revision is mutable. Public JSON uses an
+explicit whitelist; descriptors stay internal through interim and retained status
+snapshots, while producer provenance and null/omission behavior persist. See
+[unified-read.md](unified-read.md) for parsing and continuation ownership.
+
+The service selects only v31 repository evidence on both search paths, for CLI
+and MCP text and JSON. Omitting the legacy fields from the selection makes the
+producer skip legacy presentation and its CAS hydration. Its presentation pass
+skips CAS for path-only or unfocused hits. It requests the numbered
+`matchedSource` range only for authoritative source. Semantic metadata, BM25
+fields, and crawled previews need no repository CAS. This establishes a per-hit
+read contract, not a measured latency improvement. Rendering never fetches or
+stitches source.
+
+The v31 evidence client merged in PR
+[#423](https://github.com/githits-com/githits-cli/pull/423) on 2026-09-28.
+CLI/MCP live smoke and a targeted Codex descriptor eval passed, with no reported
+isolation violations. Development queries verified path-only hits, matched source,
+and crawled previews without retired fields. Producer source and tests established
+the per-hit CAS selection contract; no live CAS telemetry or latency improvement
+was measured. Review corrected stale output types before merge.
+
+New clients require
+the producer's September 7 v31 additive schema; no older-schema retry is
+introduced. After client
+publication the producer must retain that schema during rollback. Hosted clients
+adopt it only after the MCP package release and a separate remote-server dependency
+update/deployment.
+
+The current text uses `-` scope markers and omits parameter names and return
+types; JSON retains them. See [the semantic-context evaluation](search-semantic-context-evaluation.md)
+for the controlled comparisons, attribution regression, and measured limitations.
+The compact layout is not a demonstrated task-token optimization.
+
+**Promoted `warnings[]`.** Noteworthy `sourceStatus` entries — sources reporting `incompatibleQueryFeatures`, `ignoredQueryFeatures`, `incompatibleFilters`, `ignoredFilters`, lifecycle anomalies (`indexingStatus`, `codeIndexState`), or a free-form `note` — are also surfaced as a top-level `warnings: string[]` in the completed/incomplete payloads (and appended after parser warnings inside the `search_status` result block). The structured detail still lives in `sourceStatus`; `warnings[]` is the agent-visible signal that something about execution did not match the request. On completed empty results, healthy non-contributor source entries are also retained with zero `resultCount` and served identity; requested/fresh labels emit only when they materially differ from served. Contributor-bearing DOCS rows retain their physical contributors instead of duplicating healthy served/current resolution metadata. Healthy `INDEXED` / `CURRENT` / non-divergent `STALE` states never become warnings. `PROVISIONAL` is queryable but remains a visible non-healthy indexing signal, including on completed responses. Successful non-empty responses keep the prior compact projection. JSON keeps promoted warnings and source-status detail lossless; MCP text classifies parser/query and structured constraint facts once below the outcome and does not repeat promoted lifecycle/freshness warning prose or opaque notes. Implementation in `buildSourceStatusWarnings` and empty-result compaction (`packages/mcp/src/shared/unified-search-response.ts`).
+
+**Standalone-site recovery.** `search` accepts exact documentation targets as
+`site:<host[/path]>`. Backend-owned `sourceStatus[].suggestedSiteTargets` labels
+are preserved in order, with the exact truncation Boolean. The shared text
+projection keeps them in the target group: an active suggestion-only target shows
+`available:`, while a completed-empty or terminal target can show one replayable
+`Try:` line with the remaining suggestions summarized there. Suggestions are
+advisory rather than aliases; the client never selects or retries one automatically.
+
+**Unified target-state output.** MCP `search` and `search_status` text-v1 return one
+outcome-first response. The headline carries result count/type breakdown,
+active/terminal lifecycle, readiness, and pagination when applicable. A completed
+current result set uses a `Sources:` section with compact served-identity bullets.
+Repository rows prefer an eight-character commit pin with independently known
+UTC dates and historical refs. Documentation retains repository or site locators;
+corpora, request aliases, freshness and coverage remain explicit. `Preparing:`
+identifies actual repository work or documentation preparation, with advisory
+timing and requested aliases. An unresolved requested tag is not repeated when
+its package request already appears under that preparation; independently
+resolved commits remain separate. Target-local state, alternatives, constraints
+and at most one `Fix:`/`Try:` recovery line follow when relevant. Completed-empty
+and terminal site suggestions remain `Try:`-eligible even when the site lane
+was searched empty. Lane order is `code`, `symbols`, `repository docs`, concrete
+site docs, then docs. Hits remain a separate numbered ranked list.
+
+Exact `NOT_FOUND` and `UNRESOLVABLE` reasons are client-owned and lane-specific:
+`package not found: code`, `version unavailable: code`, or
+`repository ref unresolved: code`, for example. If the same target has searched or
+indexing evidence, the reason becomes bare (`not found: symbols`) and no coordinate
+recovery is suggested. Unknown unavailable states remain `unavailable`; backend
+notes and reason enums are not copied into text. Query-wide warnings remain one
+global `Warnings:` block after target rows and before hits; target-owned constraints
+stay in their target row and unowned source constraints remain global.
+
+Optional footers use `Read:`, `More results:` and `Follow-up:` in that order.
+Active continuation uses the supplied `searchRef` once under Follow-up, with
+native `search_status search_ref="..." wait_timeout_ms=30000` syntax when no
+range is available. Supported indexing ranges select a bounded wait. Usable
+hits get a read first and a conditional wait. Terminal/unknown sessions require
+a fresh search, never polling their stored reference. Target-local recovery
+suppresses generic rerun/query-rewrite advice, not pagination or active status.
+
+JSON remains the lossless stable boundary: `sourceStatus`, warnings, target
+resolution, evidence notices, and hit metadata are retained there even when text
+collapses them. `search_status` uses the same projection for stored results;
+contributors are not copied onto generic progress targets, and
+`allowPartialResults` keeps its separate pair-omission meaning.
+
+### `pkg_info` response shape
+
+**Default MCP text + JSON opt-in.** `pkg_info` defaults to compact triage text for agent turns: identity/license, description, repository popularity (stars/forks/issues and `[ARCHIVED]` when available), publish age, downloads, and explicit vulnerability status. Its vulnerability line labels the independent scopes as `Latest: ...` and `History: ...`: `vulnerabilities.total` remains the numeric count affecting the latest returned version, while `advisoryHistory.total` is the package-wide non-withdrawn, deduplicated advisory count across all versions. The history block is emitted whenever security data exists, including zero, and remains available when the nullable latest count is unavailable; an absent security block is not invented as zero. The field contains evidence only, with no inline action. CLI help routes full-history inspection to `githits pkg vulns <registry>:<name> --scope all`; the MCP routing guide selects `pkg_vulns`, whose `advisory_scope` field defines `"all"` history inspection. Color-enabled CLI output uses non-bold cyan for repository/homepage URL substrings without coloring attached statistics; no-color CLI and MCP output retain the same content and hierarchy.
+
+`verbose: true` adds GitHub language/topics/last-pushed, published-version count, download refresh date (when a download count is present), package-wide advisory rows under `Advisory history (all versions)`, and recent changes. `format: "json"` returns a lean payload designed for programmatic consumers and requests the detailed fields. The exact additive fields are top-level `versionCount`, `downloads.refreshedAt`, and `advisoryHistory.total`; `downloads` is retained when it has only `refreshedAt`. Null scalars are omitted, and empty blocks/arrays are omitted. `vulnerabilities` is emitted whenever the backend reports a numeric latest-version count, including `total: 0`; its `affectsLatest` boolean and package-wide `recent` advisory rows retain their existing meanings. Recent advisory severity values include a CVSS-banded `severityLabel` (`critical` ≥9, `high` ≥7, `medium` ≥4, else `low`) for agent convenience. Compact/default requests select `allVulnerabilityCount` unconditionally; `versionCount` and `downloadsRefreshedAt` are selected only when `includeVerboseFields` is true.
+
+**Package registry.** When acquisition evidence exists, default and verbose text add `Package registry` immediately after `Repository` when present, with the repository name and public URL. CLI `--json` and MCP JSON add `registryRepository: {id,name,url}`; dependency/vulnerability JSON preserve the same descriptor. This is the logical artifact repository that supplied validated release metadata, distinct from `registry` (ecosystem) and `repository` (source Git). It does not enumerate every host, certify binaries or describe current availability. Only Maven currently populates this generic field. Null evidence is omitted; no registry default is inferred.
+
+The overview query retains its existing selections and adds only `packageInfo.selectedVersion { resolvedVersion registryRepository { id name url } }`. The service attaches the descriptor on exact equality with the displayed overview version. A provenance-only lookup failure omits the descriptor while preserving usable overview output; primary/pathless errors keep their existing classification, and authentication/access/client-update errors remain fatal. History, tool arguments and latest-only behavior are unchanged. The `packageInfo.selectedVersion.registryRepository` schema must reach production before these clients are released or adopted by hosted MCP; an older schema rejects the new selections. Dev qualification does not establish production availability.
+
+Focused live validation after building: `bun run scripts/registry-repository-smoke.ts`. This dev-only script clears token/service overrides and runs `dist/cli.js` under Node for both CLI and actual SDK stdio MCP, checking Google, Central and null info output plus pinned shared dependency/vulnerability identities. It never invokes `auth token` or prints credentials.
+
+**No quickstart.** `pkg_info` intentionally does not expose install commands or usage snippets. Those values are package-manager-specific and not verified enough for dependency evaluation. Use `search`, `list`, `read`, or `get_example` when usage guidance is needed.
+
+**Validation.** MCP requires `target: z.string()`. The handler trims and parses it with the shared `parsePackageSpec`, then uses `buildPackageSummaryParams`; domain failures produce the same mapped `{error, code, retryable}` envelope as CLI. Missing or non-string targets fail SDK schema validation.
+
+**Always latest.** The upstream `packageSummary` resolver always returns the latest published version. Both MCP `pkg_info` and CLI `githits pkg info` reject an embedded `@version` with actionable `INVALID_ARGUMENT` before any service call rather than silently swapping to latest.
+
+`pkg_info` shares its envelope builder, text formatter, and error classifier with the CLI `githits pkg info` command via `packages/mcp/src/shared/package-summary-request.ts`, `packages/mcp/src/shared/package-summary-response.ts`, and `packages/mcp/src/shared/package-intelligence-error-map.ts`. The parity test (`src/tools/package-summary-parity.test.ts`) proves exact normalized requests, equal JSON envelopes, and no-service latest-only pin rejection.
+
+### `pkg_vulns` response shape
+
+**Filter-aware summary.** `min_severity`, `advisory_scope`, and `include_withdrawn` are passed straight through to the service. `summary.total` always means advisories affecting the inspected version, preserving the risk signal even when `advisory_scope:"non_affecting"` returns only non-affecting rows. `advisory_scope` defaults to `affected`; `non_affecting` lists non-affecting package advisories that do not affect the inspected version; `all` lists affected + non-affecting + unknown rows. Explicit filters and non-default scope are echoed as top-level `filter` in JSON (`{minSeverity?, advisoryScope?, includeWithdrawn?: true}`) and as `Filter` / `Scope` lines in text. Defaults and explicit `include_withdrawn:false` do not echo.
+
+**Compact text vs verbose/JSON.** CLI default text renders every selected direct and transitive advisory row with no advisory-row cap. MCP compact text caps the selected advisory list at 5 rendered rows and appends its surface-native hint (`use verbose=true or format=json`). Hidden-advisory counts are derived from the rendered advisory array, not backend summary counts. `--verbose` / `verbose:true` adds aliases, dates where relevant, and complete range/fix evidence without changing CLI row completeness; MCP verbose text shows all rows and full detail rows. JSON is never capped and ignores `verbose`.
+
+Direct advisory headlines label the service's `affectsInspectedVersion: true`
+as `[affects this version]` and confirmed non-affecting rows as `[non-affecting]`,
+in compact and verbose CLI/MCP text. Explicit assessment status takes precedence
+over the boolean: unknown rows remain `[unknown]`. Legacy rows without status
+use their boolean; rows with neither stay unlabeled. This keeps mixed `all`-scope
+rows distinct even when a non-affecting critical advisory sorts before active
+lower-severity advisories. The formatter does not infer applicability from
+severity or truncated affected ranges. JSON keeps non-implied assessment status
+and the existing affectedness flag.
+
+**Partitioning buckets.** Advisories with `isMalicious: true` count **only** under `summary.bySeverity.malware`; severity bands (`critical`/`high`/`medium`/`low`) count non-malicious advisories with a positive CVSS score; non-malicious advisories with no score count under `summary.bySeverity.unrated`. Every returned advisory lands in exactly one bucket. For default affected scope, the bucket sum equals `summary.total`. For `non_affecting` / `all`, the bucket sum describes the selected advisory rows while `summary.total` still describes affected-version risk. The malware bucket sorts to the top of the advisory list regardless of score. The `unrated` bucket keeps Rust / PyPI packages with missing CVSS values explicit.
+
+**Alias-cluster dedup.** Some registries (most visibly Crates) return the GHSA-prefixed and the RUSTSEC-prefixed entry for the same underlying vulnerability as separate advisories, cross-linked via `aliases[]`. The shared envelope builder unions clusters over `id ∪ aliases[]`, picks one canonical advisory per cluster (severity-bearing entries first, then `GHSA-*` over `RUSTSEC-*`, then lexicographic `id` ascending), and merges the rest under the canonical's `aliases`. `affectedRanges`, `fixedIn`, malware/withdrawn flags, and the latest `modifiedAt` are unioned across the cluster; a withdrawal only sticks if every cluster member is withdrawn. `summary.total` and `summary.bySeverity` are recomputed from the deduped list so the partition invariant holds. This is a client-side mitigation for backend issue B3 (https://app.githits.com — eval report 2026-04-28); remove `dedupAdvisoriesByAlias` from `packages/mcp/src/shared/package-vulnerabilities-response.ts` once the backend dedups upstream.
+
+**Version validation.** The shared package-version request boundary canonicalizes exact Go versions because Go module registries store them with a lowercase `v`: both `1.24.0` / `v1.24.0` and pseudo versions in either form are accepted, and the backend receives the `v`-prefixed form. Tag-style refs with a leading `v` (for example npm `v4.18.0`) remain rejected client-side with `INVALID_ARGUMENT` for other registries except Swift. This is intentionally narrow: full ecosystem-aware version parsing and typed invalid-version errors remain backend responsibilities.
+
+**Typed `VERSION_NOT_FOUND`.** Mirrors the code-nav precedent: a dedicated `PackageIntelligenceVersionNotFoundError` carries structured `{ packageName, requestedVersion, availableVersions? }` fields. Classifier routes it to `VERSION_NOT_FOUND` with a structured `details` block. When the service only gets a generic "no matching version" error, it promotes that into the typed error so CLI / MCP surfaces still render an actionable envelope. `availableVersions` remains undefined in the fallback path unless the service supplied them.
+
+**Omission rules.** Null scalars and optional empty arrays/blocks are omitted;
+zero-count `bySeverity` keys are dropped, and the `bySeverity` block itself is
+dropped when `total === 0`. The successful transitive audit is an intentional
+exception: `packages` is always present (including `[]` for a checked-clean
+graph), and each transitive occurrence always retains the required
+`matchedAffectedVersionRanges` and `fixVersionsAboveResolved` arrays (including
+`[]`). `modifiedAt` is included only when it differs from `publishedAt`, and
+`isMalicious` is included only when `true`.
+
+**Registry coverage.** npm, PyPI, Hex, Crates, NuGet, Maven, Packagist, RubyGems, Go, and Swift have vulnerability data. vcpkg and Zig are rejected client-side with a tool-specific message (`pkg vulns only supports npm, pypi, hex, crates, nuget, maven, packagist, rubygems, go, and swift. Got: ${registry}.`) — the tool-specific vulnerability predicate lives in `packages/mcp/src/shared/pkgseer-capabilities.ts`.
+
+`pkg_vulns` shares its envelope builder and text formatter with the CLI `githits pkg vulns` command via `packages/mcp/src/shared/package-vulnerabilities-request.ts` and `packages/mcp/src/shared/package-vulnerabilities-response.ts`. MCP defaults to compact text and uses `format: "json"` for structured output. The shared text formatter is surface-aware so MCP hints never mention CLI flags. The parity test (`src/tools/package-vulnerabilities-parity.test.ts`) passes `format: "json"`, asserts `toEqual` across the service-sourced success/filter/typed-error fixtures, and uses `toMatchObject` for builder-sourced `INVALID_ARGUMENT` fixtures such as unsupported registries and tag-style `v`-prefixed versions.
+
+### `pkg_deps` response shape
+
+**Data-first envelope.** `runtime`, `groups`, and `transitive` are three independent blocks emitted based on what the backend returned and what the caller asked for, not on additional caller flags. Agents branch on the envelope's shape rather than inferring from inputs. `include_issues: true` adds a separate top-level `issues` block; issue analysis alone does not expose `transitive` unless `max_depth` or `include_importers` independently requests that output.
+
+- `runtime` block: emitted whenever the service returned `dependencies.direct` (including `{count: 0, items: []}` for zero-dep packages). `runtime.count` is computed client-side from `runtime.items.length`. The source `direct[]` is always runtime-only: dev / peer / build / optional deps live in the groups block instead.
+- `groups` block: emitted when the caller requested a lifecycle view and the service returned `dependencyGroups` — including when a lifecycle filter matched nothing (`{items: []}`). Omitted when the service returned `dependencyGroups: null` (e.g. on zero-dep packages), or when the caller used the default runtime view. Each group carries its members under `items`, matching `runtime.items` so dependency lists share one key throughout the envelope. Duplicate `{name, constraint}` entries inside a group are preserved verbatim; the terminal formatter dedups for scannability but JSON is lossless.
+- `transitive` block: emitted only when the caller set `max_depth` or requested importer provenance. Carries aggregates (`edges`, `uniquePackages`, `depth?`) plus preprocessed arrays: `packages[]` (each `{name, version, importers[]}` with importer name / version / constraint pulled from the service graph), `conflicts[]` (typed `{name, requiredVersions, requirements}`), and `circularDependencies[]` (typed `{cycle: string[]}`). Each conflict requirement preserves one backend edge in its original multiplicity/order as `{constraint, dependencyType, importer, target}`. Importer and target identities carry registry/name/version; a synthetic root importer is the inspected package with `root: true`. Graph indices never cross this boundary. The raw graph is not exposed — preprocessing happens in the envelope builder so agents consume the same signal the terminal `--verbose` renderer reads without re-implementing the decoder.
+
+**Dependency issue analysis.** `include_issues: true` requests the backend's lazy
+`dependencyIssues` summary and the companion graph needed to resolve conflict
+edges. Without `max_depth`, the analysis covers the full resolved graph and
+emits `issues.scope: {mode: "full"}`; with `max_depth`, it is bounded and echoes
+`{mode: "depth_limited", maxDepth}`. The additive `issues` envelope contains
+`total`, `scope`, and four category records:
+
+```text
+deprecated: {count, items: [{registry, name, versions, reasons}]}
+outdated: {count, items: [{registry, name, latestVersion?, severity, versions, repositoryUrl?}]}
+duplicates: {count, items: [{registry?, name, versions}]}
+conflicts: {count, items: [{registry?, name, versions, requiredVersions, requirements}]}
+```
+
+Counts are backend facts and item arrays are complete for the selected graph;
+registry identities are canonical lowercase while names, versions, reasons,
+severity, repositories, and edge evidence retain their backend values. Zero
+analysis still emits all four empty category records. Issue conflicts use
+the same lossless requirement projection as existing transitive conflicts, so
+constraints, dependency types, resolved targets, and contributing importers
+remain actionable without exposing graph indices. Omitted or explicit-false
+`include_issues` preserves the existing issue selection and request cost;
+`dependencyIssues` is selected only for an explicit true value. The companion
+graph is an internal service input and is never exposed as raw graph data.
+The service fails closed when explicit issue analysis receives neither the
+nullable issue summary nor its companion graph. The MCP descriptor calls out
+that omitted `max_depth` traverses the full graph and that a supplied depth
+bounds analysis cost and scope.
+Ordinary transitive conflicts likewise fail closed when they contain indexed
+`conflictingEdges` without the nullable companion graph; edge-free conflict
+summaries need no graph and remain accepted.
+
+**Issue text.** MCP text stays compact and bounded: it reports the total,
+`full graph` or `max depth N`, all four category counts, and at most three
+deterministically sorted examples per non-empty category. Conflict examples
+also cap constraint groups and importer/type labels at three each. Every compact
+issue evidence line is bounded to the resolved terminal width with formatter-
+authored ASCII `...` (MCP defaults to 80 columns); verbose output wraps long rows
+and requirements without
+dropping selected evidence. If any selected rows or conflict evidence are
+omitted, text emits the caller-owned hint `Pass format: "json" for complete
+issue details.`; complete JSON remains the MCP route for all rows. Zero is
+rendered as positive checked evidence.
+CLI uses the same formatter with `--verbose` to render every issue row and
+conflict requirement, and its corresponding hint is `Use --verbose for complete
+issue details.`. Sorting, grouping, and deduplication are presentation-only;
+JSON retains backend order and multiplicity.
+
+**`filter.lifecycles` echo.** Canonicalised lowercase array (deduplicated, sorted in canonical display order: `runtime` → `development` → `build` → `peer` → `optional`). Emitted only when the caller supplied a non-empty lifecycle input. Matches what the backend actually received — the raw CSV string is not echoed.
+
+**Lifecycle scope.** `lifecycle: [String!]` on the wire filters `dependencyGroups.groups` only; `direct[]` and `transitive[]` are returned regardless. Documented on the backend schema and verified in live smoke.
+
+**Typed dependency graph projection.** Backend exposes typed `dependencyGraph`, `dependencyConflicts`, `circularDependencyCycles`, and `environmentMarkers`; `pkg_deps` consumes those typed fields and projects them into a lean agent-facing envelope. Deprecated raw fields (`dag`, `conflicts`, `circularDependencies`, `environmentConstraints`) are intentionally not queried. The raw graph is deliberately not exposed by this tool.
+
+**Registry coverage.** npm, PyPI, Hex, Crates, NuGet, Maven, Zig, vcpkg, Packagist, RubyGems, Go, and Swift support the `packageDependencies` query. The shared registry capability module in `packages/mcp/src/shared/pkgseer-capabilities.ts` supplies the canonical dependency list used by request/help text and the ecosystem audit; it follows `PKGSEER_REGISTRY_ARGS` order. There is no known unsupported dependency registry in this set; only an unknown registry is rejected.
+
+**Version validation.** Same shared rule as `pkg_vulns`: exact Go inputs are accepted with or without `v` and sent with canonical `v`; unsupported tag-style inputs remain client-side `INVALID_ARGUMENT` errors.
+
+**MCP schema notes.** Package coordinates use required `target: z.string()`, parsed in-handler by `parsePackageSpec` before `buildPackageDependenciesParams`. Deliberately no `include_groups` input — with the data-first envelope emitting `groups` unconditionally when the backend returns `dependencyGroups`, the flag would be a silently ignored no-op. `max_depth` / CLI `--depth` is optional; when omitted the surface shows direct dependencies only while still fetching depth 1 on the wire to resolve direct dependency versions. Passing `max_depth` requests the transitive block and caps traversal. `include_importers` adds importer provenance; if used without `max_depth`, it also requests transitive output. `include_issues` is an independent opt-in: it requests the issue summary and companion graph, uses full traversal when `max_depth` is omitted, and does not expose the ordinary transitive block unless `max_depth` or `include_importers` is also supplied. Omitted and explicit `false` preserve the current selections and cost, including conditional omission of the issue subtree.
+
+`pkg_deps` shares its envelope builder and text formatter with the CLI `githits pkg deps` command via `packages/mcp/src/shared/package-dependencies-request.ts` and `packages/mcp/src/shared/package-dependencies-response.ts`. MCP defaults to compact text and uses MCP-native hints such as `pass lifecycle="all"`; CLI hints remain CLI-native. The parity test (`src/tools/package-dependencies-parity.test.ts`) passes `format: "json"`, asserts `toEqual` across every service-sourced success / error fixture (runtime, zero-dep, full-view, optional-lifecycle, multi-lifecycle, filter-matched-nothing, Crates-target-cfg dedup round-trip, transitive, versioned match / diff, NOT_FOUND, VERSION_NOT_FOUND, BACKEND_ERROR), and uses `toMatchObject` for builder-sourced `INVALID_ARGUMENT` (unknown registry, tag-style version, unknown lifecycle).
+
+### `pkg_changelog` response shape
+
+Package changelogs default to all parsed statements with available classifications,
+including no-impact, oversize and unassessed units. `changes:"actionable"|"important"|"all"`
+filters before pagination; every matching page is retrieved. `ambiguous` alone
+controls uncertainty. See [changelog evidence](pkg-changelog.md) for the complete
+contract, coverage, projections and release guidance staging.
+
+**Data-first envelope.** The top level carries addressing (`registry` + `name`), optional `source` when a concrete changelog source exists, and `mode` (`"latest"`, `"exact"`, or `"range"`). Entries live under `entries: { count, items }`. `count` is computed client-side from `items.length`.
+
+**Per-entry shape.** `{version, normalizedVersion?, publishedAt?, htmlUrl?, body?, hasChangelog?}`. `version` is kept even when `null` so agents can write `items.map(e => e.version)` without guarding; every other nullable field is stripped when absent. `hasChangelog` is present only for exact selected-release results. `body` is present only in original-note mode (`verbatim:true` or deprecated `verbose:true`). Default JSON adds `statements:{count,totalCount,matchingCount,items,coverage}` with full statement/context text and per-item classification provenance, preserving classification:null. Deprecated top-level riskItems/riskCoverage are no longer selected for changelog. Upgrade review also uses a complete statement collection, with a focused default and whole-range riskCoverage counters; see [pkg-upgrade-review.md](pkg-upgrade-review.md). The backend's opaque per-entry `metadata` GenericJSON is deliberately dropped from the envelope.
+
+**Package-only compact target.** MCP `pkg_changelog` takes one required `target` string: `registry:name` for latest, `registry:name@version` for one selected release, and `registry:name@from..to` for releases after `from` through `to` (starting version excluded, ending version included). Open bounds `from..` and `..to` are accepted. Repository and site targets are rejected before network access. Use `registry:name@from` separately for the starting release's own notes. Exact pins query `packageInfo.selectedVersion.changelog`; latest and interval targets query `packageChangelog`.
+
+**Mode selection.** A from bound triggers range mode (every entry in `(fromVersion, toVersion]` with no cap). The lower bound is excluded and the upper bound is included, for inline targets and CLI flags alike. Text spells out these boundaries beside the interval notation. Latest mode is the default, capped by `limit` (1–50, backend default 10); an upper-cap target or `--to` supplies a latest-mode cap. Exact mode returns exactly one backend-selected release. `limit` is rejected for exact and lower-bound range targets.
+
+**Views and aliases.** `verbatim:true` shows full original notes instead of
+statements, in text and JSON. `verbose:true` is a deprecated alias.
+`omit_bodies:true` shows only the version/date/URL timeline and conflicts with
+an explicit original-note flag. Both views skip classification and ignore changes.
+MCP `body_lines` is a deprecated text-only original-note preview selector and cap
+(1-50); explicit raw-note flags ignore it, omission wins over it alone, and JSON
+ignores it. Explicit `verbatim:false` alone preserves default; body_lines still
+selects its legacy preview when present. Default text never adds raw-note previews.
+Source links stay next to release/source groups, without a global Sources table.
+
+**`filter.*` echo.** `filter` is emitted only when the caller explicitly supplied at least one of `fromVersion`, `toVersion`, `limit`, `version`, or an effective `changes` view. Backend-default `limit: 10` / `toVersion: <latest>` is never echoed. Exact mode always echoes `filter.version` as the normalized requested selector; `entries.items[0].version` is the resolved concrete release.
+
+**Version validation.** Same shared rule as `pkg_vulns` / `pkg_deps`: exact Go bounds are accepted with or without `v` and sent with canonical `v`; unsupported tag-style inputs remain client-side `INVALID_ARGUMENT` errors. A non-range suffix is a registry-aware single-release selector, not a client SemVer validator.
+
+**Empty and no-notes success.** Backend `source === null` plus empty entries is a successful empty timeline. Exact selected releases without notes succeed with `hasChangelog: false`. Actual missing packages and missing exact versions continue through `NOT_FOUND` / `VERSION_NOT_FOUND`.
+
+**Overlap with `pkg_info`.** `pkg_info` already surfaces a short-form `recentChanges` block (from the backend's `latestChangelogs` field on `PackageSummaryResult`). For a quick "what shipped recently" glance embedded in a package overview, use `pkg_info`. For range-capable, exact-release, body-rich changelog lookup, use `pkg_changelog`.
+
+`pkg_changelog` shares its envelope builder and text formatter with the CLI `githits pkg changelog` command via `packages/mcp/src/shared/package-changelog-request.ts` and `packages/mcp/src/shared/package-changelog-response.ts`. MCP defaults to parsed statements with native `format="json"` hints for bounded cuts and `verbatim=true` for original notes. The parity test (`src/tools/package-changelog-parity.test.ts`) passes `format: "json"` and asserts CLI/MCP equality for latest, exact, range, omitted bodies, empty selections, and mapped errors.
+
+### `pkg_upgrade_review` response shape
+
+Tool and CLI guidance encourage using heuristic signals as a starting point to
+evaluate codebase impact, with `pkg_changelog` / `pkg changelog` and `code_diff` /
+`code diff` available for original release-note bodies and source-change detail.
+Upgrade review returns filtered statement evidence without prescribing an
+assessment format.
+
+`changes` is a string filter: omitted or blank means `focused` (`MUST_ACT`,
+`SHOULD_KNOW`, and `UNCLASSIFIED`); `actionable` selects `MUST_ACT`, including
+uncertain labels; `important` selects `MUST_ACT` and `SHOULD_KNOW`; `all` includes
+all parsed statements, including no-impact, null-classification, and oversized
+units. Standalone `pkg_changelog` still defaults to all parsed statements.
+Filters select detailed quotes only. Compact batch triage fetches no statement
+pages, and its whole-range coverage counters and package ranking do not change
+with the selected filter.
+
+The JSON envelope preserves `summary`, `reviews`, security/dependency evidence,
+and unknowns. Upgrade changelog JSON replaces `changelog.riskItems` with the
+paginated `changelog.statements` collection, including `count`, `totalCount`,
+`matchingCount`, `selection`, `items`, and `coverage`; detailed results always
+include the effective `selection`. Statement items retain source positions,
+context, uncut `fullText`, and nullable classification with provenance. The
+whole-range `riskCoverage` counters remain, except `itemsOmitted`, which is
+removed. CLI `--json` and MCP `format: "json"` use this same envelope and are
+compared by the package-upgrade-review parity test. `text-v1` evolves in place
+and is not a byte-stable contract.
+
+Default text is one shared formatter for CLI and MCP. It leads with
+`Upgrade review - N package(s)`, then groups each package as identity,
+`Security`, with direct and optional transitive summary rows before non-empty
+advisory groups, target `Deprecation`, `Changes`,
+`Compatibility`, `Dependencies`, returned `Dependency issues`, and final
+`Unknown evidence`. A batch adds one `Across packages:` summary; zero and one
+package omit it. The formatter removes internal tool headers and repeated
+field scaffolding while retaining concrete samples, stable package/advisory
+locators, truncation facts, and follow-up guidance.
+
+The formatter accepts ANSI and width as inputs. CLI supplies its current
+terminal width and enables ANSI when supported; MCP uses no ANSI and the
+80-column default. Outcome and section headings are bold-only, package identity
+is bold cyan, compact attention summaries use yellow. Action statement tags use red,
+should-know tags yellow, and uncertain annotations muted. Keyword sections
+remain separate lexical evidence. Evidence detail and locators remain
+plain, and prose remains meaningful without color. Free prose uses hanging
+indentation and a minimum width of 20, while coordinates, versions, advisory
+IDs, and URLs remain unsplit. Changelog groups use backend source labels such as Release notes or
+Changelog and their authoritative URLs. A defined zero-valued dependency comparison renders both direct and transitive zero
+counts; undefined evidence is omitted. Existing security/advisory sample caps
+remain unchanged. Dependency-issue locators are capped at five rows per
+category in default text with an explicit remainder; `verbose` expands them
+fully. Detailed `Changes` renders all matching statements from their paginated
+pages as source-ordered bullets with nearby source links and context, without
+tier headings, global numbered references, or duplicate sampled-note previews.
+`verbose` expands quotes only to backend-bounded text and adds full batch,
+security, and dependency detail; JSON alone contains uncut `fullText` and
+classification provenance. Filters never change whole-range counters or
+package ranking. See [Upgrade review](pkg-upgrade-review.md) for the complete
+shared CLI/MCP behavior and JSON contract.
+
+### `list` / `read` / `grep` response shapes
+
+These indexed tools share compact target strings and structured resolution
+metadata while projecting purpose-specific envelopes. `list` also accepts
+explicit `site:` inventories.
+
+The advertised MCP `read` tool uses the required `McpToolServices.readService`
+dependency. Its compact code and docs branches call `ReadService.read` once,
+which sends one `Query.read` request and returns the matching semantic union
+member. The tool keeps the existing validation, code cap, docs presentation
+cap, formatting, and source-specific error mapping. Advertised MCP `grep` uses
+the separate required `McpToolServices.grepService` dependency and one
+`GrepService.grep` page. Its shared request builder, result projection, and
+text formatter are used by top-level CLI `githits grep` as well. Deprecated CLI
+command surfaces remain separate compatibility paths: `githits code read`
+calls the legacy `fetchCodeContext` root, `githits docs read` calls legacy
+`getDocPage`, and `githits code grep` calls legacy `grepRepo`; none is a
+fallback for the compact MCP tools.
+
+**`list` envelope**: `{inventoryKind, requestedTarget, canonicalTarget,
+entries: [{kind, path, title?, read?, browse?, language?, fileType?, intent?,
+byteSize?, lineCount?, contentHash?}], hasMore, nextCursor, indexedVersion,
+resolution?, targetResolution?, codeIndexState, indexingStatus, indexingRef,
+availableVersions?, indexingEstimate?, inventoryState, crawlStatus,
+coverageState, coverageReason, preparation}`. Compact text emits only a source
+line and one path per entry. JSON preserves backend-authored actions and the
+opaque cursor; it never fabricates a total or reconstructs locators.
+
+The legacy `githits code files` command retains its older
+`{registry?|repoUrl?+gitRef?, total, hasMore, ... files}` envelope for CLI
+compatibility. It is not an advertised MCP tool.
+
+**`read` code envelope**: `{registry?|repoUrl?+gitRef?, path, language?, totalLines?, startLine?, endLine?, content?, isBinary?, hint?, targetResolution?}`. `path` (not `filePath`) matches `list.entries[].read.path` and the repository `grep.hits[].read.path` action. Binary files set `isBinary: true` and **omit** `content` (not `null`); agents branch on the flag. `hint` is emitted only when the MCP span cap actually truncated the response — see "read span cap" below.
+
+**`grep` result**: `GrepResult` is the validated backend result: `{hits, targets, unavailableTargets, traversal, nextCursor, totalMatches}`. `hits` is a repository/site union; each hit retains its physical scope index, line slices and match offsets, safety metadata, and exact backend-authored `read` action. Detailed JSON selection also carries source byte coordinates, line content, and site URL-prefix detail where selected by the query. The MCP `format: "text"` formatter groups this page for reading and prints read templates plus opaque continuation guidance; JSON preserves producer hit order and action values. See [Unified grep](unified-grep.md) for the public controls, coverage semantics, and text contract. The retired MCP `code_grep` envelope and legacy filters are not aliases; those controls remain on the CLI `githits code grep` command.
+
+Where present, `targetResolution` is additive provenance. It explains requested, resolved-requested, and served artifacts plus `freshness` (`current`, `fallback_recent`, `indexing`, `provisional`, or `unavailable`), `freshnessReason`, `indexingRef`, `availableVersions`, `availableRefs`, and `suggestedRefs`. A `provisional` / `exact_provisional` Discovery result is queryable while indexing continues; shared Sources/Preparing text on unified search, annotated read, list and code files uses the exact served identity and keeps internal `indexingRef` and reason codes out of default text, while retaining meaningful preparation state and bounded alternatives. Legacy CLI code grep retains its exact `served=` identity and indexing-ref notes. Neither surface substitutes a requested ref for a served identity. `availableVersions` and `availableRefs` are already-indexed artifacts that can be queried immediately. `suggestedRefs` are fuzzy upstream candidates and may require indexing before use. Existing `indexedVersion`, `resolution`, and locator fields remain served-identity compatibility fields. Text mode renders actionable notes such as `Using recent indexed snapshot`, `Serving an older indexed snapshot; current target is still being indexed`, `Requested ref is being indexed`, `provisional (still indexing)`, `Fresh target is being indexed`, `Target unavailable`, `queryable now`, or `suggested refs`; legacy code-navigation indexing text includes the exact `served=` identity whenever results came from a queryable snapshot. JSON mode carries the structured object. A `current` resolution is authoritative on responses that expose it and suppresses alternative-target remediation; waited search completion is one case where earlier candidates can remain in structured provenance without becoming warnings. Unified `grep` instead returns its own per-scope readiness and traversal fields.
+
+### Indexing and inventory lifecycle
+
+`read` and legacy CLI `githits code grep` share the code-navigation
+indexing-retry contract. The state can arrive through either an error response
+or a success sentinel (`codeIndexState: "INDEXING"`), and that service layer
+collapses both to the same typed `CodeNavigationIndexingError` before the
+envelope builder runs. Unified MCP/CLI `grep` uses `GrepService` and its own
+typed error mapper. First-page preparation wait defaults to 30,000 ms; explicit
+zero and cursor continuations do not wait.
+
+Unified grep preparation errors use per-target reasons: only progress-only
+failures qualify for `INDEXING`; missing, ambiguous, and unrecoverable targets use
+the corresponding mapped codes. See [grep error classification](unified-grep.md#preparation-error-classification)
+for the reason table, mixed-target rule, and unknown-reason fallback.
+
+`list` has its own typed error family and preserves selected source/site
+lifecycle fields in JSON. Discovery `search` / `search_status` may additionally
+expose `codeIndexState: "PROVISIONAL"` with queryable hits and a `searchRef`.
+
+**`INDEXING` error envelope**:
+```json
+{
+  "error": "Target is indexing",
+  "code": "INDEXING",
+  "retryable": true,
+  "details": {
+    "indexingRef": "ref_…",
+    "availableVersions": [{"version": "4.21.0", "ref": "v4.21.0"}],
+    "availableRefs": [{"ref": "main"}],
+    "hint": "Backend says this ref is queued. Wait until ready with CLI `--wait 60000` or MCP `wait_timeout_ms: 60000`.",
+    "indexingEstimate": {
+      "lowerSeconds": 7,
+      "upperSeconds": 19,
+      "elapsedSeconds": 12,
+      "sampleCount": 9,
+      "source": "same_repository_refs"
+    }
+  }
+}
+```
+
+Explicit JSON preserves backend GraphQL messages, hints, timing and available artifacts in `details`. Human indexing errors use shared compact preparation rows and one surface-native action, rather than serializing fields or mixing CLI/MCP syntax into a hint. Backend hints and concrete indexed alternatives remain visible. Classifiers and core decoders retain facts; read/list/search boundaries choose native wait arguments and units. Backend progress identifiers remain in JSON. For code-navigation target and indexing errors, `details.availableVersions` and `details.availableRefs` are already indexed and immediately queryable. CodeDiff `VERSION_NOT_FOUND` is the documented exception: its `availableVersions` are backend-ranked source-ref alternatives, not code-index state. `details.suggestedRefs` appears on `REF_NOT_FOUND` and inside `details.targetResolution`; these are fuzzy suggestions and may require indexing. The client never fabricates candidates.
+
+**Follow-up — error metadata carrier consolidation.** Target, version, and ref errors currently carry available artifacts both as legacy constructor fields and in common error metadata; `CodeNavigationIndexingError` also carries `hint` as a standalone constructor field. Consolidate those carriers in a dedicated refactor; changing the internal error API is outside this response-formatting slice and has no user-visible anti-looping benefit.
+
+**Retry defaults**: `DEFAULT_WAIT_TIMEOUT_MS = 30_000` is owned by
+`packages/core-internal/src/shared/fetch-timeout.ts` and re-exported by MCP shared
+navigation defaults. Search/status, read, list, unified grep's first page, and
+legacy code navigation apply it at the CLI/MCP and concrete service boundaries.
+Explicit zero remains zero; unified grep continuation never waits. Every CLI
+`--wait` value and MCP `wait_timeout_ms` value uses milliseconds. Indexing HTTP
+budgets share `max(120000, waitTimeoutMs + 30000)`; these are per-request client
+budgets, separate from backend readiness and production proxy limits. List/grep
+still accept up to 300000 ms as client inputs, which is unverified through the
+standard production edge; generated recommendations retain their 120000 ms cap.
+GraphQL and REST example body reads run within the original HTTP deadline,
+so expiry maps to `TIMEOUT` rather than malformed JSON or `UNKNOWN`. Research,
+example generation, auth, settings, and local probes keep their independent
+existing durations.
+
+The timeout audit also covers surfaces without indexing-wait fields. Their
+existing deadlines remain independent of the 30,000 ms readiness default:
+
+| Surface | Default client deadline |
+| --- | --- |
+| Resolve, package info/vulnerabilities/dependencies/upgrade review/changelog, legacy docs list/read, and code diff | 120000 ms per GraphQL request |
+| Example generation | 240000 ms per REST request |
+| Research | 210000 ms for the whole operation, including body reads and token refresh |
+| Auth and network settings | 120000 ms per HTTP request |
+| Login callback | 300000 ms |
+| Update check | 1000 ms metadata request |
+
+Init probes and auth locks retain their separate local budgets. Local-only
+commands and branches gain no network calls. Backend-internal preparation on
+surfaces without wait fields is unverified; the client does not invent indexing
+controls for them.
+
+**CLI migration**: search/search-status previously interpreted numeric `--wait`
+values as seconds. They now use milliseconds like the other commands: replace
+`--wait 30` or `--wait 30s` with `--wait 30000` for a 30-second wait. The old `s`
+suffix is rejected by integer validation. At release preparation, update
+`skills/githits-code/SKILL.md` and `references/code-and-docs.md` for this unit
+migration and unified grep's new default; those behavior-dependent public skills
+remain on released guidance until the release lifecycle permits updating them.
+
+**Uniform indexing estimates and continuation**: See [the shared contract](indexing-estimates.md) for all waiting consumers, null-singular read handoffs and the production schema prerequisite. Human annotated output also displays total duration and active elapsed evidence.
+
+Discovery behavior: Both initial `search` progress
+and `search_status` progress retain `indexingEstimates` in CLI/MCP JSON. Entries
+identify `kind` (`REPOSITORY` or `DOCUMENTATION`), shared requested `targets`,
+repository URL and commit when known, timing evidence and `unavailableReason`.
+Nullable wire values follow the existing optional-field normalization; an explicit
+empty list remains empty. An unresolved commit can still have URL-based history.
+
+`estimate.lowerSeconds` / `upperSeconds` are advisory **total repository indexing
+execution seconds**, not remaining time, a search ETA, or guaranteed bounds.
+`elapsedSeconds` is observable active execution only and is absent while queued,
+retrying or unobservable. `sampleCount` and `source` retain historical provenance.
+Neither search `elapsedMs` nor active elapsed time is subtracted from the bounds.
+`NO_HISTORY` may carry elapsed-only timing; `UNSUPPORTED_WORK` has no duration
+model. Neither produces a fabricated range.
+
+For an active reference, shared JSON/text continuation chooses the largest numeric
+`upperSeconds`, adds 10 seconds, and rounds upward to a ten-second boundary. It
+never sums jobs or target labels. If any entry has no range, the unchanged
+30-second default is an additional floor; if no ranges exist, the default stays
+30 seconds. The final suggestion is capped at the supported 120-second maximum.
+Thus upper 40 suggests 50 seconds, upper 44 suggests 60, upper 80 suggests 90, and unsupported-only work
+suggests 30. CLI and MCP render milliseconds. Request defaults stay
+unchanged, and the client does not automatically poll.
+
+Estimates remain available with partial/provisional/stale evidence and retained
+terminal progress. They never decide lifecycle: an empty list does not complete an
+active search, and timing never makes DEFERRED/FAILED/TIMEOUT references pollable.
+Completed evidence-status retrieval retains its existing default-wait policy.
+The core service owns shared GraphQL selection/validation; the MCP shared
+`discovery-indexing-wait.ts` policy feeds both JSON guidance and CLI/MCP text.
+
+**Release prerequisite**: backend #2460's schema must be deployed on every production
+serving node before releasing/adopting this client query. Dev deployment and live
+checks do not prove production support. An older schema rejects the selection;
+there is no compatibility fallback. Backend #2458 must also be deployed for
+extended waits. Discovery search/status accept CLI `--wait 0..120000` milliseconds or
+MCP `wait_timeout_ms: 0..120000`; other navigation limits and 30-second defaults
+are unchanged. Discovery HTTP budgets are `max(120000, waitTimeoutMs + 30000)` ms,
+giving a 150-second client deadline at the maximum readiness wait. Caller
+cancellation propagates from MCP through both discovery query paths, including
+existing target-resolution query fallback.
+
+The service AbortSignal bounds the request and preserves caller cancellation during
+both headers and response-body reads. Standard socket timeouts are unchanged.
+Cloudflare's standard [origin proxy read timeout](https://developers.cloudflare.com/fundamentals/reference/connection-limits/)
+is 125 seconds; only Enterprise zones can increase it. The client cap is therefore
+120 seconds despite the backend's 300-second capability. A full 120-second
+readiness wait leaves at most five seconds for other origin work, so cold target
+resolution and response overhead can still exceed the edge budget. The 150-second
+client deadline does not extend Cloudflare's limit; verify production route timing
+before adoption.
+
+Hosted MCP adoption requires publishing `@githits/mcp`, updating the hosted server's
+dependency, and deploying it. External MCP callers must allow the requested wait
+plus response headroom; the SDK's default 60-second caller timeout is insufficient
+for the longest calls. Dev direct-Fly checks do not establish production routing.
+
+**Exact-path authority errors**: compact `read` distinguishes a missing path (`FILE_NOT_FOUND`) from a path deliberately omitted from the index (`FILE_PATH_EXCLUDED`) and an index whose source-file inventory cannot authoritatively answer the path query (`SOURCE_FILE_INVENTORY_UNKNOWN`). These preserve `filePath`, optional `exclusionReason`, retryability, and target-resolution metadata, and add surface-native `details.action` guidance for inspecting indexed paths. MCP recovery uses `list` with a directory path selector; compact CLI recovery uses `githits list <target> <directory>/`. Legacy `githits code grep` keeps its repository-file path behavior. Unified `grep` carries backend file issues in each scope status and uses its own error map for request/service failures. `read` still supports generic `NOT_FOUND` from older/backend paths, and its structured recovery is likewise rendered without classifying unrelated target misses as file errors.
+
+**`read` code span bounds (MCP-only)**: real session traces showed agents requesting 300-600 line windows (and occasional unbounded full-file reads) which dominated context cost, while a later Claude Desktop session showed that a fixed 150-line ceiling can waste context by forcing pagination for a known 248-line file. Calls without `end_line` therefore remain bounded to `MCP_READ_DEFAULT_SPAN` (150 lines), while deliberate explicit ranges may request up to `MCP_READ_MAX_SPAN` (300 lines). Both are defined in `packages/mcp/src/shared/code-navigation-defaults.ts` and enforced before the backend call.
+
+The `hint` field is emitted only when the cap *actually truncated* the response — i.e., the returned range comes up short of available content. `shouldEmitCappedHint` (in `packages/mcp/src/tools/read-file.ts`) suppresses the hint in three cases the agent doesn't need it: (a) the cap clamp didn't fire (caller's range was already within the cap); (b) the file fits within the cap, so the response is the whole file even though the request was clamped; (c) the returned range reaches end of file. Binary files always skip the hint. When emitted, the hint reads from `payload.startLine` / `endLine` / `totalLines` (the actual returned range, not the pre-clamp request) and includes the original request for the agent to learn from. The CLI command `githits code read` does not apply the cap; humans piping whole files to disk continue to work.
+
+## Text response format (`format: "text"`)
+
+Every format-selectable MCP tool accepts only `text` and `json`, with `text` as
+the default. This includes stable `code_diff`, `resolve_target`, and `research`. The format parameter recommends:
+"Use `text` (default) for reading and tool follow-ups; it is token-efficient.
+Use `json` only to parse responses in code or obtain fields absent from text." Tool-specific JSON-only details remain documented. The shared quick-start guide
+and its skill copy explicitly allow passing returned paths, IDs, and line ranges
+directly to subsequent tools without requesting JSON.
+Explicit `format: "text-v1"` is rejected by the public schema; existing callers
+should omit `format` or send `text`. The internal renderer name does not select
+a public format. JSON remains the lossless structured representation.
+
+**Measured response sizes.** Three live development queries with three hits each
+on September 6, 2026 compared compact JSON with text from identical payloads.
+Using `o200k_base` as a token-count proxy: Express router code was 2,037 vs 274
+tokens, OpenCode compaction code 2,072 vs 260, and Express routing documentation
+902 vs 490. These response-size reductions (86.5%, 87.5%, 45.7%) are not task-level
+cost savings. Captures and reproduction scripts are under ignored
+`.agent-eval/semantic-search/output-size/`.
+
+**In-place evolution.** `text-v1` names the compact line-oriented representation; it is not an exact-prose compatibility boundary. Search and `search_status` may tighten human/agent copy in place as long as their structural lifecycle, ordering, action, and hit-anatomy invariants remain covered by tests (`packages/mcp/src/shared/unified-search-text.test.ts`, `packages/mcp/src/tools/search-status.test.ts`). JSON is the stable structured boundary for programmatic callers. Other text-v1 renderers retain their own contracts and are not changed by the search presentation work.
+
+**Compact punctuation.** Formatter-authored punctuation is ASCII, including the ` | ` and ` - ` separators; ellipsis is `...`; no box-drawing or decorative punctuation. Unicode in backend payloads (titles, summaries, paths, URLs, and notes) passes through unchanged. Tokenizer behavior for multi-byte UTF-8 varies across BPE variants, and the format runs into Claude, Codex CLI, OpenCode, Cline, Cursor, etc. — the small fixed vocabulary keeps it predictable.
+
+**Example-search anatomy.** `get_example` text mode returns markdown with source provenance, followed by `solution_id: <id>` when the response includes an app URL. This avoids JSON-wrapped markdown while preserving result identity. Omit `language` to infer it; if GitHits cannot match it, the error lists languages to retry with.
+
+**Package metadata anatomy.** `pkg_info`, `pkg_vulns`, `pkg_deps`, and `pkg_changelog` text mode reuse their shared no-color terminal formatters and inject surface-native hints where needed. `pkg_upgrade_review` uses one shared CLI/MCP formatter with caller width and ANSI as inputs. `pkg_deps` hides non-runtime groups by default and says `pass lifecycle="all"` when groups exist. `pkg_changelog` defaults to all parsed bullets; its deprecated explicit preview cap says `pass verbatim=true`, while backend statement cuts say `pass format="json"`. Package errors respect the selected format: default/text explains the failure and useful recovery; explicit JSON retains `{error, code, retryable, details?}` for programmatic callers.
+
+**Unified search outcome-first anatomy** (CLI human search/search-status and MCP
+`search` / `search_status` text-v1). One shared presentation model owns target
+groups and trust facts; one shared text renderer owns wording, wrapping, hit
+anatomy, and ordering. The order is:
+
+1. one plain outcome sentence, for example `Found 1 documentation result.`;
+2. served identities under `Sources:`, then actual work under `Preparing:`;
+3. target-local limitations/recovery, then query-wide warnings;
+4. numbered ranked hits; and
+5. optional `Read:`, `More results:` and `Follow-up:` footers in that order.
+
+Headlines contain no pipe-separated lifecycle, readiness fractions, pagination
+or partial/interim labels. Sources/Preparing explain missing scope; unexplained
+backend partialResults adds `These results do not cover the full request.`
+Terminal and unknown states retain explicit prose. Active empty output says
+`No results available yet.`; continuation pages say `No results on this page.`
+Progress-only responses never invent source or contributor facts.
+
+Detailed target rows keep one identity and deterministic segment order:
+remaining `using`, `searched`, `indexing`, terminal/unavailable, `available`, `indexed`,
+then target-scoped constraints. Lanes are `code`, `symbols`, `repository docs`,
+concrete site docs, and docs. Exact terminal states use readable client-owned
+reasons (`package not found`, `version unavailable`, or `repository ref
+unresolved`) plus their lane. When searched or indexing evidence exists for the
+same target, the reason is bare and no coordinate recovery is suggested. A
+target gets at most one inline `Fix:` or replayable `Try:` line. Stale,
+provisional, and coverage facts qualify the target/source rather than creating a
+second list. Query-wide warnings remain one `Warnings:` block after target rows
+and before hits; target-owned constraints stay in their row.
+
+There is no separate session row. Follow-up contains the active reference once:
+`search_status search_ref="..." wait_timeout_ms=30000` for MCP or
+`githits search-status ... --wait 30000` for CLI when no range is available.
+Indexing estimates can adjust this wait up to 120 seconds. Usable hits get
+short use-now advice and a read before conditional waiting. Healthy completed
+hits get one exact read without that extra prose. Ended references never poll.
+
+`evidenceNotice` stays exact in JSON and is not rendered in default text. JSON is
+the lossless stable boundary for source statuses, target resolution, warnings,
+evidence notices, and hit metadata; text remains a compact decision surface.
+Surface-native pivots name `source="symbol"` / `grep` in MCP and
+`--source symbol` / `githits grep` in the top-level CLI. The legacy CLI
+`githits code grep` retains its own routing and controls.
+
+The representative CLI n8n example is maintained in
+`docs/implementation/cli-commands.md` as the output source of truth.
+
+Repository-code hits with structural evidence omit standalone indexed titles;
+semantic scope rows supply kind, qualified name, and declaration range when
+available. Repository documentation retains its heading. JSON retains titles.
+
+**Hit anatomy within unified search text-v1:**
+
+```
+[1] <producer-target> <path:preview-range> [repo doc] - <title>
+  <evidence or summary, wrapped at output width>
+[blank]
+[2] <page-target> [docs page] <package-attribution> - #<heading> - <title>
+  <summary, when informative>
+```
+
+Hit headers are numbered so ranked results can be referenced as `[1]` through
+`[N]`. Repository headers preserve producer package/repository attribution,
+target-relative file paths and preview/source ranges before the type tag
+(`[repo doc]`, `[repo code]`, or `[repo symbol]`). Their title is the final tail.
+These header coordinates can be reused with unified read. The exact backend
+read action remains in JSON `followUp`, which may use a different repository
+address, root-relative path, selector, or range. The original `docsReadTarget`,
+page ID, repository commit and repository-root path remain provenance in JSON.
+`docsReadTarget` is accepted by unified read, not an exclusive instruction to
+use the deprecated docs reader.
+Hosted documentation headers show a page locator, package attribution, distinct
+heading/source provenance and title. Source provenance uses
+`host/path#anchor` without the protocol; when it is the target plus a fragment,
+only that distinct fragment is shown. It never chooses an action or promotes a
+fragment into its target. Exact duplicate locators are omitted. Unavailable
+fields retain explicit `documentation target unavailable`, `target unavailable`,
+`source URL unavailable`, or `title unavailable` values. Text omits per-hit read
+commands and unavailable-action guidance. Qualified non-follow-up internal
+IDs and kind/category tails stay out of default text. JSON keeps existing
+`docsReadTarget`, compatible `pageId`, provenance `sourceUrl` and `followUp`,
+without internal descriptors. Repository headers preserve producer target/path
+and preview ranges; a missing producer path uses `location unavailable` without
+manufacturing it from the action.
+
+A summary's first line is omitted when it repeats the title
+after removing Markdown heading markers, as is an immediately following
+setext underline. Source indentation is retained when summaries wrap, with a
+consistent two-space hit-body indent. If a title does not fit on the header
+line, the fixed locator prefix stays unwrapped with a trailing ` -`, and only
+the title continues on two-space-indented lines.
+
+Result headlines count each returned kind once, for example `Found 5 repository
+documentation results and 5 documentation results.` More results instructs
+repeating the original search with its exact `offset` / `--offset`, preserving
+query/targets/filters. Search status cannot paginate. Missing offsets receive a
+truthful advisory without a fabricated value. Active pagination warns that
+results can change. Counted indexed alternatives use `(+N more)`.
+
+**Follow-up — mutable hosted docs and crawled-doc section anchors.** Hosted/crawled `documentation_page` HTTP(S) targets address mutable current content, while repository documentation is separately snapshot-addressed. The backend descriptor selects target, optional path, selector and bounds; search preview/evidence coordinates remain independent. Both surfaces preserve descriptor bytes and render selectors separately instead of promoting provenance fragments or inventing heading bounds. MCP search actions narrow explicit path selections to 300 lines; pathless docs selections remain complete, and CLI text retains the full selection. Missing action metadata produces unavailable guidance. A sufficient search snippet needs no read. For a heading read, the backend resolves the heading and its full subtree through the next equal-or-higher heading and reports its absolute page range. Missing, duplicate, windowed/inexact, or unsupported sections return non-retryable `DOCUMENTATION_SECTION_UNRESOLVED` with a reason; they never become `NOT_FOUND` or a successful full-page read. Publisher-only IDs omitted during ingestion remain unavailable. The client never decodes or normalizes locator bytes and does not synthesize website slug rules.
+
+Completed-empty action selection is target-aware: exact terminal lanes with no
+searched/indexing peer get local recovery, while searched-empty evidence can get
+a query rewrite. Indexing or trust-only evidence gets a single rerun action when
+no target-local recovery exists; standalone-site output uses its site-specific
+rewrite only when applicable. Filter removal and symbol/grep pivots appear
+only when requested constraints make them useful. Terminal `DEFERRED`, `FAILED`,
+and `TIMEOUT` preserve disclosed evidence and lifecycle; unknown statuses stay
+conservative and do not poll. Promoted lifecycle/freshness prose, opaque evidence
+text, and the exact notice remain in JSON; parser/query and target-owned
+constraint facts appear once in text.
+
+**Legacy listing anatomy** (`githits code files` compatibility output):
+
+```
+code_files | <N>[+] paths | <identity> [path="..."] [path_prefix="..."] [globs=...] [exts=...] [...]
+[blank]
+<path1>
+<path2>
+...
+[blank]
+More files available. Pass limit=N or refine the filter.
+```
+
+`<identity>` is `<registry>:<name>@<version>` for spec addressing or `<repoUrl>@<gitRef>` for repo addressing. Filter echoes appear in the header only when the caller supplied them explicitly (defaults never echo).
+
+**Unified grep text response** (MCP `grep` and CLI `githits grep`): the shared
+`formatGrepText` groups the returned page by exact file/page identity while JSON
+retains backend occurrence order. Match rows use `:`, context rows use `-`, and
+disjoint blocks with context use `--`. Numbered headers carry the exact backend
+read locator; the page headline, scope rows, and continuation guidance preserve
+coverage and traversal state. See [Unified grep](unified-grep.md) for the full
+output, request, and recovery contract.
+
+The retained CLI `githits code grep` continues to use legacy `grepRepo`
+request/response helpers, including literal matching and Unicode-aware case
+folding by default, repository-file filters, per-file limits, and symbol hydration.
+It has no corresponding MCP tool; see
+[CLI commands](cli-commands.md#githits-code-grep) for that compatibility
+surface's controls and output.
+
+**Docs branch read bounds.** The `Query.read` docs branch owns inclusive,
+one-based, page-relative selection through `contentRange`. Either explicit
+bound overrides an HTTP(S) fragment; omitted start means line 1 and omitted end
+means EOF. The backend clamps an end beyond EOF and rejects nonpositive,
+reversed, or past-EOF starts. Compact `read` forwards only caller-supplied
+bounds. MCP text then locally displays at most 150 lines when `end_line` is
+omitted or 300 when it is explicit; this presentation cap is never sent as a
+synthetic backend range, so it cannot suppress fragment resolution. JSON and
+CLI have no local display cap. The deprecated `githits docs read` command keeps
+its legacy `getDocPage` root and is documented separately in
+`cli-commands.md`.
+
+The required backend `contentRange` supplies `startLine`, `endLine`, `totalLines`,
+and resolved `anchor`. `page.content` is already the selected body, so the client
+never reapplies absolute bounds. Local MCP truncation slices the returned prefix
+and reports the displayed absolute range. Its concrete continuation retains the
+served target/path, clears the selector, and selects the whole remaining range
+through `contentRange.endLine`; the next response applies its own cap. Retaining
+that end across retries covers the entire section without entering the next one.
+`totalLines` counts the whole stored page, including a trailing empty line. Empty
+pages report `totalLines: 0` with absent bounds. `anchor` is present only for a
+resolved indexed section.
+
+`read` passes the docs `target` string through unchanged, whether it
+is an emitted HTTP(S) `docsReadTarget` or a historical page ID. Successful JSON
+reads retain `docsReadTarget`, compatible `pageId`, and provenance
+`sourceUrl`, plus the actual returned `startLine` / `endLine`, whole-page
+`totalLines`, and any resolved `anchor`. Opaque and snapshot-pinned IDs are not
+trimmed, percent-decoded, fragment-stripped, or otherwise normalized. Unknown
+pages retain the existing non-retryable `NOT_FOUND` envelope, distinct from the
+section-resolution error, and URL reads never enqueue crawling.
+
+**Backend compatibility.** Compact `read` requires `Query.read` with both
+`CodeContextResult` and `GetDocPageResult` union branches and the complete
+selected minimum fields documented in [Unified read](unified-read.md),
+including `contentRange` for docs and indexing/target-resolution metadata for
+code. Deploy that schema before releasing or deploying the client. There is
+deliberately no old-schema fallback: a client pointed at an older target
+returns the normal sanitized protocol-mismatch error instead of silently losing
+fragment/range semantics. Legacy roots remain available to deprecated command
+compatibility paths only. The endpoint probe results below are historical. On
+2026-09-10, production validation confirmed that
+the default `https://pkgseer.dev` target accepted all three additions, and an
+authenticated Flask corpus read resolved `#the-routing-system` to lines 81-93
+of 219. On 2026-09-14, authenticated built CLI and local MCP probes also
+confirmed both `Query.read` union branches against that production target. The
+current production OSS default is `https://oss.githits.dev`; `GITHITS_ENV=dev`
+selects `https://oss-dev.githits.dev`. Backend merge state and deployment state
+are separate; only the served schema establishes runtime compatibility.
+
+Content is sanitized across the complete stored page before backend slicing, so
+any backend `contentSafety` assessment covers the complete page even when
+modifications fall outside the returned selection. The current read envelope does
+not expose that unused backend field. Client diagnostics and result metadata keep
+only locators, explicit bounds, range coordinates, and existing provenance; they
+never store documentation content or credentials as usage details.
+
+**Errors in text mode.** All package-produced MCP failures respect `format`: omitted/default and explicit `text` return readable error content with `isError: true`; explicit `json` retains the structured error envelope. This includes direct/early tool errors, local Research and server-side service-provider failures. Host auth/terms remediation and caller cancellation remain intact. CLI keeps native terminal and explicit JSON errors. SDK schema failures are handled before package tool handlers and keep the SDK's validation text; the direct callable adapter retains its Zod exception contract. Envelope-parsing smoke/audit probes request JSON explicitly and separately check readable text failures.
+
+## Quick-start guide
+
+The MCP server deliberately omits protocol-level `instructions`. Clients have
+handled that field as hidden guidance, privileged guidance, namespace metadata,
+or a prefix repeated on every tool. Plain MCP clients use the `quick_start`
+tool to expose shared guidance once, on demand. The loaded `githits-mcp` skill
+contains the same stable guide and therefore makes no bootstrap call;
+selected descriptions and schemas remain the source of truth for tool-specific
+routing, arguments, output, and recovery. The bootstrap descriptor's complete
+catalog sentence identifies it as the required first call, includes the literal
+`quick_start` retrieval token, and states the untrusted-content safety benefit;
+the skill-loaded exception follows later. Every evidence and preparatory
+descriptor repeats the same prerequisite
+in a centrally composed footer to remind direct-tool callers to load
+`quick_start`; it does not enforce that call. The footer is absent from transport-neutral
+callable tools, which may not expose a bootstrap tool. There are no
+tool-specific exceptions.
+
+The concrete Codex failure was verified in August 2026. Codex PR
+[#21053](https://github.com/openai/codex/pull/21053) intentionally preserved
+plain MCP server instructions as deferred-tool namespace descriptions. In the
+runtime catalog inspected for this work, the 5,691-character local GitHits
+instruction block plus its separator appeared as the same 5,693-character
+prefix on each of 17 tools. Codex issue
+[#29097](https://github.com/openai/codex/issues/29097) separately tracks that
+MCP instructions are not reliably exposed as server-wide agent guidance. The
+portable response is to leave the protocol field absent, not to optimize a
+payload whose privilege, visibility, and repetition vary by host.
+
+`packages/mcp/src/mcp/instructions.ts` owns the `quick_start` guide sections:
+
+- **Shared guide** — question-to-tool table, cross-tool workflow, canonical
+  targets, result conventions (text/JSON, evidence reuse, continuation, waits,
+  citations/limits), and dependency-upgrade verification. Selected
+  descriptions/schemas own resolver gates, language retry, docs fragment/range
+  behavior, and other single-tool mechanics. See
+  [plugin packaging](plugin-packaging.md) for the section layout.
+- **External-content block** — appended by default from `packages/mcp/src/tools/guardrails.ts`; tells agents to treat third-party prose as data, not instructions.
+- **Resolver guidance** — the shared guide sends fuzzy names to
+  `resolve_target`; canonical identities skip resolution. The `resolve_target`
+  description owns the gates: only unambiguous EXACT/HIGH with
+  CLEAR/NOT_APPLICABLE allows automatic continuation. Other or missing statuses
+  are non-actionable; MEDIUM/LOW or ambiguity needs narrowing or explicit
+  choice. Sites use docs search/list and emitted read actions.
+- **Research section** — the stable guide routes question answering to
+  `research`, keeps its privacy sentence, and carries the shared
+  verified-answer guidance; see [research](research.md#routing-guidance).
+- **Local experimental block** — appended only by the workspace-internal local
+  composer for enabled local experimental definitions. None are registered, so
+  the local guide equals the public guide; public and remote servers never
+  receive this appendix.
+
+The stable guide embedded in `skills/githits-mcp/SKILL.md` is an exact copy of
+`buildMcpQuickStart()` and is checked by `src/skills-packaging.test.ts`. The
+local experimental appendices from `buildLocalMcpQuickStart()` are not copied
+into the public skill and do not override the loaded-skill rule.
+
+`[experimental] tools = true` in `config.toml`, or the hidden
+`githits mcp start --experimental-tools` eval override for one process, enables
+local experimental definitions; with none registered it changes nothing.
+
+When adding a new package tool, extend the quick-start composer with a one-line bullet (`\`tool_name\` — one-sentence purpose`) in the same PR that registers the tool. Keep the bullet terse; argument and response detail belong in the tool's `description`. `mcp-instructions.test.ts` enforces both directions of the mention↔registration invariant.
+
+## Entry Points
+
+The `githits mcp` command has two modes:
+
+- **`githits mcp`** (no subcommand) — Detects TTY. When run interactively, shows setup instructions for configuring AI assistants. When run via stdio (non-TTY), starts the MCP server.
+- **`githits mcp start`** — Always starts the MCP server. Use this in MCP configuration files.
+
+The MCP server starts without a synchronous auth check; auth errors surface per-tool-call inside each tool's handler. See `src/commands/mcp.ts` for the TTY detection logic.
+
+## Architecture
+
+```
+CLI stdio wrapper (src/commands/mcp.ts)
+  └─ loads local policy and creates extended local services
+       └─ workspace-internal local composer (@githits/mcp/internal)
+            └─ shared factory engine (packages/mcp/src/mcp/server.ts)
+                 └─ registers each tool: createXxxTool(service)
+                      └─ ToolDefinition { name, description, schema, handler, annotations? }
+                           └─ handler calls GitHitsService / CodeNavigationService / PackageIntelligenceService / ReadService
+                                └─ service implementation makes HTTP calls
+
+Public/remote createMcpServer()
+  └─ shared factory engine with stable McpToolServices and public tool inventory
+```
+
+The layering is intentional:
+
+- **Tool definitions** (`packages/mcp/src/tools/*.ts`) own the MCP contract: names, descriptions, schemas, and response formatting
+- **GitHitsService / CodeNavigationService / PackageIntelligenceService / ReadService** own the HTTP transport contracts and live in `packages/core-internal`; `ReadService` is the compact `Query.read` client
+- **Shared factory engine** (`packages/mcp/src/mcp/server.ts`) owns MCP SDK registration, per-call provider resolution, and auth/trace wrapping
+- **Workspace-internal local composer** (`packages/mcp/src/mcp/local-server.ts`) combines the local policy with injected experimental definitions (currently none) and composes their instruction subset while keeping any local-only requirements out of the public package
+- **Public/remote server setup** (`createMcpServer()` from `@githits/mcp`) uses stable `McpToolServices` (including required `readService`) and the stable public inventory
+- **CLI MCP command** (`src/commands/mcp.ts`) owns local stdio startup: loads policy only for an actual server start, creates services from the CLI container, sets request-header mode, connects `StdioServerTransport`, and prints TTY setup instructions
+
+This separation means tool logic can be tested without HTTP calls, and service logic can be tested without MCP SDK dependencies.
+
+### Caller cancellation
+
+Every network-backed tool forwards the caller's cancellation signal to its
+backend request: `get_example`, `search`, `search_status`, `research`, `list`,
+`read`, `grep`, `resolve_target`, `code_diff`, `pkg_info`, `pkg_vulns`,
+`pkg_deps`, `pkg_changelog`, and `pkg_upgrade_review`. The server adapter
+copies the MCP request's abort signal into `ToolExecutionContext.signal`; the
+MCP SDK aborts it when the client sends a cancellation notification or the
+connection closes. A cancelled or disconnected call therefore aborts its
+in-flight HTTP request instead of letting it run to completion.
+
+- Service methods accept an optional trailing `ServiceRequestOptions`
+  (`{ signal?: AbortSignal }`, exported from `@githits/mcp/client`). Tools pass
+  it only when a signal exists, so signal-free callers keep their
+  single-argument call shape. CLI commands do not pass a signal and behave as
+  before.
+- Services combine the signal with their own request deadline. It covers both
+  response headers and body reads, and every request of multi-request
+  operations such as paginated advisories, transitive audits, and changelog or
+  upgrade statement pages.
+- A caller abort rejects with the signal's reason, and
+  `throwIfCallerCancellation` rethrows it from the handler instead of
+  returning an error `ToolResult`. An internal deadline keeps each service's
+  existing timeout error mapping.
+- `executeWithTokenRefresh` checks the signal before reading a token, after a
+  failed attempt, and after a refresh, so a cancelled call never refreshes
+  credentials or retries. If a token lookup or refresh fails after the caller
+  aborted, the caller's reason surfaces instead of the provider error.
+
+## Browser-callable surface
+
+`@githits/mcp/tools` is a deliberately narrow public entry for a frontend
+proof of concept. It currently exports the `get_example` factory, its
+search-only `GetExampleService` contract, `toCallableTool()`, and the callable
+metadata/result types. The service seam is structural: callers provide only
+`search(params, options?)`, so a browser service can use its own backend
+endpoint without importing `@githits/core-internal` or the MCP server.
+
+`toCallableTool()` creates a plain callable object with `name`, `description`,
+`annotations`, input-mode JSON Schema, and `execute(input, options?)`. It wraps
+the tool's Zod shape in `z.object()`, emits the schema with
+`z.toJSONSchema(..., { io: "input" })`, and parses input before invoking the
+handler. This means required fields, optional fields, enum values, and Zod
+defaults are reflected in the schema and enforced before the service call.
+The handler returns the existing serializable `ToolResult` envelope; successful
+text and structured error results therefore remain the same as the MCP tool
+path. The initial callable surface is not a second tool protocol or a generic
+protocol-conversion layer.
+
+The callable execution options carry only a browser-standard `AbortSignal`.
+When present, the signal is forwarded unchanged to `GetExampleService.search`.
+Caller cancellation rejects the execution with its cancellation reason rather
+than being converted to a `ToolResult`; service deadlines and ordinary service
+errors retain their existing mapping behavior.
+
+The public `/tools` entry exports the neutral `AuthenticationError`,
+`ApiRateLimitError`, `FetchTimeoutError`, and `TermsAcceptanceRequiredError`
+constructors. An injected browser service should throw one of these exact
+constructors when it wants `get_example` to produce the corresponding
+structured `AUTH_REQUIRED`, `RATE_LIMITED`, `TIMEOUT`, or
+`TERMS_ACCEPTANCE_REQUIRED` `ToolResult`. This is an explicit service-error
+contract, not automatic HTTP response classification. Callable execution
+supplies the host-neutral authentication action `Authenticate with GitHits,
+then retry.`; terms errors use their canonical `acceptanceUrl` action, and
+arbitrary errors remain `UNKNOWN`.
+
+MCP execution has a different boundary. The MCP SDK callback receives raw
+callback state (`extra`) in the server adapter. The adapter extracts only the
+explicit `ToolExecutionContext` fields (`authAction`, paired
+`termsRemediation`, and `signal`) before invoking a tool handler. Tool
+definitions never read raw MCP callback state, so direct callers can omit the
+context and concurrent requests do not share ambient state.
+
+The frontend owns the WebMCP host integration: registration through
+`document.modelContext`, authentication and login UI, request transport, CORS
+policy, and user-facing recovery. The `/tools` entry provides no filesystem,
+environment/config discovery, auth storage, or Node service implementation.
+Only its selected resolved runtime graph is browser-safe; installing the full
+`@githits/mcp` package still includes the MCP SDK and Node-oriented dependency
+tree, and the root and `/client` entries remain Node-oriented.
+
+## Tool Definition Pattern
+
+Each tool follows the same structure. See `packages/mcp/src/tools/search.ts` for the canonical example:
+
+1. Define an `Args` interface for the handler input
+2. Define a `schema` object with Zod validators (these become the MCP tool's input schema)
+3. Define a `DESCRIPTION` constant whose first sentence satisfies claude.ai's
+   rendered catalog contract and whose first 80 raw characters remain useful to
+   clients that expose a raw prefix. Do not use internal periods in that opening
+   sentence; abbreviations, version literals, and filenames make the observed
+   host boundary ambiguous. MCP session composition appends the shared
+   `quick_start` prerequisite to evidence and preparatory tools.
+4. Export a `createXxxTool(service)` factory function returning a `ToolDefinition`
+5. The handler calls the service and wraps the result with `textResult()` or lets `withErrorHandling()` catch errors
+
+> **Descriptions and session composition are owned by `@githits/mcp`.** Do not
+> duplicate them in `remote-mcp`. Add a rendered first-sentence contract and an
+> exact first-80 raw-prefix test in `packages/mcp/src/mcp/server.test.ts`, then
+> use descriptor-only agent evals to inspect discovery and actual calls. Even
+> small wording differences can change tool selection behaviour.
+
+## Adding a New Tool
+
+When adding a new public MCP tool, follow this checklist:
+
+1. **Create tool file** — `packages/mcp/src/tools/new-tool.ts` with `Args` interface, `schema`, `DESCRIPTION`, and `createNewTool(service)` factory
+2. **Add service method** — Add the method to the relevant service interface and implementation in `packages/core-internal/src/services/`
+3. **Export from tools barrel** — Add `export { createNewTool } from "./new-tool.js"` to `packages/mcp/src/tools/index.ts`
+4. **Register in MCP server** — In `packages/mcp/src/mcp/server.ts`, import the factory and add it to `getMcpToolDefinitions()`
+5. **Add tests** — Create `packages/mcp/src/tools/new-tool.test.ts` with metadata, service call, success, and error path tests
+6. **Update mock service** — Add the new method to the mock factories in `packages/mcp/src/services/test-helpers.ts`
+7. **Add CLI command** — Create a corresponding CLI command in `src/commands/` (see `docs/implementation/cli-commands.md`)
+8. **Update registration smoke** — Add the tool name to `EXPECTED_MCP_TOOLS` in `packages/mcp/src/smoke-test.ts`
+9. **Update CLI structure smoke** — If this adds a top-level CLI command, add it to `EXPECTED_TOP_LEVEL_COMMANDS` in `scripts/cli-smoke.ts`
+
+## Host Boundaries
+
+The hosted and local stable MCP servers do not maintain separate tool
+definitions or formatters. Both register the `@githits/mcp` surface and inject
+services through its `McpToolServices` boundary. `remote-mcp` owns hosted
+transport, request auth/session state, deployment, and observability; the CLI
+owns stdio startup, local auth/storage, and local configuration. The CLI may
+compose config-gated experimental tools when one exists, but those do not change
+the public or hosted stable inventory.
+
+## Testing Tools
+
+Each tool has a co-located test file (for example `packages/mcp/src/tools/get-example.test.ts`, `packages/mcp/src/tools/search.test.ts`, `packages/mcp/src/tools/search-status.test.ts`). Tests use mock factories from `packages/mcp/src/services/test-helpers.ts` to mock the service layer.
+
+Test categories for each tool:
+- **Metadata** — tool name and description are correct
+- **Service calls** — correct parameters passed to the service
+- **Success path** — result formatted correctly
+- **Error path** — errors wrapped in `ToolResult` with `isError: true`
+
+See `docs/guidelines/TESTING.md` for the full testing pattern.
+
+## Key Reference Files
+
+| File | What it demonstrates |
+|---|---|
+| `packages/mcp/src/tools/get-example.ts` | Example-search MCP tool definition |
+| `packages/mcp/src/tools/search.ts` | Unified indexed-search MCP tool definition |
+| `packages/mcp/src/tools/search-status.ts` | Follow-up MCP tool for incomplete unified searches |
+| `packages/mcp/src/tools/types.ts` | `ToolDefinition` interface, `textResult`/`errorResult` helpers |
+| `packages/mcp/src/tools/shared.ts` | Shared MCP error/action helpers |
+| `packages/mcp/src/shared/service-request-args.ts` | Optional caller-signal forwarding to service calls |
+| `packages/mcp/src/tools/network-tool-cancellation.test.ts` | Per-tool caller-cancellation contract |
+| `packages/mcp/src/services/test-helpers.ts` | Mock service factories |
+| `packages/mcp/src/mcp/server.ts` | Transport-neutral MCP server construction and tool registration |
+| `packages/mcp/src/mcp/instructions.ts` | Stable guide builder returned by `quick_start` and copied into the loaded `githits-mcp` skill |
+| `src/commands/mcp.ts` | CLI stdio startup, request-header mode setup, and TTY setup instructions |
+| `packages/core-internal/src/services/githits-service.ts` | REST API client for example search |
+| `packages/core-internal/src/services/code-navigation-service.ts` | Package/source service client for unified `search`, `search_status`, and legacy code-navigation operations |
+| `packages/core-internal/src/services/list-service.ts` | Transport-neutral unified `list` client for package, repository, and site inventories |
+| `packages/core-internal/src/services/grep-service.ts` | Transport-neutral unified `grep` client for one mixed-source `Query.grep` page |
+| `packages/mcp/src/tools/grep.ts` | Stable MCP `grep` schema and adapter |
+| `packages/mcp/src/shared/grep-request.ts` / `grep-response.ts` / `grep-error-map.ts` / `grep-text.ts` | Shared unified `grep` request, result, error, and text boundaries used by MCP and CLI |
+
+## Related Documentation
+
+- [`packages/mcp/README.md`](../../packages/mcp/README.md) — public package and
+  remote-host integration boundary
+- [`mcp-cli-parity.md`](./mcp-cli-parity.md) — rules for dual-surface tools (CLI ↔ MCP)
+- [`cli-commands.md`](./cli-commands.md) — CLI commands that mirror these MCP tools
+- `docs/guidelines/ARCHITECTURAL_GUIDELINES.md` — service isolation and testing patterns
+
+See [Repository target grammar](repository-targets.md) for the shared GitHub, Codeberg, GitLab, and owner-qualified Launchpad addressing contract and provider-preserving response identity.
+
+### Search path compatibility
+
+MCP callers use `path:<prefix>` in `query`; the backend reports ignored or
+incompatible query features in `sourceStatus` instead of the client preflighting
+source combinations. CLI `--path-prefix` remains a structured code-source filter.
+The shared request builder rejects a nonempty CLI prefix when no code source is
+selected, returning `INVALID_ARGUMENT` before `service.search`; it does not silently
+discard the requested scope. Empty CLI values remain omitted, while explicit mixed
+sources and automatic mixed targets remain valid when code is selected.

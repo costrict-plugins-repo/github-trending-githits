@@ -1,0 +1,278 @@
+import type {
+  CodeNavigationService,
+  UnifiedSearchTarget,
+} from "@githits/core-internal";
+import { z } from "zod";
+import {
+  DEFAULT_WAIT_TIMEOUT_MS,
+  MAX_DISCOVERY_WAIT_TIMEOUT_MS,
+} from "../shared/code-navigation-defaults.js";
+import { mapCodeNavigationError } from "../shared/code-navigation-error-map.js";
+import type { MappedError } from "../shared/mapped-error.js";
+import { withIndexingRetryAction } from "../shared/mapped-error-text.js";
+import { buildUnifiedSearchParams } from "../shared/unified-search-request.js";
+import {
+  buildUnifiedSearchErrorPayload,
+  buildUnifiedSearchSuccessPayload,
+  projectUnifiedSearchSuccessPayload,
+} from "../shared/unified-search-response.js";
+import { parseUnifiedSearchTargetSpec } from "../shared/unified-search-target.js";
+import {
+  renderUnifiedSearchError,
+  renderUnifiedSearchSuccess,
+} from "../shared/unified-search-text.js";
+import { withVersionRefRecovery } from "../shared/version-ref-recovery.js";
+import { SEARCH_GUARDRAIL } from "./guardrails.js";
+import {
+  addLocalMcpAuthAction,
+  mcpMappedErrorResult,
+  throwIfCallerCancellation,
+} from "./shared.js";
+import {
+  errorResult,
+  OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
+  type ToolDefinition,
+  type ToolExecutionContext,
+  type ToolResult,
+  textResult,
+  type ZodRawShape,
+} from "./types.js";
+
+type ResolvedSearchTarget = Exclude<
+  ReturnType<typeof resolveSearchTarget>,
+  ToolResult
+>;
+
+export interface SearchArgs {
+  query: string;
+  target?: string;
+  targets?: string[];
+  source?: "docs" | "code" | "symbol";
+  public_only?: boolean;
+  allow_partial_results?: boolean;
+  limit?: number;
+  offset?: number;
+  wait_timeout_ms?: number;
+  format?: "text" | "json";
+}
+
+const searchTargetSchema = z
+  .string()
+  .min(1)
+  .describe(
+    "Compact target: `npm:react@version`, `github:facebook/react@ref`, `launchpad:~owner/+git/repo@ref` (`lp:PROJECT` also accepted), or `site:react.dev`. Omit the suffix for the latest package version or repository default branch; a ref may be a branch, tag, or commit. `#` is for semantic fragments.",
+  );
+
+const schema: ZodRawShape = {
+  query: z
+    .string()
+    .min(1)
+    .describe(
+      "Focused discovery terms, API names, behaviors, or quoted phrases. Add constraints inline, for example `kind:function`, `category:callable`, `path:lib/`, `intent:production`, `name:Router`, or `lang:typescript`; qualifiers combine with terms using query boolean syntax.",
+    ),
+  target: searchTargetSchema
+    .optional()
+    .describe(
+      "One compact target: `npm:react@version`, `github:facebook/react@ref`, `launchpad:~owner/+git/repo@ref` (`lp:PROJECT` also accepted), or `site:react.dev`. Omit the suffix for the latest package version or repository default branch; a ref may be a branch, tag, or commit. `#` is for semantic fragments. Do not also pass `targets`.",
+    ),
+  targets: z
+    .array(searchTargetSchema)
+    .max(20)
+    .optional()
+    .describe("Up to 20 compact targets. Do not also pass `target`."),
+  source: z
+    .enum(["docs", "code", "symbol"])
+    .optional()
+    .describe(
+      "Optional result source: `docs` for guides/reference pages, `code` for source and tests, or `symbol` for APIs/entities. Omit to let GitHits select the best sources.",
+    ),
+  public_only: z
+    .boolean()
+    .optional()
+    .describe(
+      'Set true to restrict code and symbol results to public APIs. False is equivalent to omitting it; ignored for `source:"docs"`.',
+    ),
+  allow_partial_results: z
+    .boolean()
+    .optional()
+    .describe(
+      "Default true returns a serveable subset while other target/source pairs prepare, with searchRef for continuation. Set false to keep hits atomic across runnable pairs; a complete serveable interim result may still accompany searchRef during refresh. Partial payloads support normal pagination via nextOffset.",
+    ),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe("Maximum results to return (default 10, max 100)."),
+  offset: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Zero-based result offset (default 0). Continue pagination with the response's `nextOffset` when present.",
+    ),
+  wait_timeout_ms: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_DISCOVERY_WAIT_TIMEOUT_MS)
+    .optional()
+    .describe(
+      `Time to wait for results in ms. Default ${DEFAULT_WAIT_TIMEOUT_MS}, max ${MAX_DISCOVERY_WAIT_TIMEOUT_MS}.`,
+    ),
+  format: z
+    .enum(["text", "json"])
+    .default("text")
+    .describe(
+      "Omit `format` to use token-efficient text when the model reads the result or chooses follow-up tools. Set `json` only when code consumes the raw response instead of the model, or a required field is absent from text.",
+    ),
+};
+
+const DESCRIPTION =
+  'Discover relevant docs, code, and symbols in a known public target. Start here for open-ended "how does", "where is", "find", or "locate" questions. ' +
+  "Required: `query` plus either `target` or `targets`; pass `target` or `targets`, not both. " +
+  "Target indexed dependencies and repositories, or standalone docs with `site:<host[/path]>`. " +
+  "Put search constraints in `query`; backend validation reports accepted values. Inspect returned warnings and `sourceStatus` when a qualifier is ignored or incompatible with a selected source. `public_only` remains structured and is ignored for docs. " +
+  "A `search` call can return complete results directly. Use visible hits for lookup now. Follow `search_status` only if you need updated results and the response supplies both a `searchRef` and a `search_status` action; never repeat `search` to poll. Terminal or unrecognized statuses are not polled; follow the response's recovery guidance instead. If the response includes advisory `sourceStatus[].suggestedSiteTargets`, retry one explicitly; do not treat suggestions as aliases or retry automatically. " +
+  "Use hit content directly when sufficient; otherwise replay its complete emitted read action or generated `followUp` unchanged, including supplied selector and bounds. A `[docs page]` header is a page locator; its action selects the hit's section. Hosted HTTP(S) page locators address mutable current content. Repository docs remain snapshot-addressed and keep returned ranges. For direct reads, explicit bounds select a caller-chosen range; a docs URL fragment without bounds returns its heading and full subtree through the next equal-or-higher heading." +
+  `\n\n${SEARCH_GUARDRAIL}`;
+
+export function createSearchTool(
+  service: CodeNavigationService,
+): ToolDefinition<SearchArgs, typeof schema> {
+  return {
+    name: "search",
+    description: DESCRIPTION,
+    schema,
+    annotations: OPEN_WORLD_READ_ONLY_TOOL_ANNOTATIONS,
+    handler: async (args, context) => {
+      try {
+        const effectiveTarget = isBlankSearchTarget(args.target)
+          ? undefined
+          : args.target;
+        const resolvedTarget = effectiveTarget
+          ? resolveSearchTarget(effectiveTarget, context, args.format)
+          : undefined;
+        if (resolvedTarget && "content" in resolvedTarget)
+          return resolvedTarget;
+
+        const effectiveTargets = args.targets?.filter(
+          (target) => !isBlankSearchTarget(target),
+        );
+        const nonEmptyTargets = effectiveTargets?.length
+          ? effectiveTargets
+          : undefined;
+        const resolvedTargets = nonEmptyTargets?.map((entry) =>
+          resolveSearchTarget(entry, context, args.format),
+        );
+        const resolvedTargetsError = resolvedTargets?.find(
+          (entry) => "content" in entry,
+        );
+        if (resolvedTargetsError) {
+          return resolvedTargetsError;
+        }
+
+        const built = buildUnifiedSearchParams({
+          target:
+            resolvedTarget && !("content" in resolvedTarget)
+              ? resolvedTarget
+              : undefined,
+          targets: resolvedTargets?.filter(isResolvedSearchTarget),
+          query: args.query,
+          sources: args.source
+            ? [args.source.toUpperCase() as "DOCS" | "CODE" | "SYMBOL"]
+            : undefined,
+          publicOnly: args.public_only,
+          allowPartialResults: args.allow_partial_results,
+          limit: args.limit,
+          offset: args.offset,
+          waitTimeoutMs: args.wait_timeout_ms,
+        });
+
+        const outcome = await service.search(built.params, {
+          signal: context?.signal,
+        });
+        const payload = buildUnifiedSearchSuccessPayload(
+          built.params,
+          built.rawQuery,
+          built.compiledQuery,
+          outcome,
+        );
+        if (isTextFormat(args.format)) {
+          return textResult(renderUnifiedSearchSuccess(payload));
+        }
+        return textResult(
+          JSON.stringify(projectUnifiedSearchSuccessPayload(payload)),
+        );
+      } catch (error) {
+        throwIfCallerCancellation(error, context?.signal);
+        const basePayload = buildUnifiedSearchErrorPayload(error);
+        const indexingMapped = withIndexingRetryAction(
+          {
+            code: basePayload.code as MappedError["code"],
+            message: basePayload.error,
+            retryable: basePayload.retryable,
+            details: basePayload.details as MappedError["details"],
+          },
+          "search",
+          "mcp",
+        );
+        const mapped = withVersionRefRecovery(indexingMapped, {
+          syntax: "mcp",
+          tool: "search",
+          args,
+        });
+        const payload = addLocalMcpAuthAction(
+          {
+            ...basePayload,
+            ...(mapped.details
+              ? { details: mapped.details as Record<string, unknown> }
+              : {}),
+          },
+          context,
+        );
+        if (isTextFormat(args.format)) {
+          return errorResult(renderUnifiedSearchError(payload));
+        }
+        return errorResult(JSON.stringify(payload));
+      }
+    },
+  };
+}
+
+function isBlankSearchTarget(
+  target: SearchArgs["target"] | undefined,
+): boolean {
+  if (target === undefined) return true;
+  return target.trim().length === 0;
+}
+
+function isResolvedSearchTarget(
+  target: ReturnType<typeof resolveSearchTarget>,
+): target is ResolvedSearchTarget {
+  return !("content" in target);
+}
+
+function resolveSearchTarget(
+  target: string,
+  context: ToolExecutionContext | undefined,
+  format: SearchArgs["format"],
+): UnifiedSearchTarget | ToolResult {
+  try {
+    return parseUnifiedSearchTargetSpec(target);
+  } catch (error) {
+    const mapped = mapCodeNavigationError(error);
+    return mcpMappedErrorResult(mapped, context, format);
+  }
+}
+
+/**
+ * Default response format is text — agents consume the MCP surface
+ * and benefit from the compact form. Programmatic / parity callers
+ * opt into JSON explicitly.
+ */
+function isTextFormat(format: SearchArgs["format"]): boolean {
+  return format === undefined || format === "text";
+}

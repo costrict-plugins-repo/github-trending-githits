@@ -1,0 +1,300 @@
+import {
+  DEFAULT_FETCH_TIMEOUT_MS,
+  FetchTimeoutError,
+  fetchWithTimeout,
+  isFetchTimeoutError,
+} from "../shared/fetch-timeout.js";
+import { parseHttpErrorDetail } from "../shared/http-error-detail.js";
+import type { ClientHeaderBuilder } from "../shared/request-headers.js";
+import {
+  TermsAcceptanceRequiredError,
+  throwIfTermsAcceptanceRequired,
+} from "../shared/terms-acceptance.js";
+import { validateServiceUrl } from "./config.js";
+import {
+  ApiRateLimitError,
+  AuthenticationError,
+  SERVER_AUTHENTICATION_REJECTED_MESSAGE,
+} from "./githits-service-errors.js";
+import {
+  type ProgressRequest,
+  readProgressRejection,
+} from "./progress-request.js";
+import {
+  type ServiceDiagnostics,
+  withServiceDiagnostics,
+} from "./runtime-diagnostics.js";
+
+export {
+  createTermsAcceptanceError,
+  TERMS_ACCEPTANCE_REQUIRED_CODE,
+  TERMS_ACCEPTANCE_URL,
+  TERMS_URL,
+  type TermsAcceptanceRemediation,
+  TermsAcceptanceRequiredError,
+} from "../shared/terms-acceptance.js";
+export type { AuthenticationErrorSource } from "./githits-service-errors.js";
+export {
+  ApiRateLimitError,
+  AUTHENTICATION_REQUIRED_MESSAGE,
+  AuthenticationError,
+  LOCAL_AUTHENTICATION_MISSING_MESSAGE,
+  SERVER_AUTHENTICATION_REJECTED_MESSAGE,
+} from "./githits-service-errors.js";
+
+const DEFAULT_EXAMPLE_REQUEST_TIMEOUT_MS = 240_000;
+
+/** A stale OAuth JWT can be refreshed once for either auth failure signal. */
+export function isTokenRefreshableError(error: unknown): boolean {
+  return (
+    error instanceof AuthenticationError ||
+    error instanceof TermsAcceptanceRequiredError
+  );
+}
+
+/**
+ * Parse an HTTP Retry-After value into a non-negative delay in seconds.
+ * HTTP-date delays round up so callers never retry before the stated time.
+ */
+export function parseRetryAfterSeconds(
+  value: string | null,
+  nowMs: number,
+): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+
+  if (/^\d+$/.test(normalized)) {
+    const delaySeconds = Number(normalized);
+    return Number.isSafeInteger(delaySeconds) ? delaySeconds : undefined;
+  }
+
+  // Numeric-looking values that are not delay-seconds must not be
+  // reinterpreted by Date.parse as implementation-specific dates.
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(normalized)) return undefined;
+
+  // Date.parse accepts formats outside HTTP-date, including ISO dates.
+  // Restrict parsing to the three wire formats HTTP clients must accept.
+  const isHttpDate =
+    /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(
+      normalized,
+    ) ||
+    /^[A-Z][a-z]+, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/.test(
+      normalized,
+    ) ||
+    /^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/.test(
+      normalized,
+    );
+  if (!isHttpDate) return undefined;
+
+  const retryAtMs = Date.parse(normalized);
+  if (!Number.isFinite(retryAtMs)) return undefined;
+
+  const delayMs = retryAtMs - nowMs;
+  if (delayMs < 0) return undefined;
+
+  const delaySeconds = Math.ceil(delayMs / 1_000);
+  return Number.isSafeInteger(delaySeconds) ? delaySeconds : undefined;
+}
+
+/**
+ * Parameters for search API call.
+ */
+export interface SearchParams {
+  query: string;
+  /** Source read syntax; omission preserves the server's client default. */
+  sourceFormat?: "cli" | "mcp" | "url";
+  language?: string;
+  licenseMode?: "strict" | "yolo" | "custom";
+  includeExplanation?: boolean;
+}
+
+/** Optional browser-standard controls for a GitHits service request. */
+export interface GitHitsServiceRequestOptions {
+  signal?: AbortSignal;
+  /** Optional best-effort progress correlation; never changes the result. */
+  progress?: ProgressRequest;
+}
+
+export interface GitHitsServiceRuntimeOptions {
+  clientHeaders?: ClientHeaderBuilder;
+  userAgent?: string;
+  exampleRequestTimeoutMs?: number;
+  diagnostics?: ServiceDiagnostics;
+}
+
+/**
+ * Service interface for GitHits REST API.
+ */
+export interface GitHitsService {
+  /** Search for code examples. Returns markdown-formatted result. */
+  search(
+    params: SearchParams,
+    options?: GitHitsServiceRequestOptions,
+  ): Promise<string>;
+}
+
+/**
+ * Production implementation of GitHitsService.
+ */
+export class GitHitsServiceImpl implements GitHitsService {
+  constructor(
+    private readonly apiUrl: string,
+    private readonly token: string,
+    private readonly fetchFn?: typeof fetch,
+    private readonly fetchTimeoutMs: number | undefined = undefined,
+    private readonly runtime: GitHitsServiceRuntimeOptions = {},
+  ) {}
+
+  async search(
+    params: SearchParams,
+    options?: GitHitsServiceRequestOptions,
+  ): Promise<string> {
+    options?.signal?.throwIfAborted();
+    return withServiceDiagnostics(
+      this.runtime.diagnostics,
+      "githits.search.request",
+      async () => {
+        const send = (progress?: ProgressRequest) =>
+          this.request(
+            "/search",
+            {
+              method: "POST",
+              headers: this.headers(progress?.headers),
+              body: JSON.stringify({
+                query: params.query,
+                source_format: params.sourceFormat,
+                language: params.language,
+                license_mode: params.licenseMode ?? "strict",
+                include_explanation: params.includeExplanation ?? false,
+              }),
+              ...(options?.signal ? { signal: options.signal } : {}),
+            },
+            this.runtime.exampleRequestTimeoutMs ??
+              DEFAULT_EXAMPLE_REQUEST_TIMEOUT_MS,
+          );
+        let { response, body } = await send(options?.progress);
+        const progressRejection =
+          options?.progress && readProgressRejection(response);
+        if (progressRejection) {
+          // Rejected before admission: nothing ran, so resend without progress.
+          options.progress?.rejected(progressRejection);
+          ({ response, body } = await send());
+        }
+
+        if (!response.ok) {
+          throw this.createError(response, body);
+        }
+
+        return body;
+      },
+    );
+  }
+
+  private headers(
+    extra?: Readonly<Record<string, string>>,
+  ): Record<string, string> {
+    return {
+      ...this.runtime.clientHeaders?.(),
+      ...extra,
+      Authorization: `Bearer ${this.token}`,
+      "Content-Type": "application/json",
+      "User-Agent": this.runtime.userAgent ?? "githits-cli",
+    };
+  }
+
+  private fetchOptions(defaultTimeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS): {
+    fetchFn?: typeof fetch;
+    timeoutMs: number;
+  } {
+    return {
+      fetchFn: this.fetchFn,
+      timeoutMs: this.fetchTimeoutMs ?? defaultTimeoutMs,
+    };
+  }
+
+  private async request(
+    path: string,
+    init: RequestInit,
+    defaultTimeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  ): Promise<{ response: Response; body: string }> {
+    const apiUrl = validateServiceUrl(this.apiUrl, "GITHITS_API_URL");
+    const fetchOptions = this.fetchOptions(defaultTimeoutMs);
+    try {
+      return await fetchWithTimeout(
+        `${apiUrl.replace(/\/+$/, "")}${path}`,
+        init,
+        fetchOptions,
+        async (response) => ({ response, body: await response.text() }),
+      );
+    } catch (cause) {
+      if (isCallerAbort(cause, init.signal)) throw cause;
+      if (isFetchTimeoutError(cause) || isAbortError(cause)) {
+        throw new GitHitsRequestTimeoutError(fetchOptions.timeoutMs, cause);
+      }
+      if (cause instanceof TypeError) {
+        throw new Error(
+          "Could not connect to GitHits. Check your connection and GITHITS_API_URL, then try again.",
+          { cause },
+        );
+      }
+      throw cause;
+    }
+  }
+
+  private createError(response: Response, body: string): Error {
+    const status = response.status;
+    const detail = parseHttpErrorDetail(body, ["detail"]);
+    throwIfTermsAcceptanceRequired(body);
+
+    switch (status) {
+      case 401:
+        return new AuthenticationError(
+          SERVER_AUTHENTICATION_REJECTED_MESSAGE,
+          "server",
+        );
+      case 403:
+        return new Error("Access denied.");
+      case 404:
+        return new Error(detail || "Resource not found.");
+      case 429:
+        return new ApiRateLimitError(
+          undefined,
+          parseRetryAfterSeconds(
+            response.headers.get("Retry-After"),
+            Date.now(),
+          ),
+        );
+      default: {
+        if (status >= 500) {
+          return new Error(
+            `Server error (${status}). Try again shortly.${detail ? ` ${detail}` : ""}`,
+          );
+        }
+        return new Error(
+          `Request failed with status ${status}.${detail ? ` ${detail}` : ""}`,
+        );
+      }
+    }
+  }
+}
+
+class GitHitsRequestTimeoutError extends FetchTimeoutError {
+  constructor(timeoutMs: number, cause: unknown) {
+    super(timeoutMs, { cause });
+    this.name = "GitHitsRequestTimeoutError";
+    this.message = "Request to GitHits timed out. Try again.";
+  }
+}
+
+function isAbortError(error: unknown): error is DOMException {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isCallerAbort(
+  error: unknown,
+  signal: AbortSignal | null | undefined,
+): boolean {
+  return Boolean(
+    signal?.aborted && (error === signal.reason || isAbortError(error)),
+  );
+}

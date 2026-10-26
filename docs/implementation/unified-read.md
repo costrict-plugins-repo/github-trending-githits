@@ -1,0 +1,651 @@
+# Unified read
+
+MCP advertises one `read` tool. CLI provides `githits read`; `githits code read`
+and `githits docs read` remain compatible commands, marked deprecated in help.
+Compact advertised MCP reads and compact top-level CLI reads, including exact
+files, call the transport-neutral `ReadService` once, which sends one backend
+`Query.read` request. Validation, range caps, formatting, and error recovery
+remain owned by the MCP and CLI surfaces. `ReadService` lives in
+`packages/core-internal` and is publicly available only through
+`@githits/mcp/client`; the required
+`McpToolServices.readService` is the request-scoped provider boundary for the
+public MCP server.
+
+## Locators and ownership
+
+Package paths start at the package root; repository paths start at the repository
+root. A read action's target and path form one address. In particular, a package
+search or grep can emit a repository-addressed read action with a repository-root
+path. Reuse both values together rather than moving that path onto the original
+package target. Backend `PathContract` and resolved package scope own coordinate
+conversion; client `ReadTarget` parsing and rendering preserve the selected pair.
+Symbol-resolution text explicitly identifies the target that its candidate and
+suggestion paths are relative to, separately from repository provenance.
+
+CLI recovery commands use the shared `shellQuoteExact` helper for paths,
+selectors, and targets. JSON quoting is reserved for MCP arguments and JSON
+payloads: double quotes in a shell command would still expand substitutions in
+a filename. CLI list recovery shares `buildCliListRecoveryCommand`; it terminates
+options for dash-leading paths. Symbol-search recovery terminates options before
+the selector.
+Literal filename whitespace and numeric-colon suffix limitations are recorded
+in the [open backlog](../plans/open-backlog.md#literal-path-round-trips--2026-10-22).
+
+`packages/mcp/src/shared/read-request.ts` owns transport-neutral locator and range
+validation and recognizes the explicit lowercase `site:` target whose path
+selects hosted documentation. Other nonempty paths scope code to one exact
+target-relative file; without `selector`, that path reads the file. A site path
+is relative to the supplied site's target, preserves emitted query and encoded
+bytes, and uses `/` for the site's landing page. Do not repeat a scoped target's
+prefix in its page path; replay emitted action values exactly.
+Pathless targets, including
+compact package/repository fragments and emitted documentation locators, go to
+the backend's unified `read` resolver. The returned union type determines
+whether CLI/MCP present code, documentation, or a symbol-resolution outcome.
+The client does not classify a pathless target from its spelling.
+The client sends the fragment unchanged to the backend without adding a
+`selector`; the backend decodes and validates it once. Search recovery after a symbol miss uses the requested base target. Successful
+read continuations instead retain the backend-served descriptor identity and
+clear its selector; neither changes the original read request.
+Compact repository refs containing `/` can resemble repository page IDs. The
+backend interprets snapshot page IDs and their `#heading` or line continuations
+as indexed file reads; other fragments can resolve code symbols, with an
+optional exact `path` narrowing the match. The client presents the returned
+type without reproducing that rule. Put a code file path in the
+separate `path` argument, not inside `target` before `#symbol`. An embedded
+path has no reliable text-only boundary: GitLab repositories can have nested
+group names, refs can contain `/`, and repository documentation page IDs also
+contain file paths. An explicit `selector` can also use the full provider
+HTTPS repository URL with such a ref. The backend resolves HTTP(S) URL
+fragments without a selector or path as documentation, including provider roots.
+Empty optional paths count as omitted. Preserve docs
+target bytes, including URL query strings, percent encoding, fragments, and pinned
+repository locators. Never infer the source from URL host or file extension, or
+retry a failed read against the other backend.
+
+A current snapshot repository page ID has the form
+`provider:namespace/repo@SHA/path` (with possible nested GitLab groups). The
+backend serves it as an indexed file, even when the caller supplies the same
+path separately for a continuation. For that exact-file form, CLI JSON identity
+uses `targetResolution.served.commitSha`;
+the generic code-target parser would otherwise mistake `SHA/path` for the ref.
+The `#` suffix selects a symbol or heading; compact repository refs use `@`.
+Structured `--git-ref` remains available for unusual refs containing `#`.
+
+The backend owns each automatic read action as `ReadTarget`: opaque `target`,
+optional `path`, target-dependent `selector` (code symbol or docs anchor), and
+optional absolute `startLine`/`endLine`. Core validates these facts without
+parsing identity, resolving refs or decoding selectors. Shared presentation
+quotes the same action for CLI and MCP. For a dash-leading CLI path, it emits
+selector/range flags before an option terminator and the literal positional path,
+so Commander preserves that filename after shell quotes are removed.
+Search/status select all five fields;
+semantic/package/repository address priority is entirely backend-owned.
+Legacy locator and `preferredRead` metadata remain evidence and provenance,
+without choosing an alternate action. Search text retains producer attribution,
+target-relative preview paths/ranges in repository evidence headers and snippets,
+and emits one unwrapped read command per hit, including explicit
+selectors. The previous text baseline had no per-hit executable command.
+
+CLI text actions retain the complete selected range. Search JSON `followUp`
+uses MCP syntax and the existing 300-line action cap on both surfaces. Only
+explicit actions with a path are narrowed; pathless repository-doc page-ID
+ranges remain uncapped. Semantic cap focus is producer `matchedSource`; other
+code/docs actions use `locator.evidenceRange`. Missing evidence starts at the
+selection origin. Bounds never grow, and previews never become heading bounds.
+
+Search descriptors are internal presentation data. Explicit per-hit and
+success/status projections preserve the existing public JSON schema, content,
+provenance, and null/omission behavior, including interim and retained snapshots.
+No `readTarget`, `codeAction`, or `docAction` is serialized. Missing descriptors
+from old custom search/read providers produce unavailable guidance rather than
+reconstructed addresses. A repository symbol without a served SHA cannot use its
+mutable `gitRef`; its guidance is `follow-up unavailable: missing exact revision`.
+Complete backend-selected package actions remain available.
+
+Docs inventory selects target-only `readTarget` and maps it to the existing
+required `docsReadTarget` string. Both text surfaces emit exactly one whole-page
+action, without a separately reconstructed repository-code shortcut. Existing
+custom inventory providers keep their required opaque string actions.
+
+The MCP tool accepts `target`, optional `path`, `selector`, `start_line`, `end_line`,
+`wait_timeout_ms`, and `format`. Targets for code are compact package/repository
+strings, matching `list` and `grep`. An explicit `site:` target plus
+path addresses hosted documentation through the backend's authorized inventory;
+the target and path emitted by `list` are replayed unchanged. Existing target
+parsers still own package/provider syntax and exact Git revision handling.
+
+The tool in `packages/mcp/src/tools/read.ts` injects `ReadService` and calls its
+`read` method once. The service returns code, docs, or typed code-resolution
+outcomes, and the
+existing source-specific payload builders, formatters, and error mapping remain
+in place. CLI uses the same locator interpretation but its own actions,
+retaining complete, content-only output for pipes. JSON result models remain
+source-specific.
+
+## Backend contract and schema ownership
+
+`ReadServiceImpl` sends the compact request directly to `Query.read`, selecting
+`__typename` and the complete minimum fields needed by all union branches. The
+`CodeContextResult` branch selects `content`, `filePath`, `language`,
+`totalLines`, `startLine`, `endLine`, `isBinary`, `codeIndexState`,
+`indexingRef`, `availableVersions`, `indexingEstimate`, and
+`targetResolution` (including their existing subfields), plus
+`codeAction: readTarget { target path selector startLine endLine }`. The
+`GetDocPageResult` branch selects `registry`, `packageName`, `version`,
+`sourceKind`, `contentRange { startLine endLine totalLines anchor }`, and the
+enclosing `docAction: readTarget { target path selector startLine endLine }`,
+and the page's `id`, `docsReadTarget`, `title`, `content`, `contentFormat`,
+`breadcrumbs`, `lastUpdatedAt`, `sourceKind`, `source { url label }`, `repoUrl`,
+`gitRef`, `requestedRef`, `filePath`, and `baseUrl` fields.
+The `CodeSymbolResolutionResult` branch selects status, up to ten candidates,
+up to ten suggestions, truncation, snapshot identity, message, and index state.
+`AMBIGUOUS`, `NOT_FOUND`, and `SNAPSHOT_UNSUPPORTED` are successful typed
+resolution outcomes without source content. The last outcome explains how to
+search symbols and use exact-path, line-bounded `read` as a workaround.
+
+The returned `__typename` determines the presented source. A missing or unknown
+union branch is a malformed unified-read response; it is never retried against
+another branch or a legacy root. GraphQL failures without a result type use the
+backend's `extensions.code`: documentation-section failures retain their docs
+classification, while shared and code-specific codes retain the code mapper's
+richer version/ref recovery metadata. Transport, HTTP, and malformed-response
+messages are source-neutral. There is no schema
+fallback for compact reads. Custom endpoints configured with
+`GITHITS_CODE_NAV_URL` must implement
+`Query.read`, both union branches, and this selected minimum schema. The legacy
+roots remain available for the compatibility commands, but they are not a
+fallback for compact reads.
+
+Full selected descriptors require all five wire keys; nullable code/search
+actions accept explicit null, while docs actions require an object. Missing or
+malformed selected fields produce the existing malformed-response error. The
+union uses distinct aliases because nullable code and non-null docs actions
+conflict under one GraphQL response key; core normalizes both to `readTarget`.
+Legacy compatibility queries omit the descriptor and keep their parser contracts.
+Optional SDK metadata (`ReadTarget` is exported by `@githits/mcp/client`) preserves
+old custom-service source compatibility. No new service method is required.
+The small scalar selection adds response data; no latency/byte-saving claim or
+extra body hydration is made.
+
+## Sections, windows, and waiting
+
+- A docs URL fragment with no explicit bounds selects its exact indexed section:
+  the heading and full subtree through the next equal-or-higher heading. Do not
+  synthesize line defaults before that backend call.
+- Either explicit bound overrides a docs fragment with a page-relative range.
+  Returned positions and continuation bounds are absolute page line numbers.
+- An explicit docs selector is the logical fragment ID, for example
+  `--selector expressjson` for `#expressjson`; a docs URL fragment cannot be
+  combined with it. Either explicit bound overrides heading selection.
+- A code selector returns the indexed definition range by default. With `path`,
+  resolution is restricted to that exact file. Explicit bounds use the selected
+  file's normal read-range rules. A successful symbol read may omit language.
+  MCP presentation caps selected code to 150 lines by default or 300 with an
+  explicit end, then supplies an exact-file continuation; CLI keeps full output.
+- Compact code `target#symbol` uses the same result presentation and optional
+  exact-path narrowing as an explicit selector. Empty fragments and a fragment
+  combined with an explicit selector surface the backend's invalid argument
+  response without a documentation retry.
+- MCP docs text displays at most 150 selected lines by default, or 300 with an
+  explicit end. MCP docs JSON retains the full backend selection. MCP exact-file
+  code reads cap before fetching at 150 lines by default or 300 with an explicit
+  end, including JSON; symbol result presentation applies the same cap.
+- Validate requested positive integer bounds and their order before applying caps;
+  a fractional end beyond the cap must not silently become a valid bounded request.
+- `wait_timeout_ms` is forwarded to unified `read`: default 30,000 ms, range
+  0–60,000, including explicit zero. The backend applies it when indexing is
+  relevant. INDEXING retains backend metadata and supplies recovery through the
+  same read locator. No client retry loop.
+
+Display-cap continuations retain the served `target`/`path`, clear `selector`,
+and select the whole remaining returned range from the next line through the
+returned selection endpoint. The next request/display cap limits its response;
+the action's end is never narrowed to just that next capped window.
+Symbol/heading continuations cannot exceed that selection. Code
+providers with no `endLine` use the existing returned-content line splitter to
+establish its endpoint before truncation, including trailing-newline handling.
+Exact-file fetch caps retain generic retry guidance and reported file extent.
+For an explicit selection, each retry preserves its end, clamped to actual EOF;
+unbounded file retries keep their existing start-only guidance. Empty/binary
+reads produce no fabricated action or zero bounds. All
+compact reads remain one backend call; no broader read is added for a hint.
+CLI text/JSON keeps full selected content; MCP code caps apply to text/JSON,
+whereas MCP docs caps apply only to text.
+
+CLI uses `--lines` or `--start`/`--end` for either backend result, with the
+same explicit bounds sent to unified `read`. Exact-file paths also accept
+`<path>:N-M`; this suffix is not parsed for symbol or heading reads.
+The CLI validates compact exact-file targets and paths locally, retains
+content-only text and caller-parsed package/repository identity in JSON, and
+adds `githits code files` recovery for missing or unverifiable files.
+`--repo-url`/`--git-ref` retain their compatibility route. `--git-ref`
+without `--repo-url` remains invalid. CLI `--wait` has the same applicability
+as the MCP wait parameter.
+
+## Ask compatibility
+
+Research receives a minimal backend-owned display envelope. CLI and local MCP print
+`display_markdown`; JSON preserves the envelope unchanged. The backend renders final
+`read` citations from exact upstream `readTarget` values, preserving served commits,
+paths, selectors, and line bounds. Clients neither parse nor validate these sources.
+
+The request's `source_format` selects CLI commands, MCP calls, or upstream URLs inside
+the Markdown. CLI commands use `npx githits@latest read`, with optional `--selector`
+and `--lines` before `-- <target> [path]`. MCP citations use `read({...})`. The backend
+owns quoting; CLI retains terminal sanitization, and neither client executes calls.
+New source capabilities still need to work against supported installed catalogs.
+
+This is an experimental compatibility reset. Older structured-response clients are
+not supported at cutover. Afterward, keep `display_markdown` and request/thread
+semantics stable while presentation evolves. See
+[Research display and clarification](ask-target-clarification.md) for the wire contract,
+JSON tolerance, and coordinated rollout. No hosted MCP package change is required.
+
+## Migration and future extension
+
+```text
+compact code read(target, path, ...) -> Query.read(target, path, ...)
+compact docs read(target, ...)        -> Query.read(target, ...)
+code selector read(target, selector, optional path) -> Query.read(...)
+compact symbol read(target#symbol, optional path) -> Query.read(...)
+docs selector read(target, selector)  -> Query.read(...)
+githits code read ...                 -> legacy fetchCodeContext
+githits docs read ...                 -> legacy getDocPage
+githits read --repo-url ...           -> legacy fetchCodeContext
+githits read --repo-url ... --selector <name> -> Query.read(...)
+```
+
+The compact MCP tool and compact top-level CLI command are the canonical read
+surfaces and record backend usage as `read`. Deprecated `githits code read` and
+`githits docs read` stay on their legacy roots so their usage remains an
+observable compatibility cohort; backend analytics distinguish canonical
+`read` from legacy `code_read`/`docs_read`. Top-level `githits read --repo-url ...`
+without selector also stays on `fetchCodeContext`: its structured repository URL
+plus git-ref input is an independent compatibility interface. Selector reads
+use `Query.read`. These
+paths have no removal date or threshold in this documentation; usage statistics
+are evidence for a future product decision.
+
+The root `githits` 0.22.1 release carries CLI and local stdio MCP fragment
+reads; published `@githits/mcp` 0.22.0 already contains the MCP implementation.
+Hosted adoption is separate: update `remote-mcp` to construct
+`ReadServiceImpl` per request with the same token, headers, endpoint/config,
+fetch function, and diagnostics policy, then deploy that host. Until those
+steps occur, hosted traffic remains on its currently published package and
+legacy/current behavior. This repository does not deploy the hosted server.
+
+Code selectors use backend-owned symbol identity and strict resolution. The
+client does not pick a duplicate or infer a symbol from source text. Returned
+repository targets use `@ref`; existing exact-file and docs reads remain valid
+without `selector`.
+
+## Read-action release prerequisites
+
+This feature records patch impact for both public packages without changing
+versions. Dev descriptor availability permits client verification. Publication
+requires the full selected schema on authenticated production and any configured
+client API endpoint. Old clients remain compatible with additive backend fields;
+rollback is the prior client package, with fields retained and no runtime schema
+fallback. Hosted adoption still requires its own MCP dependency update and deploy.
+Broader public CLI/package skill promotion remains at the applicable release
+boundary; the stable MCP guide has the bounded same-PR exception below.
+
+## Public skill release follow-through
+
+The stable MCP quick-start builder and embedded `skills/githits-mcp/SKILL.md` copy
+change together with the backing behavior in this PR under the explicit
+exact-parity exception. This accepts a bounded main-to-release window and ships
+with the next applicable CLI/MCP artifacts. The CLI-code skill and reference
+also receive a bounded version-neutral wording correction now: replay generated
+follow-ups with every supplied argument unchanged, including selectors/bounds.
+That rule works for released fragment actions and current selector actions, and
+adds no new layout or behavior promise. Wider skill promotion retains its
+release-boundary policy because main can serve those skills before npm release.
+The 0.22.0 release branch updated `skills/githits-code/SKILL.md` and its
+reference to prefer `githits read`, show selector reads, and retain legacy
+commands only as compatibility guidance. The root 0.22.1 release branch adds
+compact `target#symbol` reads to the CLI skill and its command-to-MCP mapping.
+The stable MCP guide and `buildMcpQuickStart()` both route known symbols and
+heading IDs to `read`.
+The package skill has no read examples to change. CLI alias removal remains a
+separate product decision.
+
+## Validation evidence
+
+Pre-change static descriptor measurement at 9697466: code_read 4,855 bytes,
+docs_read 2,088 bytes, pair JSON array 6,946 bytes; stable catalog 15 tools /
+56,176 bytes; quick-start guide 4,821 bytes. Measurement serializes name,
+description, `z.toJSONSchema(z.object(schema))`, and annotations. These are byte
+counts, not token estimates or runtime performance measurements.
+
+After-change measurement with the identical serializer: read array 2,444 bytes
+(64.8% smaller), stable catalog 14 tools / 51,605 bytes (4,571 bytes smaller),
+and guide 4,845 bytes (24 bytes larger). The combined catalog-plus-guide is
+4,547 bytes smaller. No before/after agent-token or runtime-speed claim is made.
+
+The source-specific read regressions, CLI routing, Ask projection, catalog,
+quick-start parity, smoke assertions, and deterministic eval fixtures are covered
+by the test suite. Build, smoke, package and agent-eval evidence follows.
+
+Deterministic validation: `bun test` passed 4,608 tests / 16,193 assertions;
+`bun run typecheck`, changed-file Biome lint/format, `bun run build`,
+`bun run plugins:generate`, `bun run plugins:check`, and
+`bun run validate:packages` passed. Full-repository lint exits successfully with
+pre-existing warnings in the unchanged repository-target parser.
+
+Agent evals used local descriptor-only guidance and unchanged neutral workload
+prompts. No isolation-violation artifacts were emitted (the harness writes them
+only when violations are detected).
+
+| Run (under `.agent-eval/runs/`) | Observed behavior | Reported metrics |
+| --- | --- | --- |
+| `2026-09-11T08-47-31-123Z` — Codex discovery | All three workloads reported success/high confidence, but no GitHits tools were used; raw traces show web tools and local file probes. This is not evidence of read behavior. | 81.4s; 69,180 uncached input, 104,448 cached input, 2,081 output tokens; estimated base-rate cost $0.01842216. |
+| `2026-09-11T08-47-31-300Z` — Claude discovery | Read Express source lines 55–90; followed docs search with target-only `read` of the Express route-handlers fragment. The direct Flask workload used WebFetch instead. All answers reported high confidence. | 156.5s; logical counts and token/cost metrics unavailable in the Claude adapter. Raw tool results confirmed successful source and section content. |
+| `2026-09-11T08-50-34-348Z` — Codex intent | Using the existing harness `--intent-profile githits`, read Express lines 55–90 and the unchanged Flask fragment with no bounds; Flask returned only absolute lines 81–93. Both answers reported success/high confidence. | 60.4s; six logical MCP calls, including two reads; 79,375 uncached input, 194,048 cached input, 1,564 output tokens; estimated base-rate cost $0.02163276. |
+
+Commands used `bun run agent:e2e --agent <agent> --server local
+--guidance-profile descriptors`, repeated `--workload` for `code-read-window.md`,
+`docs-search-followup.md`, and `docs-fragment-read.md`. The Codex intent run added
+`--intent-profile githits` and selected only code-read-window and docs-fragment-read.
+`tool-calls.json`, raw results, `final.json`, metrics, and validation artifacts were
+inspected. Self-reported confidence is not a quality grade; no grading stage or
+matching pre-change agent baseline was run.
+
+Live validation:
+
+- Stable `bun run smoke:mcp` assertions passed, including unified code/docs reads.
+  Its subsequent experimental Ask request timed out at 60 seconds, so the complete
+  command exited unsuccessfully; live Ask projection is not claimed verified.
+- `bun run smoke:cli` passed unauthenticated checks but stopped in unrelated
+  `pkg deps npm:express --issues` with a backend HTTP 502 before the read checks.
+- Targeted authenticated CLI probes then verified `read` and both legacy commands
+  produce identical JSON and content-only output for Express 5.2.1 source lines
+  55–90 and the Flask routing fragment; verbose output also passed. The fragment
+  selected absolute lines 81–93 with no supplied bounds.
+- `bun run smoke:cli:built` and `bun run smoke:mcp:built` passed, including stable
+  and experimental registration/auth handling under Node.
+
+These external live-suite failures remain evidence limitations, not suppressed
+assertions or added retries. Unit tests cover Ask projection, including metadata
+preservation and no mutation of backend results.
+
+
+## Implementation review closure
+
+One Opus review ran on 2026-09-11, followed by coordinator verification; no second
+review round was requested, following the user's single-pass policy.
+
+- Accepted missing CLI authenticated-command registration. The shared metadata
+  table naturally owns auto-login eligibility, continuation text, and JSON auth
+  failure handling. Added `read` to that table; regressions exercise interactive
+  success/continuation and failure envelopes, alongside both legacy commands.
+- Accepted stale CLI recovery hints/help. Both new and legacy code reads now direct
+  retries to `githits read`; content and JSON result contracts remain unchanged.
+  Scanned the command/helper and parity assertions for the same stale name.
+- Accepted current-policy documentation drift and repeated search-description
+  wording. Updated current references while retaining historical measurements and
+  release-boundary public skill work.
+- Rejected the optional suggestion to replace explicit zero waits in indexing
+  recovery. Zero remains an intentional nonblocking mode; the recovery preserves
+  caller intent, and the guide already explains using indexing estimates to choose
+  a longer wait. No new retry policy or automatic waiting was added.
+
+Six bounded Luna dispatches handled mechanical follow-ups, peripheral text,
+neighboring descriptors, guide parity, catalog assertions, and final wording.
+Coordinator retained routing/validation, CLI/Ask integration, auth closure, and
+verification. No worker rework or interrupts were needed. Initial eval inventory and auth
+metadata omissions were coordinator scope gaps; closure tests also caught a
+dynamically assembled legacy CLI name and missing smoke rejection for the new
+CLI syntax. All were fixed and covered by the final passing suite.
+
+CI exposed missing explicit types on the exported read schema/descriptions:
+bunup warns locally but fails declaration generation under `CI=true`. Added
+explicit Zod schema and string annotations without changing the wire schema or
+runtime. `CI=true bun run --cwd packages/mcp build`, typecheck, and the 36-test
+read/catalog/eval subset pass; public-package validation was repeated in CI mode.
+
+
+### Luna low and Haiku follow-up (2026-09-11)
+
+Tested commit `e71f771` with `gpt-5.6-luna --reasoning-effort low` and
+`haiku` (provider reports `claude-haiku-4-5-20251001`). Each ran all three
+workloads in both descriptor-only discovery and the existing GitHits-intent
+profile: 12 cells total, one sample per model/profile/workload. Workloads ran with
+`--concurrency 2`; prompts and runtime were unchanged.
+
+| Model / profile | Source window | Exact Flask fragment | Docs search follow-up |
+| --- | --- | --- | --- |
+| Luna low / discovery | Local probes, then web | Web | Web |
+| Luna low / intent | `code_files` then `read`, lines 55–90 | `search` then target-only `read`, lines 81–93 | Used sufficient docs-search snippets, no unnecessary read |
+| Haiku / discovery | Local probes, then `read`, lines 55–90 | WebFetch, after correcting its native tool call | WebSearch and WebFetch |
+| Haiku / intent | Direct `read`, lines 55–90 | Direct target-only `read`, lines 81–93 | `search` → ambiguous-section read error → narrower `search`; answered from returned snippets |
+
+Raw results confirm both models used the unified schema correctly for code and
+fragments under GitHits intent. No retired MCP names, structured read targets,
+wrong source dispatch, or accidental fragment bounds appeared. All 12 final
+responses self-reported success/high confidence and no isolation violations were
+detected; these statuses alone are not an answer-quality grade. Subsequent manual
+inspection checked the six intent answers against retrieved content: both source
+answers identify lazy initialization and the exact caseSensitive/strict settings;
+both fragment answers cover automatic route ordering and canonical redirects;
+both docs answers describe method/path/callback handlers supported by search
+content. No material answer error was found in those six samples. There is no
+formal automated quality score or reliability claim from one sample per cell.
+
+Discovery remains a separate limitation: Luna chose no GitHits tool in any of
+these three neutral cells, and Haiku chose it only for code. The earlier statement
+that Luna used “no tools” was too broad: `tool-calls.json`/logical metrics count
+GitHits calls, whereas raw stdout also records native web and local tools.
+
+Observed locator-consistency gap: Haiku copied
+`https://expressjs.com/en/5x/guide/routing/#routing` verbatim from search result 7.
+Read returned `DOCUMENTATION_SECTION_UNRESOLVED` with `reason: ambiguous`.
+The adapter forwarded the supplied target unchanged; this does not demonstrate a
+unified-schema failure. Backend search/read section consistency needs investigation
+in the backend repository. No backend change or client fallback was attempted in
+this evaluation task; the recovered answer does not make the failed locator valid.
+Evidence is in the Haiku intent docs-search-followup raw stdout, including both
+search responses and the read error.
+
+Run directories under `.agent-eval/runs/`:
+
+- Luna discovery: `2026-09-11T09-16-57-232Z` — 0 GitHits calls; 53,864 uncached
+  input, 73,984 cached input, 1,135 output tokens; base-rate estimate $0.01361448.
+- Luna intent: `2026-09-11T09-17-25-748Z` — 8 GitHits calls; 74,820 uncached
+  input, 297,984 cached input, 1,518 output tokens; base-rate estimate $0.02274528.
+- Haiku discovery: `2026-09-11T09-16-57-224Z`.
+- Haiku intent: `2026-09-11T09-17-37-611Z`.
+
+Haiku aggregate token/cost and logical-call metrics remain unavailable in the
+harness adapter; raw tool-use and matching result records were inspected instead.
+No before/after comparison is claimed. This follow-up changes evidence only.
+
+### PR eval locator correction (2026-09-11)
+
+PR evals at `338d02d` exposed an existing `code_files` text-header bug:
+`indexedVersion` contained the served Git SHA, but the formatter appended it to
+`npm:express@...` as though it were a package version. Luna copied this invalid
+locator, received `VERSION_NOT_FOUND`, then tried object-valued `read.target`
+recovery calls before switching to the required compact repository string.
+
+The list-files formatter owns the copyable header target. It now prefers the
+backend's served repository URL and exact commit (or served ref), using the
+existing repository-target formatter. Package-only responses use the served
+package version or explicitly requested version; untyped `indexedVersion` and
+`resolvedRef` fields are never converted into package versions. JSON retains all
+original resolution fields. This fixes locator production without broadening
+`read.target` or inventing a version from a Git ref. Regression coverage uses the
+observed Express payload and parses the emitted locator back into a code target.
+
+Initial PR runs `34594029426`, `34594060140`, and `34594062207`, attempt 1,
+were exported to Braintrust but ran concurrently and encountered 72 HTTP 429
+responses. Preserve these experiments as contaminated execution evidence, not
+as clean before/after measurements. Only one 429 came from `global-example`;
+others affected package and navigation workloads. Attempt 2 of the first run
+completed without observed 429s and exposed the locator bug above. Remaining
+repeats were stopped when the user requested correction before further runs.
+Future comparisons exclude `global-example` as requested, match 44 existing
+scenario/workload cells, and report the two added fragment cells separately.
+All comparisons use `main-r34592914082-a1` at `74e316e` as the baseline.
+
+Correction validation: 4,712 unit tests passed; typecheck and CI-mode public
+package validation passed. The live Express payload rendered
+`github:expressjs/express@dbac741a49a5a64336b70c06e85c2e2706e36336`; passing that
+locator unchanged to `read` returned the requested application-source lines
+55-90, including both router options. Source and built CLI/MCP smoke checks
+cover unauthenticated handling and MCP registration. The 11-line formatter
+delta was reviewed inline under the small-change review policy.
+
+### First corrected PR run and repo-doc text correction
+
+Run `34595208046` at `65799f5` exported experiment
+`pr-388-r34595208046-a1`, linked to the same main baseline. Excluding the
+user-unwanted `global-example`, inspected traces had no HTTP 429s, no isolation
+violations, and no recurrence of package targets containing a Git SHA. Discovery
+used GitHits for Express routing (six successful reads). The remaining errors
+included three backend timeouts, an invalid explicit `version: "latest"`, and a
+rewritten Express URL that mixed one page with another page's fragment.
+
+Two more read failures exposed a text/JSON inconsistency: search text showed
+`pypi:flask@3.1.3 docs/design.rst:83-93`, while JSON's working follow-up used the
+opaque repo-doc target
+`github:pallets/flask@22d924701a6ae2e4cd01e9a15bbaf3946094af65/docs/design.rst`.
+Luna invented a combined package/path docs locator and got `NOT_FOUND`.
+The search text renderer now uses the existing `documentationReadLocator`
+selection for repo docs, exposing its unchanged target with separate
+`start_line`/`end_line` bounds. Repository code locations, semantic preferred
+reads, ANSI styling, and JSON follow-ups retain their contracts. This is a
+small renderer correction, reviewed inline; no new locator parser or backend
+fallback is introduced. A regression uses the observed Flask result, and a live
+read copied from the rendered row returned the expected lines 83-93.
+
+Repo-doc correction validation: 4,713 tests, typecheck, CI-mode public-package
+validation, and source/built CLI/MCP smoke checks passed. The formatter's exact
+locator and separate bounds were also checked against the live docs read endpoint.
+
+### Package-addressed repository docs (2026-09-28)
+
+The historical opaque-locator presentation workaround above is superseded for
+package-attributed docs with complete metadata. Unified read now accepts the
+package target with a separate target-relative path: live reads of
+`npm:githits@0.22.1` plus `docs/implementation/auth.md` returned the same lines
+and served commit as its emitted repository page ID; the original Flask
+`pypi:flask@3.1.3` plus `docs/design.rst` read also succeeded. Search headers now
+show the served package target with `path:start-end`, and derived docs reads
+use that package target plus the separate path. They never invent a combined
+package/path documentation ID. Repository-only and incomplete legacy results
+retain the emitted locator, and JSON preserves snapshot provenance.
+
+Some ordinary repo-code JSON follow-ups without semantic preferred reads still
+use exact repository addresses despite package-addressed text headers. This
+change addresses docs presentation and generated docs follow-ups; it does not
+change that existing code-follow-up policy.
+
+Validation: 4,951 unit tests, typecheck, build, changed-file checks, and source
+CLI/MCP smoke suites passed. A local descriptor-only Claude Flask eval used a
+package target plus separate docs path successfully, with no isolation violations;
+its final success/high-confidence self-report was not an answer-quality grade.
+Internal and external code review found no accepted findings.
+
+### Sequential PR comparison (2026-09-11)
+
+Three runs were inspected one at a time, with the repo-doc text correction made
+between the first and second. All exported successfully to Braintrust and link
+to `main-r34592914082-a1` (`74e316e`). The final implementation `e45651c` has two
+samples; do not average the earlier `65799f5` sample into its results.
+
+All used `gpt-5.6-luna`, low reasoning, Codex CLI 0.154.0, and the workflow's
+local MCP discovery/intent/full-guidance scenarios. This CI matrix does not test
+Haiku. Matched inputs, model settings, reporting contracts, and result schemas
+were identical to baseline. Match by `metadata.cellId`; exclude `global-example`
+as requested and exclude the newly added fragment cells from baseline deltas.
+This leaves 44 matched cells per run. Metrics below are totals over those cells;
+duration is cumulative agent duration, not workflow wall time. Costs are the
+harness's base-rate estimates, not billed amounts.
+
+| Experiment | Code | Tokens | Estimated cost | Duration (s) | MCP calls | Failed calls |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| [Baseline](https://www.braintrust.dev/app/GitHits/p/githits-cli-agent-evals/experiments/main-r34592914082-a1) | `74e316e` | 4,887,192 | $0.407235 | 717.236 | 193 | 1 |
+| [First inspected run](https://www.braintrust.dev/app/GitHits/p/githits-cli-agent-evals/experiments/pr-388-r34595208046-a1) | `65799f5` | 5,319,951 | $0.419810 | 1,600.347 | 210 | 7 |
+| [Both locator fixes](https://www.braintrust.dev/app/GitHits/p/githits-cli-agent-evals/experiments/pr-388-r34595991782-a1) | `e45651c` | 4,859,966 | $0.404573 | 949.429 | 185 | 3 |
+| [Unchanged repeat](https://www.braintrust.dev/app/GitHits/p/githits-cli-agent-evals/experiments/pr-388-r34596413414-a1) | `e45651c` | 5,337,152 | $0.420483 | 1,678.688 | 193 | 11 |
+
+The two final-code samples average **4.3% more tokens, 1.3% more estimated cost,
+2.1% fewer MCP calls, and 83.2% longer cumulative duration** than this single
+baseline. Full-guidance matched cells alone average 2.8% fewer tokens and 2.2%
+less estimated cost; intent cells average 4.8% more tokens and 1.6% more cost.
+Backend timeouts and different call paths affect duration and consumption. These
+samples do not establish an overall token/cost improvement or a causal slowdown
+from the schema change. The independently measured descriptor-size reduction is
+still real, but does not translate directly into end-to-end token savings here.
+
+All three 48-cell runs reported successful harness/final statuses and had no
+isolation violations. This is not an answer-quality score. Raw traces were
+inspected for failed calls, recovery, locator use, and the dedicated source-window
+and fragment tasks. The two final-code runs had no 429s or recurrence of the
+SHA-as-package-version or invented repo-doc-target failures. Remaining issues:
+
+- Run two: one package target used as a docs page, one docs URL put in `path`, and
+  one altered Zod fragment. The valid emitted Zod locator worked when copied.
+- Run three: one object-valued `read.target`, five unresolved documentation
+  fragments, one explicit unsupported `version: "latest"`, and four backend
+  package-service timeouts. The Express `#routing` ambiguity is the previously
+  dispatched backend finding; baseline itself also had an unresolved Express
+  fragment. No client fallback or schema expansion was introduced for these.
+- The Zod full-guidance answer in run two repeated a type-shape comment
+  (`errors`/`properties`) that conflicts with the `formErrors`/`fieldErrors`
+  example in the same retrieved snippet. Preserve this source/answer ambiguity;
+  the success/high-confidence status does not settle correctness.
+- Neutral discovery selected GitHits in 0/2 then 1/2 final-code cells (baseline
+  0/2). Full guidance also had one zero-GitHits-call cell in each final-code run:
+  the direct fragment task in run two and `site-search-explicit` in run three.
+  Do not confuse successful answers through other tools with GitHits adoption.
+
+The dedicated code-window answers correctly described lazy initialization and
+both router options in all three inspected runs. Direct Flask fragment reads
+succeeded whenever actually invoked; some cells answered via other tools.
+The repo-doc correction also has a separate exact-locator live regression,
+since both final-code docs-noise runs chose website pages instead of repeating
+the original repo-doc path.
+
+Artifacts are retained locally under `.agent-eval/ci-pr388/fixed1`, `fixed2`, and
+`fixed3`; GitHub keeps uploaded artifacts for 14 days. Normalized eval rows and
+structural tool spans are retained in the linked Braintrust experiments. No raw
+stdout, provider events, or credentials were exported by this comparison.
+
+## Package-addressed documentation validation
+
+PR [#424](https://github.com/githits-com/githits-cli/pull/424) merged on
+2026-09-28. Live reads from displayed githits and Flask package-relative rows
+returned the expected source; CLI/MCP live smoke and the Claude
+`docs-search-noise` descriptor eval passed. The trace used a separate pinned
+package target and exact path, plus a hosted fragment read. No answer-quality
+grading was performed. Tests cover monorepo path coordinates, repository-only
+and incomplete locators, semantic preferred-read precedence, and the 300-line
+MCP follow-up cap. Ordinary repo-code JSON follow-ups retain their existing
+addressing; package-doc follow-up consistency does not assert parity for them.
+
+## Preparation errors and refresh annotations
+
+Default/text MCP indexing failures explain that requested content is not available
+yet, show compact preparation/timing rows and one `wait_timeout_ms` retry. CLI
+uses its native millisecond `--wait`; no reply mixes both syntaxes or exposes an
+opaque indexing reference in prose. The recommended wait uses uniform timing
+first and supplied singular timing otherwise, never the just-failed zero wait.
+JSON retains backend messages, hints, timing and indexed alternatives. Annotated
+readable content can show pending refresh; ordinary CLI body output remains raw.
+See [uniform indexing estimates](indexing-estimates.md) for timing semantics and
+the production deployment prerequisite.
+
+
+## Annotated code provenance
+
+MCP code reads and verbose CLI code reads place shared `Sources` rows after the
+existing file header and before content. Independently supplied commit dates and
+historical indexed refs belong to the served identity. `Preparing` follows the
+content and describes the concrete job identity, with `observed HEAD` only for
+an exact raw repository/full-SHA match to a resolved HEAD/default-branch request.
+A different requested commit remains separately labelled. Binary and empty
+verbose reads retain the same provenance and recovery facts. Plain CLI content
+and JSON retain their existing contracts.

@@ -1,0 +1,982 @@
+// PARITY TEST — enforces rule IDs from docs/implementation/mcp-cli-parity.md:
+//   PARITY-JSON-KEYS       CLI --json output and MCP text payload parse to
+//                          deepEqual JSON objects for equivalent inputs.
+//   PARITY-ERROR-ENVELOPE  Both surfaces emit { error, code, retryable,
+//                          details? } on every error path; MCP error text is
+//                          always valid JSON.
+//
+// Assertion policy:
+//   - Service-sourced success and error fixtures use `toEqual`: both
+//     surfaces route through the same classifier / envelope builder,
+//     so backend facts match; recovery actions use native surface syntax.
+//   - `INVALID_ARGUMENT` fixture uses `toMatchObject`: both surfaces
+//     parse the canonical compact target and run the shared builder,
+//     including the tool-local availability predicate. Same envelope
+//     shape, potentially surface-specific error text.
+//
+// Coverage includes direct-only defaults, transitive parity, filter/error
+// envelopes, and permissive validation cases.
+
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
+import type {
+  PackageIntelligenceService,
+  VulnerabilityReport,
+} from "@githits/core-internal";
+import {
+  PackageIntelligenceBackendError,
+  PackageIntelligenceTargetNotFoundError,
+  PackageIntelligenceVersionNotFoundError,
+} from "@githits/core-internal";
+import {
+  type PkgVulnsCommandDependencies,
+  pkgVulnsAction,
+} from "../commands/pkg/vulns.js";
+import {
+  createMockPackageIntelligenceService,
+  defaultVulnerabilityReport,
+} from "../services/test-helpers.js";
+import {
+  createParityMcpTool,
+  isProcessExitSentinel,
+} from "./parity-test-helpers.js";
+
+function cliDeps(
+  overrides: Partial<PkgVulnsCommandDependencies> = {},
+): PkgVulnsCommandDependencies {
+  return {
+    packageIntelligenceService: createMockPackageIntelligenceService(),
+    codeNavigationUrl: "https://pkgseer.dev",
+    hasValidToken: true,
+    mcpUrl: "https://mcp.example.com",
+    ...overrides,
+  };
+}
+
+async function cliJson(
+  spec: string,
+  options: Parameters<typeof pkgVulnsAction>[1] = {},
+  deps: PkgVulnsCommandDependencies = cliDeps(),
+): Promise<unknown> {
+  const logSpy = spyOn(console, "log").mockImplementation(() => {});
+  const errSpy = spyOn(console, "error").mockImplementation(() => {});
+  const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+    throw new Error("process.exit");
+  });
+  try {
+    try {
+      await pkgVulnsAction(spec, { ...options, json: true }, deps);
+    } catch (error) {
+      if (!isProcessExitSentinel(error)) throw error;
+    }
+    const fromLog = logSpy.mock.calls[0]?.[0] as string | undefined;
+    const fromErr = errSpy.mock.calls[0]?.[0] as string | undefined;
+    const raw = fromLog ?? fromErr;
+    return raw ? JSON.parse(raw) : undefined;
+  } finally {
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+    exitSpy.mockRestore();
+  }
+}
+
+async function mcpJson(
+  args: {
+    target: string;
+    min_severity?: string;
+    advisory_scope?: string;
+    include_withdrawn?: boolean;
+    include_transitive?: boolean;
+  },
+  packageVulnerabilitiesMock?: () => Promise<VulnerabilityReport>,
+): Promise<{ json: unknown; isError: boolean | undefined }> {
+  const service = createMockPackageIntelligenceService(
+    packageVulnerabilitiesMock
+      ? { packageVulnerabilities: packageVulnerabilitiesMock as never }
+      : {},
+  );
+  const tool = createParityMcpTool("pkg_vulns", {
+    packageIntelligenceService: service,
+  });
+  const result = await tool.handler({ ...args, format: "json" }, {});
+  const text = result.content[0]?.text ?? "";
+  return { json: JSON.parse(text), isError: result.isError };
+}
+
+function zeroVulnsReport(): VulnerabilityReport {
+  return {
+    package: { name: "clean", registry: "NPM", version: "1.0.0" },
+    security: {
+      affectedVulnerabilityCount: 0,
+      nonAffectingVulnerabilityCount: 0,
+      allVulnerabilityCount: 0,
+      currentVersionAffected: false,
+      upgradePaths: [],
+      vulnerabilities: [],
+    },
+  };
+}
+
+function transitiveVulnerabilityReport(): VulnerabilityReport {
+  const report = structuredClone(defaultVulnerabilityReport);
+  report.transitive = {
+    affectedCount: 1,
+    nonAffectingCount: 0,
+    unknownCount: 0,
+    totalCount: 1,
+    advisoryScope: "AFFECTED",
+    totalPackagesAnalyzed: 2,
+    packageCount: 1,
+    occurrenceCount: 1,
+    packages: [
+      {
+        affectedCount: 1,
+        nonAffectingCount: 0,
+        unknownCount: 0,
+        totalCount: 1,
+        registry: "NPM",
+        name: "body-parser",
+        occurrenceCount: 1,
+        occurrences: [
+          {
+            version: "1.19.0",
+            affectsResolvedVersion: true,
+            matchedAffectedVersionRanges: ["< 2.0.0"],
+            fixVersionsAboveResolved: ["2.0.0"],
+            nearestFixedVersion: "2.0.0",
+            advisory: {
+              osvId: "GHSA-body-parser",
+              summary: "Body parser issue",
+              severityScore: 8.0,
+            },
+          },
+        ],
+      },
+    ],
+  };
+  return report;
+}
+
+describe("package_vulnerabilities parity", () => {
+  it("uses identical non-affecting wording in CLI and MCP text", async () => {
+    const report = transitiveVulnerabilityReport();
+    report.security = {
+      affectedVulnerabilityCount: 1,
+      nonAffectingVulnerabilityCount: 1,
+      allVulnerabilityCount: 2,
+      currentVersionAffected: true,
+      vulnerabilities: [
+        {
+          osvId: "GHSA-direct-fixed",
+          affectsInspectedVersion: false,
+          assessmentStatus: "NON_AFFECTING",
+        },
+      ],
+    };
+    const audit = report.transitive!;
+    audit.advisoryScope = "NON_AFFECTING";
+    audit.affectedCount = 0;
+    audit.nonAffectingCount = 1;
+    const pkg = audit.packages[0]!;
+    pkg.affectedCount = 0;
+    pkg.nonAffectingCount = 1;
+    const occurrence = pkg.occurrences[0]!;
+    occurrence.affectsResolvedVersion = false;
+    occurrence.assessmentStatus = "NON_AFFECTING";
+    occurrence.matchedAffectedVersionRanges = [];
+    occurrence.fixVersionsAboveResolved = [];
+    delete occurrence.nearestFixedVersion;
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: mock(() => Promise.resolve(report)),
+    });
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (chunk) => {
+        writes.push(String(chunk));
+        return true;
+      },
+    );
+    let cli: string;
+    try {
+      await pkgVulnsAction(
+        "npm:express",
+        { scope: "non_affecting", transitive: true, verbose: true },
+        cliDeps({ packageIntelligenceService: service }),
+      );
+      cli = stripVTControlCharacters(writes.join(""));
+    } finally {
+      writeSpy.mockRestore();
+    }
+    const tool = createParityMcpTool("pkg_vulns", {
+      packageIntelligenceService: service,
+    });
+    const result = await tool.handler(
+      {
+        target: "npm:express",
+        advisory_scope: "non_affecting",
+        include_transitive: true,
+        verbose: true,
+      },
+      {},
+    );
+    const mcp = result.content[0]?.text ?? "";
+    expect(result.isError).toBeUndefined();
+    expect(cli.replace(/\s+/g, " ").trim()).toBe(
+      mcp.replace(/\s+/g, " ").trim(),
+    );
+    for (const text of [cli, mcp]) {
+      expect(text).toContain("Scope   non-affecting advisories only");
+      expect(text).toContain("showing 1 non-affecting advisory\n");
+      expect(text).not.toContain("that do not affect this version");
+      expect(text).toContain("1 non-affecting advisory occurrence");
+      expect(text.match(/\[non-affecting\]/g)).toHaveLength(2);
+      expect(text).not.toContain("historical");
+    }
+  });
+
+  it("PARITY-JSON-KEYS: happy path CLI === MCP", async () => {
+    const packageVulnerabilities = mock(
+      (
+        _params?: Parameters<
+          PackageIntelligenceService["packageVulnerabilities"]
+        >[0],
+      ) => Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: packageVulnerabilities as never,
+    });
+    const cli = await cliJson(
+      "npm:express",
+      {},
+      cliDeps({ packageIntelligenceService: service }),
+    );
+    const { json, isError } = await mcpJson(
+      { target: "npm:express" },
+      packageVulnerabilities,
+    );
+    expect(isError).toBeUndefined();
+    expect(packageVulnerabilities).toHaveBeenCalledTimes(2);
+    expect(packageVulnerabilities.mock.calls).toEqual([
+      [
+        {
+          registry: "NPM",
+          packageName: "express",
+          version: undefined,
+          minSeverity: undefined,
+          includeWithdrawn: undefined,
+          includeTransitive: undefined,
+          advisoryScope: undefined,
+          includeTransitiveAdvisoryDetails: true,
+        },
+      ],
+      [
+        {
+          registry: "NPM",
+          packageName: "express",
+          version: undefined,
+          minSeverity: undefined,
+          includeWithdrawn: undefined,
+          includeTransitive: undefined,
+          advisoryScope: undefined,
+          includeTransitiveAdvisoryDetails: true,
+        },
+      ],
+    ]);
+    expect(cli).toEqual(json);
+  });
+
+  it("PARITY-JSON-KEYS: scoped pinned target CLI === MCP", async () => {
+    const packageVulnerabilities = mock(
+      (
+        _params?: Parameters<
+          PackageIntelligenceService["packageVulnerabilities"]
+        >[0],
+      ) => Promise.resolve(defaultVulnerabilityReport),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: packageVulnerabilities as never,
+    });
+    const cli = await cliJson(
+      "NPM:@types/node@22.0.0",
+      {},
+      cliDeps({ packageIntelligenceService: service }),
+    );
+    const { json, isError } = await mcpJson(
+      { target: "NPM:@types/node@22.0.0" },
+      packageVulnerabilities,
+    );
+
+    expect(isError).toBeUndefined();
+    expect(packageVulnerabilities).toHaveBeenCalledTimes(2);
+    expect(packageVulnerabilities.mock.calls).toEqual([
+      [
+        {
+          registry: "NPM",
+          packageName: "@types/node",
+          version: "22.0.0",
+          minSeverity: undefined,
+          includeWithdrawn: undefined,
+          includeTransitive: undefined,
+          advisoryScope: undefined,
+          includeTransitiveAdvisoryDetails: true,
+        },
+      ],
+      [
+        {
+          registry: "NPM",
+          packageName: "@types/node",
+          version: "22.0.0",
+          minSeverity: undefined,
+          includeWithdrawn: undefined,
+          includeTransitive: undefined,
+          advisoryScope: undefined,
+          includeTransitiveAdvisoryDetails: true,
+        },
+      ],
+    ]);
+    expect(cli).toEqual(json);
+  });
+
+  it.each([undefined, false] as const)(
+    "PARITY-DIRECT-DEFAULT: transitive=%s keeps direct-only JSON and service params aligned",
+    async (transitive) => {
+      const cliFn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+      const cli = await cliJson(
+        "npm:express",
+        transitive === undefined ? {} : { transitive },
+        cliDeps({
+          packageIntelligenceService: createMockPackageIntelligenceService({
+            packageVulnerabilities: cliFn as never,
+          }),
+        }),
+      );
+      const mcpFn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+      const { json, isError } = await mcpJson(
+        {
+          target: "npm:express",
+          ...(transitive === undefined
+            ? {}
+            : { include_transitive: transitive }),
+        },
+        mcpFn as never,
+      );
+      expect(isError).toBeUndefined();
+      expect(cli).toEqual(json);
+      expect(
+        (
+          cliFn.mock.calls as unknown as Array<[Record<string, unknown>]>
+        )[0]?.[0].includeTransitive,
+      ).toBe(transitive);
+      expect(
+        (
+          mcpFn.mock.calls as unknown as Array<[Record<string, unknown>]>
+        )[0]?.[0].includeTransitive,
+      ).toBe(transitive);
+      expect((cli as { transitive?: unknown }).transitive).toBeUndefined();
+    },
+  );
+
+  it("PARITY-TRANSITIVE: CLI and MCP deep-equal complete audits with shared scope semantics", async () => {
+    const report = transitiveVulnerabilityReport();
+    if (report.transitive) report.transitive.advisoryScope = "ALL";
+    const cliFn = mock(() => Promise.resolve(report));
+    const cli = await cliJson(
+      "npm:express",
+      {
+        severity: "HIGH",
+        scope: "all",
+        includeWithdrawn: true,
+        transitive: true,
+      },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: cliFn as never,
+        }),
+      }),
+    );
+    const mcpFn = mock(() => Promise.resolve(report));
+    const { json, isError } = await mcpJson(
+      {
+        target: "npm:express",
+        min_severity: "HIGH",
+        advisory_scope: "all",
+        include_withdrawn: true,
+        include_transitive: true,
+      },
+      mcpFn as never,
+    );
+    expect(isError).toBeUndefined();
+    expect(cli).toEqual(json);
+    expect((cli as { transitive?: unknown }).transitive).toBeDefined();
+    expect((cli as { filter?: unknown }).filter).toEqual({
+      minSeverity: "high",
+      advisoryScope: "all",
+      includeWithdrawn: true,
+    });
+    expect(
+      (cliFn.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0]
+        .includeTransitive,
+    ).toBe(true);
+    expect(
+      (mcpFn.mock.calls as unknown as Array<[Record<string, unknown>]>)[0]?.[0]
+        .includeTransitive,
+    ).toBe(true);
+  });
+
+  it("PARITY-JSON-KEYS: include_withdrawn filter echo CLI === MCP", async () => {
+    const fn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+    const cli = await cliJson(
+      "npm:express",
+      { includeWithdrawn: true },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      { target: "npm:express", include_withdrawn: true },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+    expect((cli as { filter?: unknown }).filter).toEqual({
+      includeWithdrawn: true,
+    });
+  });
+
+  it("PARITY-JSON-KEYS: combined filter echo CLI === MCP", async () => {
+    const fn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+    const cli = await cliJson(
+      "npm:express",
+      { severity: "HIGH", includeWithdrawn: true },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      {
+        target: "npm:express",
+        min_severity: "HIGH",
+        include_withdrawn: true,
+      },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+    expect((cli as { filter?: unknown }).filter).toEqual({
+      minSeverity: "high",
+      includeWithdrawn: true,
+    });
+  });
+
+  it("PARITY-JSON-KEYS: advisory scope echo CLI === MCP", async () => {
+    const historicalReport: VulnerabilityReport = {
+      package: { name: "express", registry: "NPM", version: "5.2.1" },
+      security: {
+        affectedVulnerabilityCount: 0,
+        nonAffectingVulnerabilityCount: 1,
+        allVulnerabilityCount: 1,
+        currentVersionAffected: false,
+        upgradePaths: [],
+        vulnerabilities: [
+          {
+            osvId: "GHSA-old-old-old",
+            summary: "Old vulnerable range",
+            severityScore: 5,
+            affectedVersionRanges: ["<5.0.0"],
+            affectedVersionRangesCount: 1,
+            affectedVersionRangesTruncated: false,
+            fixedInVersions: ["5.0.0"],
+            affectsInspectedVersion: false,
+            matchedAffectedVersionRanges: [],
+            duplicateIds: [],
+          },
+        ],
+      },
+    };
+    const fn = mock(() => Promise.resolve(historicalReport));
+    const cli = await cliJson(
+      "npm:express",
+      { scope: "non_affecting" },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      {
+        target: "npm:express",
+        advisory_scope: "non_affecting",
+      },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+    expect((cli as { filter?: unknown }).filter).toEqual({
+      advisoryScope: "non_affecting",
+    });
+  });
+
+  it("PARITY-JSON-KEYS: filtered zero response CLI === MCP", async () => {
+    const fn = mock(() => Promise.resolve(zeroVulnsReport()));
+    const cli = await cliJson(
+      "npm:clean",
+      { severity: "high" },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      { target: "npm:clean", min_severity: "high" },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+    expect((cli as { filter?: unknown }).filter).toEqual({
+      minSeverity: "high",
+    });
+  });
+
+  it("PARITY-JSON-KEYS: zero-vulns hot path CLI === MCP", async () => {
+    const zeroFn = mock(() => Promise.resolve(zeroVulnsReport()));
+    const cli = await cliJson(
+      "npm:clean",
+      {},
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: zeroFn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson({ target: "npm:clean" }, zeroFn as never);
+    expect(cli).toEqual(json);
+  });
+
+  it("PARITY-JSON-KEYS: filtered success CLI === MCP", async () => {
+    // Simulate the backend returning a filter-aware count: only the
+    // high and critical advisories (2 total) plus the malware one
+    // (included because a null severity + isMalicious still counts
+    // as malware, not below-threshold) — a filter typically returns
+    // just banded advisories above the threshold.
+    const sourceAdvisories =
+      defaultVulnerabilityReport.security?.vulnerabilities ?? [];
+    const critAdvisory = sourceAdvisories[1];
+    const highAdvisory = sourceAdvisories[2];
+    if (!critAdvisory || !highAdvisory) {
+      throw new Error(
+        "fixture setup: expected at least 3 advisories in default report",
+      );
+    }
+    const filteredReport: VulnerabilityReport = {
+      package: { name: "express", registry: "NPM", version: "4.18.0" },
+      security: {
+        affectedVulnerabilityCount: 2,
+        nonAffectingVulnerabilityCount: 0,
+        allVulnerabilityCount: 2,
+        currentVersionAffected: true,
+        upgradePaths: ["4.18.2"],
+        vulnerabilities: [critAdvisory, highAdvisory],
+      },
+    };
+    const fn = mock(() => Promise.resolve(filteredReport));
+    const cli = await cliJson(
+      "npm:express",
+      { severity: "high" },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      { target: "npm:express", min_severity: "high" },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+  });
+
+  it("PARITY-JSON-KEYS: versioned success (caller and backend match) CLI === MCP", async () => {
+    const fn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+    const cli = await cliJson(
+      "npm:express@4.18.0",
+      {},
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson(
+      { target: "npm:express@4.18.0" },
+      fn as never,
+    );
+    expect(cli).toEqual(json);
+    // Both surfaces should omit requestedVersion.
+    expect(
+      (cli as { requestedVersion?: string }).requestedVersion,
+    ).toBeUndefined();
+  });
+
+  it("PARITY-JSON-KEYS: versioned real diff surfaces requestedVersion on both surfaces", async () => {
+    // Fixture where the backend resolves a "4.17" tag to concrete
+    // "4.17.2"; the requestedVersion echoes the caller's input.
+    const resolvedReport: VulnerabilityReport = {
+      package: { name: "express", registry: "NPM", version: "4.17.2" },
+      security: {
+        affectedVulnerabilityCount: 0,
+        nonAffectingVulnerabilityCount: 0,
+        allVulnerabilityCount: 0,
+        currentVersionAffected: false,
+        upgradePaths: [],
+        vulnerabilities: [],
+      },
+    };
+    const fn = mock(() => Promise.resolve(resolvedReport));
+    const cli = await cliJson(
+      "npm:express@4.17",
+      {},
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json } = await mcpJson({ target: "npm:express@4.17" }, fn as never);
+    expect(cli).toEqual(json);
+    expect((cli as { requestedVersion?: string }).requestedVersion).toBe(
+      "4.17",
+    );
+  });
+
+  it("PARITY-ERROR-ENVELOPE: NOT_FOUND CLI === MCP", async () => {
+    const error = new PackageIntelligenceTargetNotFoundError(
+      "Package 'npm:ghost' not found.",
+    );
+    const fn = mock(() => Promise.reject(error));
+    const cli = await cliJson(
+      "npm:ghost",
+      {},
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json, isError } = await mcpJson(
+      { target: "npm:ghost" },
+      fn as never,
+    );
+    expect(isError).toBe(true);
+    expect(cli).toEqual(json);
+    expect(cli).toEqual({
+      error: "Package 'npm:ghost' not found.",
+      code: "NOT_FOUND",
+      retryable: false,
+    });
+  });
+
+  it("PARITY-ERROR-ENVELOPE: VERSION_NOT_FOUND shares facts with native actions", async () => {
+    const previousArgv = process.argv;
+    process.argv = [
+      "bun",
+      "src/cli.ts",
+      "pkg",
+      "vulns",
+      "npm:express@99.0.0",
+      "--json",
+    ];
+    try {
+      const error = new PackageIntelligenceVersionNotFoundError(
+        "Version 99.0.0 not found",
+        "npm:express",
+        "99.0.0",
+        ["4.18.2", "4.18.1"],
+      );
+      const fn = mock(() => Promise.reject(error));
+      const cli = await cliJson(
+        "npm:express@99.0.0",
+        {},
+        cliDeps({
+          packageIntelligenceService: createMockPackageIntelligenceService({
+            packageVulnerabilities: fn as never,
+          }),
+        }),
+      );
+      const { json } = await mcpJson(
+        { target: "npm:express@99.0.0" },
+        fn as never,
+      );
+      const envelope = json as {
+        details: { action: string; [key: string]: unknown };
+        [key: string]: unknown;
+      };
+      expect(envelope.details.action).toBe(
+        'Retry pkg_vulns with target="npm:express@4.18.2".',
+      );
+      const cliEnvelope = cli as typeof envelope;
+      expect(cliEnvelope.details.action).toBe(
+        "Try: githits pkg vulns npm:express@4.18.2 --json",
+      );
+      const { action: _mcpAction, ...mcpFacts } = envelope.details;
+      const { action: _cliAction, ...cliFacts } = cliEnvelope.details;
+      expect({ ...cliEnvelope, details: cliFacts }).toEqual({
+        ...envelope,
+        details: mcpFacts,
+      });
+      expect(cli).toMatchObject({
+        code: "VERSION_NOT_FOUND",
+        retryable: false,
+        details: {
+          package: "npm:express",
+          requestedVersion: "99.0.0",
+          availablePackageVersions: ["4.18.2", "4.18.1"],
+        },
+      });
+    } finally {
+      process.argv = previousArgv;
+    }
+  });
+
+  it("PARITY-ERROR-ENVELOPE: BACKEND_ERROR (TIMEOUT) CLI === MCP", async () => {
+    const error = new PackageIntelligenceBackendError(
+      "upstream timed out",
+      504,
+      "TIMEOUT",
+    );
+    const fn = mock(() => Promise.reject(error));
+    const cli = await cliJson(
+      "npm:express",
+      {},
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json, isError } = await mcpJson(
+      { target: "npm:express" },
+      fn as never,
+    );
+    expect(isError).toBe(true);
+    expect(cli).toEqual(json);
+    expect(cli).toMatchObject({
+      code: "TIMEOUT",
+      retryable: true,
+      error: "upstream timed out",
+    });
+  });
+
+  it("PARITY-ERROR-ENVELOPE: INVALID_ARGUMENT (unsupported registry) — shape match via toMatchObject", async () => {
+    // CLI: parsePackageSpec accepts vcpkg (it's a known registry),
+    // then buildPackageVulnerabilitiesParams rejects via the tool-
+    // local predicate. MCP: schema is permissive; the same builder
+    // runs in-handler and rejects. Same envelope shape, identical
+    // error text because the message is a literal string in the
+    // builder.
+    const cli = await cliJson("vcpkg:foo");
+    const { json, isError } = await mcpJson({ target: "vcpkg:foo" });
+
+    expect(isError).toBe(true);
+    expect(cli).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+      error: expect.any(String),
+    });
+    expect(json).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+      error: expect.any(String),
+    });
+    expect(Object.keys(cli as object).sort()).toEqual(
+      Object.keys(json as object).sort(),
+    );
+  });
+
+  it("PARITY-ERROR-ENVELOPE: INVALID_ARGUMENT (tag-style version) — shape match via toMatchObject", async () => {
+    const cli = await cliJson("npm:express@v4.18.0");
+    const { json, isError } = await mcpJson({
+      target: "npm:express@v4.18.0",
+    });
+
+    expect(isError).toBe(true);
+    expect(cli).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+      error: expect.any(String),
+    });
+    expect(json).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+      error: expect.any(String),
+    });
+    expect(Object.keys(cli as object).sort()).toEqual(
+      Object.keys(json as object).sort(),
+    );
+  });
+
+  it("PARITY-PERMISSIVE-SCHEMA: uppercase min_severity input is tolerated on both surfaces (envelope parity)", async () => {
+    // Permissive schema + in-handler validation means uppercase
+    // severity input flows through buildPackageVulnerabilitiesParams
+    // on both surfaces. CLI: parses via resolveMinSeverity. MCP:
+    // schema is z.string(), validation delegated to the builder.
+    // Both should succeed and emit the same success envelope; no
+    // raw Zod error surfaces on either side.
+    const fn = mock(() => Promise.resolve(defaultVulnerabilityReport));
+    const cli = await cliJson(
+      "npm:express",
+      { severity: "CRITICAL" },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: fn as never,
+        }),
+      }),
+    );
+    const { json, isError } = await mcpJson(
+      { target: "npm:express", min_severity: "CRITICAL" },
+      fn as never,
+    );
+    expect(isError).toBeUndefined();
+    expect(cli).toEqual(json);
+  });
+
+  it("PARITY-PERMISSIVE-SCHEMA: invalid min_severity label produces INVALID_ARGUMENT envelope on both surfaces", async () => {
+    // "severe" is not a known label. Both surfaces should reject
+    // via the in-handler builder with a structured envelope; neither
+    // should surface a raw Zod error.
+    const cli = await cliJson("npm:express", { severity: "severe" });
+    const { json, isError } = await mcpJson({
+      target: "npm:express",
+      min_severity: "severe",
+    });
+    expect(isError).toBe(true);
+    expect(cli).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+    });
+    expect(json).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+    });
+  });
+});
+
+describe("direct unknown JSON parity", () => {
+  it("keeps unknown counts, status and raw reasons lossless on both surfaces", async () => {
+    const report = structuredClone(defaultVulnerabilityReport);
+    Object.assign(report.security!, {
+      unknownVulnerabilityCount: 3,
+      assessmentStatus: "FUTURE_STATUS",
+    });
+    Object.assign(report.security!.vulnerabilities![0]!, {
+      assessmentStatus: "UNKNOWN",
+      assessmentReasons: ["INVALID_RANGE", "FUTURE_REASON"],
+      affectsInspectedVersion: false,
+    });
+    const service = createMockPackageIntelligenceService({
+      packageVulnerabilities: mock(async () => report),
+    });
+    const cli = await cliJson(
+      "npm:express",
+      { scope: "unknown" },
+      cliDeps({ packageIntelligenceService: service }),
+    );
+    const mcp = await mcpJson(
+      { target: "npm:express", advisory_scope: "unknown" },
+      async () => report,
+    );
+    expect(cli).toEqual(mcp.json);
+    expect(cli).toMatchObject({
+      filter: { advisoryScope: "unknown" },
+      summary: {
+        unknownVulnerabilityCount: 3,
+        assessmentStatus: "FUTURE_STATUS",
+      },
+      advisories: expect.arrayContaining([
+        expect.objectContaining({
+          assessmentStatus: "UNKNOWN",
+          assessmentReasons: ["INVALID_RANGE", "FUTURE_REASON"],
+        }),
+      ]),
+    });
+  });
+  it("accepts transitive unknown scope identically on both surfaces", async () => {
+    const report = structuredClone(defaultVulnerabilityReport);
+    report.transitive = {
+      advisoryScope: "UNKNOWN",
+      totalPackagesAnalyzed: 2,
+      packageCount: 1,
+      occurrenceCount: 1,
+      affectedCount: 0,
+      nonAffectingCount: 0,
+      unknownCount: 1,
+      totalCount: 1,
+      packages: [
+        {
+          registry: "PYPI",
+          name: "unknown-only",
+          occurrenceCount: 1,
+          affectedCount: 0,
+          nonAffectingCount: 0,
+          unknownCount: 1,
+          totalCount: 1,
+          occurrences: [
+            {
+              version: "1.0",
+              affectsResolvedVersion: false,
+              assessmentStatus: "UNKNOWN",
+              assessmentReasons: ["INVALID_RANGE", "FUTURE_REASON"],
+              matchedAffectedVersionRanges: [],
+              fixVersionsAboveResolved: [],
+              advisory: { osvId: "UNKNOWN-1" },
+            },
+          ],
+        },
+      ],
+    };
+    const call = mock(async () => report);
+    const cli = await cliJson(
+      "npm:express",
+      { scope: "unknown", transitive: true },
+      cliDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageVulnerabilities: call,
+        }),
+      }),
+    );
+    const mcp = await mcpJson(
+      {
+        target: "npm:express",
+        advisory_scope: "unknown",
+        include_transitive: true,
+      },
+      call,
+    );
+    expect(cli).toEqual(mcp.json);
+    expect(cli).toMatchObject({
+      transitive: {
+        advisoryScope: "unknown",
+        summary: { unknownCount: 1, totalCount: 1 },
+        packages: [
+          {
+            occurrences: [
+              {
+                assessmentStatus: "UNKNOWN",
+                assessmentReasons: ["INVALID_RANGE", "FUTURE_REASON"],
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(call).toHaveBeenCalledTimes(2);
+    for (const [params] of call.mock.calls as unknown as Array<
+      [Record<string, unknown>]
+    >)
+      expect(params).toMatchObject({
+        advisoryScope: "UNKNOWN",
+        includeTransitive: true,
+      });
+  });
+});

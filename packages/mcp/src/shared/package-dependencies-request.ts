@@ -1,0 +1,192 @@
+/**
+ * Shared request builder for the `package_dependencies` tool. Both
+ * the CLI command and the MCP tool normalise their inputs here so the
+ * two surfaces cannot diverge on validation rules, registry coercion,
+ * or lifecycle parsing.
+ *
+ * Responsibilities:
+ * - Trim + validate `packageName`.
+ * - Normalise registry case and reject truly unknown registries with the
+ *   shared `UnsupportedRegistryError`. All known registries are supported by
+ *   the upstream `packageDependencies` resolver.
+ * - Normalise exact Go versions to their canonical `v`-prefixed form.
+ *   Reject tag-style versions (`v4.18.0`) client-side for other registries;
+ *   Swift is the exception, where `v`-prefixed release tags are accepted.
+ * - Parse the comma-separated lifecycle list into the canonical
+ *   lowercase enum set; reject unknown tokens.
+ * - Enforce `maxDepth` bounds (1–10).
+ */
+
+import type { PackageDependenciesParams } from "@githits/core-internal";
+import {
+  PKGSEER_REGISTRY_LIST,
+  parsePkgseerRegistryArg,
+  toPkgseerRegistry,
+} from "@githits/core-internal";
+import {
+  InvalidPackageSpecError,
+  UnsupportedRegistryError,
+} from "./package-spec.js";
+import { normalisePackageVersion } from "./package-version.js";
+
+export type DependencyLifecycle =
+  | "runtime"
+  | "development"
+  | "build"
+  | "peer"
+  | "optional";
+
+export type DependencyLifecycleInput = DependencyLifecycle | "all";
+
+const LIFECYCLES: readonly DependencyLifecycle[] = [
+  "runtime",
+  "development",
+  "build",
+  "peer",
+  "optional",
+] as const;
+
+const LIFECYCLE_ORDER: Readonly<Record<DependencyLifecycle, number>> = {
+  runtime: 0,
+  development: 1,
+  build: 2,
+  peer: 3,
+  optional: 4,
+};
+
+export { SUPPORTED_DEPS_REGISTRIES_LIST } from "./pkgseer-capabilities.js";
+
+export interface PackageDependenciesRequestInput {
+  /** Lowercase registry surface value (`npm`, `pypi`, …). */
+  registry: string;
+  /** Raw package name — may carry surrounding whitespace. */
+  packageName: string;
+  /** Optional version — backend defaults to latest when omitted. */
+  version?: string;
+  /** Optional flag to include transitive graph. */
+  includeTransitive?: boolean;
+  /** Optional flag to include transitive aggregate/detail fields. */
+  includeTransitiveDetails?: boolean;
+  /** Optional flag to include dependency group metadata. */
+  includeGroups?: boolean;
+  /** Optional flag to include transitive dependency issue analysis. */
+  includeIssues?: boolean;
+  /** Optional traversal depth (1–10). */
+  maxDepth?: number;
+  /**
+   * Optional lifecycle filter: CSV string or pre-split array. Tokens
+   * are trimmed, lowercased, validated, deduplicated, and sorted by
+   * canonical display order before going on the wire. Empty input is
+   * treated as no filter.
+   */
+  lifecycle?: string | string[];
+}
+
+export interface PackageDependenciesRequestBuildResult {
+  params: PackageDependenciesParams;
+  /**
+   * Canonical lifecycle list that went on the wire (sorted,
+   * deduplicated). Surfaces verbatim as the envelope's
+   * `filter.lifecycles` when non-empty. Empty array means "no filter".
+   */
+  canonicalLifecycles: DependencyLifecycleInput[];
+  wireLifecycles: DependencyLifecycle[];
+}
+
+export function buildPackageDependenciesParams(
+  input: PackageDependenciesRequestInput,
+): PackageDependenciesRequestBuildResult {
+  const trimmedName = input.packageName?.trim() ?? "";
+  if (!trimmedName) {
+    throw new InvalidPackageSpecError("Package name is required.");
+  }
+
+  const registryArg = parsePkgseerRegistryArg(input.registry ?? "");
+  if (!registryArg) {
+    throw new UnsupportedRegistryError(
+      `Unsupported registry '${input.registry}'. Supported: ${PKGSEER_REGISTRY_LIST}.`,
+    );
+  }
+
+  const registry = toPkgseerRegistry(registryArg);
+
+  const version = normalisePackageVersion(input.version, registry, {
+    rejectLeadingV: true,
+  });
+
+  const canonicalLifecycles = resolveLifecycles(input.lifecycle);
+  const wireLifecycles = canonicalLifecycles.filter(
+    (entry): entry is DependencyLifecycle =>
+      entry !== "runtime" && entry !== "all",
+  );
+
+  const maxDepth = input.maxDepth;
+  if (maxDepth !== undefined) {
+    if (!Number.isInteger(maxDepth) || maxDepth < 1 || maxDepth > 10) {
+      throw new InvalidPackageSpecError(
+        `Transitive depth must be an integer between 1 and 10. Got ${maxDepth}.`,
+      );
+    }
+  }
+
+  return {
+    canonicalLifecycles,
+    wireLifecycles,
+    params: {
+      registry,
+      packageName: trimmedName,
+      version,
+      includeTransitive:
+        input.includeIssues === true ? true : input.includeTransitive,
+      includeTransitiveDetails: input.includeTransitiveDetails,
+      includeGroups: input.includeGroups,
+      includeDependencyIssues: input.includeIssues,
+      maxDepth,
+      lifecycle: wireLifecycles.length > 0 ? wireLifecycles : undefined,
+    },
+  };
+}
+
+function resolveLifecycles(
+  raw: string | string[] | undefined,
+): DependencyLifecycleInput[] {
+  if (raw === undefined) return [];
+  const tokens = Array.isArray(raw)
+    ? raw.flatMap((entry) => entry.split(","))
+    : raw.split(",");
+  const seen = new Set<DependencyLifecycleInput>();
+  for (const token of tokens) {
+    const trimmed = token.trim();
+    if (trimmed.length === 0) continue;
+    const lower = trimmed.toLowerCase();
+    if (!isLifecycleInput(lower)) {
+      throw new InvalidPackageSpecError(
+        `Unknown lifecycle '${trimmed}'. Expected one of: ${LIFECYCLES.join(", ")}, all.`,
+      );
+    }
+    seen.add(lower);
+  }
+  if (seen.has("all") && seen.size > 1) {
+    throw new InvalidPackageSpecError(
+      "lifecycle=all cannot be combined with other lifecycle values.",
+    );
+  }
+  return Array.from(seen).sort(lifecycleInputSort);
+}
+
+export function isLifecycle(value: string): value is DependencyLifecycle {
+  return (LIFECYCLES as readonly string[]).includes(value);
+}
+
+function isLifecycleInput(value: string): value is DependencyLifecycleInput {
+  return value === "all" || isLifecycle(value);
+}
+
+function lifecycleInputSort(
+  a: DependencyLifecycleInput,
+  b: DependencyLifecycleInput,
+): number {
+  if (a === "all") return b === "all" ? 0 : 1;
+  if (b === "all") return -1;
+  return LIFECYCLE_ORDER[a] - LIFECYCLE_ORDER[b];
+}

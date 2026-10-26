@@ -1,0 +1,413 @@
+import { describe, expect, it, mock } from "bun:test";
+import { z } from "zod";
+import { createMockPackageIntelligenceService } from "../services/test-helpers.js";
+import { PACKAGE_UPGRADE_REVIEW_MAX_PACKAGES } from "../shared/package-upgrade-review-request.js";
+import { createPackageUpgradeReviewTool } from "./package-upgrade-review.js";
+
+function parseText(result: { content: Array<{ text: string }> }): unknown {
+  return JSON.parse(result.content[0]?.text ?? "");
+}
+
+describe("createPackageUpgradeReviewTool", () => {
+  it("distinguishes oversize from unassessed", () => {
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService(),
+    );
+    const changesProperty = z.toJSONSchema(z.object(tool.schema)).properties
+      ?.changes;
+    const changesDescription =
+      typeof changesProperty === "object" && changesProperty !== null
+        ? changesProperty.description
+        : undefined;
+
+    expect(changesDescription).toContain("too-long-to-classify");
+    expect(changesDescription).toContain("oversize");
+    expect(changesDescription).not.toContain("UNCLASSIFIED");
+  });
+
+  it("registers metadata and schema keys", () => {
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService(),
+    );
+
+    expect(tool.name).toBe("pkg_upgrade_review");
+    expect(tool.description).toContain("reports facts only");
+    expect(tool.description).toContain(
+      "Use signals as a starting point to evaluate the impact of changes on the codebase",
+    );
+    expect(tool.description).toContain("pkg_changelog and code_diff");
+    expect(tool.annotations?.readOnlyHint).toBe(true);
+    expect(Object.keys(tool.schema).sort()).toEqual([
+      "changes",
+      "current_version",
+      "format",
+      "include_dependency_issues",
+      "min_severity",
+      "package_name",
+      "packages",
+      "registry",
+      "skip_transitive_security",
+      "target_version",
+      "verbose",
+    ]);
+
+    const inputSchema = z.toJSONSchema(z.object(tool.schema));
+    expect(inputSchema.properties?.packages).toMatchObject({
+      description: expect.stringContaining("at most 30 upgrades"),
+    });
+    expect(inputSchema.properties?.packages).not.toHaveProperty("maxItems");
+    expect(tool.description).toContain("at most 30 upgrades");
+  });
+
+  it.each([
+    [
+      "single text",
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+      },
+      "text",
+      ["MUST_ACT", "SHOULD_KNOW", "UNCLASSIFIED"],
+    ],
+    [
+      "verbose single",
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+        verbose: true,
+        changes: "  AcTiOnAbLe  ",
+      },
+      "text",
+      ["MUST_ACT"],
+    ],
+    [
+      "batch triage",
+      {
+        packages: [
+          {
+            registry: "npm",
+            package_name: "express",
+            current_version: "4.18.0",
+            target_version: "5.0.0",
+          },
+          {
+            registry: "npm",
+            package_name: "lodash",
+            current_version: "4.0.0",
+            target_version: "5.0.0",
+          },
+        ],
+        changes: "important",
+      },
+      "triage",
+      ["MUST_ACT", "SHOULD_KNOW"],
+    ],
+    [
+      "verbose batch",
+      {
+        packages: [
+          {
+            registry: "npm",
+            package_name: "express",
+            current_version: "4.18.0",
+            target_version: "5.0.0",
+          },
+          {
+            registry: "npm",
+            package_name: "lodash",
+            current_version: "4.0.0",
+            target_version: "5.0.0",
+          },
+        ],
+        verbose: true,
+        changes: "all",
+      },
+      "text",
+      undefined,
+    ],
+    [
+      "batch JSON",
+      {
+        packages: [
+          {
+            registry: "npm",
+            package_name: "express",
+            current_version: "4.18.0",
+            target_version: "5.0.0",
+          },
+          {
+            registry: "npm",
+            package_name: "lodash",
+            current_version: "4.0.0",
+            target_version: "5.0.0",
+          },
+        ],
+        changes: "   ",
+        format: "json",
+      },
+      "json",
+      ["MUST_ACT", "SHOULD_KNOW", "UNCLASSIFIED"],
+    ],
+    [
+      "single JSON",
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+        changes: "all",
+        format: "json",
+      },
+      "json",
+      undefined,
+    ],
+  ] as const)(
+    "selects MCP upgrade changelog host projection: %s",
+    async (_case, args, changelogView, statementTiers) => {
+      const packageUpgradeReview = mock((params) =>
+        Promise.resolve({
+          summary: {
+            total: params.packages.length,
+            withUnknowns: 0,
+            withAddedAdvisories: 0,
+            withBreakingSignals: 0,
+            withDirectDependencyChanges: 0,
+            withTransitiveVulnerabilityAdditions: 0,
+          },
+          reviews: [],
+        }),
+      );
+      const tool = createPackageUpgradeReviewTool(
+        createMockPackageIntelligenceService({
+          packageUpgradeReview: packageUpgradeReview as never,
+        }),
+      );
+
+      expect(z.object(tool.schema).safeParse({ changes: " " }).success).toBe(
+        true,
+      );
+      const changesSchema = JSON.stringify(
+        z.toJSONSchema(z.object(tool.schema)).properties?.changes,
+      );
+      expect(changesSchema).toContain("focused");
+      expect(changesSchema).toMatch(/whole-range/i);
+
+      const mutableArgs =
+        "packages" in args
+          ? {
+              ...args,
+              packages: args.packages.map((pkg) => ({ ...pkg })),
+            }
+          : args;
+      const result = await tool.handler(mutableArgs, {});
+
+      expect(result.isError).toBeUndefined();
+      expect(packageUpgradeReview).toHaveBeenCalledWith(
+        expect.objectContaining({ changelogView, statementTiers }),
+      );
+    },
+  );
+
+  it("calls the aggregate service method with normalized single-package params", async () => {
+    const packageUpgradeReview = mock((params) =>
+      Promise.resolve({
+        summary: {
+          total: params.packages.length,
+          withUnknowns: 0,
+          withAddedAdvisories: 0,
+          withBreakingSignals: 0,
+          withDirectDependencyChanges: 0,
+          withTransitiveVulnerabilityAdditions: 0,
+        },
+        reviews: [],
+      }),
+    );
+    const service = createMockPackageIntelligenceService({
+      packageUpgradeReview: packageUpgradeReview as never,
+    });
+    const tool = createPackageUpgradeReviewTool(service);
+
+    await tool.handler(
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+        min_severity: "high",
+        include_dependency_issues: true,
+        format: "json",
+      },
+      {},
+    );
+
+    expect(packageUpgradeReview).toHaveBeenCalledTimes(1);
+    expect(packageUpgradeReview.mock.calls[0]?.[0]).toMatchObject({
+      packages: [
+        {
+          registry: "NPM",
+          name: "express",
+          currentVersion: "4.18.0",
+          targetVersion: "5.0.0",
+        },
+      ],
+      minSeverity: 7,
+      includeTransitiveSecurity: true,
+      includeDependencyIssues: true,
+      changelogLimit: 20,
+    });
+  });
+
+  it("ignores empty optional mode fields emitted by tool-call harnesses", async () => {
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService(),
+    );
+
+    const single = await tool.handler(
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+        packages: [
+          {
+            registry: " ",
+            package_name: "",
+            current_version: "\t",
+            target_version: "",
+          },
+        ],
+        format: "json",
+      },
+      {},
+    );
+
+    const batch = await tool.handler(
+      {
+        registry: "",
+        package_name: " ",
+        current_version: "",
+        target_version: "\t",
+        packages: [
+          {
+            registry: " ",
+            package_name: "",
+            current_version: "\t",
+            target_version: "",
+          },
+          {
+            registry: "npm",
+            package_name: "express",
+            current_version: "4.18.0",
+            target_version: "5.0.0",
+          },
+        ],
+        format: "json",
+      },
+      {},
+    );
+
+    expect(single.isError).toBeUndefined();
+    expect(batch.isError).toBeUndefined();
+    expect(
+      (parseText(single) as { summary?: { total?: number } }).summary?.total,
+    ).toBe(1);
+    expect(
+      (parseText(batch) as { summary?: { total?: number } }).summary?.total,
+    ).toBe(1);
+  });
+
+  it("returns text by default and JSON when requested", async () => {
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService(),
+    );
+
+    const text = await tool.handler(
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+      },
+      {},
+    );
+    expect(text.isError).toBeUndefined();
+    expect(text.content[0]?.text).toStartWith("Upgrade review - 1 package");
+    expect(text.content[0]?.text).toContain("Security");
+    expect(text.content[0]?.text).toContain("Changes");
+    expect(text.content[0]?.text).not.toContain("pkg_upgrade_review");
+    expect(text.content[0]?.text).not.toContain("\x1b[");
+    expect(() => JSON.parse(text.content[0]?.text ?? "")).toThrow();
+
+    const json = await tool.handler(
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        target_version: "5.0.0",
+        format: "json",
+      },
+      {},
+    );
+    expect(
+      (parseText(json) as { summary?: { total?: number } }).summary?.total,
+    ).toBe(1);
+  });
+
+  it("returns INVALID_ARGUMENT for incomplete args", async () => {
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService(),
+    );
+
+    const result = await tool.handler(
+      {
+        registry: "npm",
+        package_name: "express",
+        current_version: "4.18.0",
+        format: "json",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(parseText(result)).toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
+  it("rejects over-cap batches before calling the service", async () => {
+    const packageUpgradeReview = mock(() =>
+      Promise.reject(new Error("service must not be called")),
+    );
+    const tool = createPackageUpgradeReviewTool(
+      createMockPackageIntelligenceService({
+        packageUpgradeReview: packageUpgradeReview as never,
+      }),
+    );
+
+    const result = await tool.handler(
+      {
+        packages: Array.from(
+          { length: PACKAGE_UPGRADE_REVIEW_MAX_PACKAGES + 1 },
+          (_, index) => ({
+            registry: "npm",
+            package_name: `package-${index}`,
+            current_version: "1.0.0",
+            target_version: "1.0.1",
+          }),
+        ),
+        format: "json",
+      },
+      {},
+    );
+
+    expect(packageUpgradeReview).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(parseText(result)).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+      error: "packages[] must contain at most 30 upgrades.",
+    });
+  });
+});

@@ -1,0 +1,91 @@
+# Backlog
+
+## Investigate production Research timeouts
+
+Observed during 0.24.0 release validation on 2026-09-30. The live local MCP
+smoke completed its initial Research JSON request and URL follow-up, then
+failed the text follow-up. A separate local MCP request for
+`npm:express`, "Where is router dispatch implemented?", returned
+`TIMEOUT` with "Research timed out." The service maps that exact message from
+HTTP 504; the client request timeout has a different message.
+
+The hosted Research API owns the failed operation. Investigate its execution
+and HTTP timeout boundaries, then verify the initial request and both thread
+follow-ups through local MCP. The root cause is unverified; no client retry or
+timeout workaround is proposed. This requires backend investigation outside
+this CLI worktree. Earlier release validation also stalled in experimental
+Research, so the evidence does not establish a new 0.24.0 regression. Stable
+agent evals exclude this experimental tool.
+
+On 2026-10-05, authenticated dev MCP stable smoke passed; the experimental
+Research initial JSON succeeded in 107.1s, then its URL-source thread follow-up
+failed the expected-success assertion after 200.4s. The assertion did not expose
+the underlying error code, so this is additional Research investigation evidence,
+not a confirmed diagnosis or regression in indexing metadata. No client timeout
+or retry workaround was added.
+
+## Investigate unified read preparation metadata at deadline and readiness
+
+Authenticated dev CLI/MCP checks on 2026-10-05 verified the normal pending
+read/list estimate and native retry messages. Two edge transitions remain:
+
+- A read of `github:sqlalchemy/sqlalchemy@rel_2_0_0` with `wait_timeout_ms: 1`
+  returned `TIMEOUT`, retryable, and no indexing metadata. Its backend message
+  was "Repository preparation exceeded waitTimeoutMs before an indexing target
+  was available." The CLI cannot infer that indexing has started or invent an
+  estimate. Backend target preparation owns the deadline classification and
+  available metadata; inspect that path before changing the client contract.
+- Bounded readable results for rel_2_0_0 and rel_2_0_1 briefly had provisional
+  target resolution and empty `indexingEstimates`; a later rel_2_0_0 read was
+  current. Verify whether work was still active when these states were captured
+  or whether resolution and timing observed different readiness stages. Do not
+  infer an estimate or remaining ETA from provisional resolution alone.
+
+The existing provisional provenance footer still uses internal field labels.
+Resolve the state semantics before redesigning that footer around preparation
+status. This requires backend investigation outside this CLI lane; no backend
+edits, extra polling or inferred timing were introduced.
+
+## Accepted resolve-target launch limits
+
+The user accepted the 2026-10-06 production audit for GA and prefers adjustment
+when issues appear. These are retained findings, not additional release gates;
+see [target resolution](implementation/resolve-target.md) for audit scope.
+
+- Backend identity/admission: docs.rs and Cloudflare standalone sites may be
+  absent, Swift kind preference stays soft, and Emacs binding candidates do not
+  establish GNU Emacs core identity on unsupported Savannah. Future fixes should
+  reproduce the affected input, preserve unrelated package matches, and return
+  the requested supported identity or honest uncertainty without unrelated-site
+  substitution. Provider/vendor coverage expansion requires a product decision.
+- Pydantic site refresh: usable stale docs and emitted read actions succeeded,
+  while one status follow-up remained INDEXING at about 80.7 seconds. Completion
+  was not verified; this is not proof of a stuck refresh. Investigate backend
+  refresh state if reported again, and verify completion/current freshness with
+  readable results. No client timer workaround or repeated polling is proposed.
+
+Docker MEDIUM SDK resolution without a kind preference is explicitly accepted;
+repository-preferred Docker Engine remains HIGH Moby. No new ranking change or
+coverage requirement is inferred from GA promotion.
+
+## Investigate intermittent production Launchpad shortcut timeouts
+
+During 0.33.0 release validation on 2026-10-20, the production CLI skill eval
+reported repository-provider timeouts while resolving `lp:software-properties`
+at `02bfa5ae3026843835e540bc507a517863e39c64` and
+`lp:ubuntu/+source/hello` at `c80e07d07e4ea27e0847ed731da7138b9e1df5d0`.
+Three list calls and two search calls failed. Other searches acquired canonical
+owners, and five canonical source reads succeeded; the eval completed with a
+cited answer. This is tool-use evidence, not an independently graded quality
+result.
+
+A subsequent bounded comparison through the built Node CLI passed both short
+and canonical list targets: short inputs completed in 1.5 seconds each and
+canonical inputs in 1.2 seconds each. The failure is intermittent; this check
+does not establish its root cause or recovery mechanism. The backend's provider
+resolution path owns shortcut acquisition. Inspect its provider calls and
+request deadlines using the failed eval time window (09:02:57-09:03:43 UTC)
+before changing client behavior. No CLI retry layer or caller constraint was
+introduced. Backend investigation is outside this release-preparation worktree.
+Local evidence is retained under `.agent-eval/release-0.33.0-launchpad-skills`
+and `/tmp/murex-release-launchpad-pairs.json`.

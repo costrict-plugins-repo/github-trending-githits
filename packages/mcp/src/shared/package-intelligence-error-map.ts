@@ -1,0 +1,199 @@
+/**
+ * Classify errors raised from {@link PackageIntelligenceService} into
+ * the shared `MappedError` envelope. Every `PackageIntelligence*Error`
+ * subclass maps to a specific `MappedErrorCode`; shared cases
+ * (`AuthenticationError`, name-prefixed `Invalid*` / `Unsupported*`)
+ * reuse the same mapping rules as
+ * {@link mapCodeNavigationError}.
+ */
+
+import {
+  AuthenticationError,
+  ClientUpdateRequiredError,
+  MalformedPackageIntelligenceResponseError,
+  PackageIntelligenceAccessError,
+  PackageIntelligenceBackendError,
+  PackageIntelligenceDocumentationSectionUnresolvedError,
+  PackageIntelligenceFeatureFlagRequiredError,
+  PackageIntelligenceGraphQLError,
+  PackageIntelligenceNetworkError,
+  PackageIntelligenceTargetNotFoundError,
+  PackageIntelligenceValidationError,
+  PackageIntelligenceVersionNotFoundError,
+} from "@githits/core-internal/browser";
+import { buildUpdateRequiredError } from "./code-navigation-error-map.js";
+import type {
+  MappedError,
+  MappedErrorCode,
+  MappedErrorDetails,
+} from "./mapped-error.js";
+import { AuthRequiredError } from "./require-auth.js";
+import { mapSessionIdError } from "./session-id-error-map.js";
+import { mapTermsAcceptanceError } from "./terms-acceptance-error-map.js";
+import { mapVersionRefRecovery } from "./version-ref-recovery.js";
+
+// Re-export for caller convenience — callers of
+// `mapPackageIntelligenceError` use the same envelope type as code-nav
+// callers, so they import it alongside the classifier.
+export type { MappedError, MappedErrorCode, MappedErrorDetails };
+
+/**
+ * Map a thrown error from `PackageIntelligenceServiceImpl` into the
+ * shared `MappedError` envelope. Unrecognised errors fall to
+ * `UNKNOWN`; a table test guards that no named class ever falls
+ * through.
+ */
+export function mapPackageIntelligenceError(error: unknown): MappedError {
+  return classify(error);
+}
+
+function classify(error: unknown): MappedError {
+  if (
+    (error instanceof PackageIntelligenceVersionNotFoundError ||
+      error instanceof PackageIntelligenceBackendError) &&
+    error.recovery
+  )
+    return mapVersionRefRecovery(error.message, error.recovery);
+  const sessionError = mapSessionIdError(error);
+  if (sessionError) return sessionError;
+  const termsError = mapTermsAcceptanceError(error);
+  if (termsError) return termsError;
+  if (error instanceof ClientUpdateRequiredError) {
+    return buildUpdateRequiredError(error.reason, error.currentVersion);
+  }
+  if (error instanceof PackageIntelligenceTargetNotFoundError) {
+    return {
+      code: "NOT_FOUND",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (error instanceof PackageIntelligenceDocumentationSectionUnresolvedError) {
+    return {
+      code: "DOCUMENTATION_SECTION_UNRESOLVED",
+      message: error.message,
+      retryable: false,
+      details: error.reason ? { reason: error.reason } : undefined,
+    };
+  }
+  if (error instanceof PackageIntelligenceVersionNotFoundError) {
+    const details: MappedErrorDetails = {};
+    if (error.packageName) details.package = error.packageName;
+    if (error.requestedVersion) {
+      details.requestedVersion = error.requestedVersion;
+    }
+    if (error.availableVersions && error.availableVersions.length > 0) {
+      // Retain registry releases separately from indexed repository snapshots.
+      details.availablePackageVersions = error.availableVersions;
+    }
+    return {
+      code: "VERSION_NOT_FOUND",
+      message: error.message,
+      retryable: false,
+      details: Object.keys(details).length > 0 ? details : undefined,
+    };
+  }
+  if (error instanceof PackageIntelligenceValidationError) {
+    return {
+      code: "INVALID_ARGUMENT",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (
+    error instanceof PackageIntelligenceAccessError ||
+    error instanceof PackageIntelligenceFeatureFlagRequiredError
+  ) {
+    return {
+      code: "ACCESS_DENIED",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (
+    error instanceof AuthenticationError ||
+    error instanceof AuthRequiredError
+  ) {
+    return {
+      code: "AUTH_REQUIRED",
+      message: error.message,
+      retryable: false,
+      details: {
+        authSource:
+          error instanceof AuthenticationError ? error.source : "local",
+      },
+    };
+  }
+  if (error instanceof PackageIntelligenceNetworkError) {
+    return { code: "NETWORK", message: error.message, retryable: true };
+  }
+  if (error instanceof PackageIntelligenceBackendError) {
+    return classifyBackendError(error);
+  }
+  if (error instanceof PackageIntelligenceGraphQLError) {
+    return {
+      code: "BACKEND_ERROR",
+      message: error.message,
+      retryable: false,
+      details: error.code ? { graphqlCode: error.code } : undefined,
+    };
+  }
+  if (error instanceof MalformedPackageIntelligenceResponseError) {
+    return {
+      code: "PROTOCOL_ERROR",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (isInvalidArgumentError(error)) {
+    return {
+      code: "INVALID_ARGUMENT",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (error instanceof Error) {
+    return { code: "UNKNOWN", message: error.message, retryable: false };
+  }
+  return { code: "UNKNOWN", message: "Unknown error", retryable: false };
+}
+
+function classifyBackendError(
+  error: PackageIntelligenceBackendError,
+): MappedError {
+  const details: MappedErrorDetails = {};
+  if (typeof error.status === "number") details.status = error.status;
+  if (error.graphqlCode) details.graphqlCode = error.graphqlCode;
+
+  const build = (code: MappedErrorCode, defaultRetryable: boolean) => ({
+    code,
+    message: error.message,
+    retryable: error.retryable ?? defaultRetryable,
+    details: Object.keys(details).length > 0 ? details : undefined,
+  });
+
+  switch (error.graphqlCode) {
+    case "TIMEOUT":
+      return build("TIMEOUT", true);
+    case "RATE_LIMITED":
+      return build("RATE_LIMITED", true);
+    case "UPSTREAM_ERROR":
+      return build("BACKEND_ERROR", true);
+    default:
+      // INTERNAL_ERROR / UNKNOWN_ERROR / any other / undefined all
+      // route to a non-retryable backend error.
+      return build("BACKEND_ERROR", false);
+  }
+}
+
+/**
+ * Name-prefix rule shared with `mapCodeNavigationError` — callers that
+ * raise `InvalidPackageSpecError` / `UnsupportedRegistryError` land on
+ * `INVALID_ARGUMENT` without this module importing them directly.
+ */
+function isInvalidArgumentError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name.startsWith("Invalid") || error.name.startsWith("Unsupported")
+  );
+}

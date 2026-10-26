@@ -1,0 +1,55 @@
+# Review Guidelines
+
+Checklist for reviewing code changes in githits-cli.
+
+## Architecture
+
+- [ ] Architecture is sound and meets guidelines (see `ARCHITECTURAL_GUIDELINES.md`)
+- [ ] Implementation is easy to understand
+- [ ] Code is in correct modules, no unnecessary duplication
+- [ ] Services are properly abstracted for testing
+- [ ] GraphQL/API-backed changes fetch only fields used by each output mode, with conditional fields or separate queries where needed
+
+## Code Quality
+
+- [ ] TypeScript types are defined for all parameters and returns
+- [ ] Types are as narrow as possible (avoid `any`, prefer specific unions)
+- [ ] Functions follow single responsibility principle
+- [ ] Error handling is consistent and uses shared utilities
+
+## Testing
+
+- [ ] Good test coverage for new functionality
+- [ ] All tests pass (`bun test`)
+- [ ] Tests mock services at interface level
+- [ ] Error paths are tested
+- [ ] GraphQL/API selection changes have tests for compact vs verbose/JSON wire variables, selected fields, and omitted fields
+
+## Documentation
+
+- [ ] JSDoc comments for public functions
+- [ ] Comments explain "why" not just "what"
+- [ ] Implementation docs updated if needed
+- [ ] `AGENTS.md` updated if agent-facing patterns change
+- [ ] Notable changes add an independent valid `changes/` fragment with every public artifact's pending bump
+- [ ] Feature pull requests do not edit `CHANGELOG.md`
+- [ ] Historical changelog sections are unchanged unless a minimal edit corrects a blatant factual error
+
+## Release PRs
+
+- [ ] A request to audit, prepare, create, cut, or release a version does not authorize merging or enabling auto-merge
+- [ ] The release PR is merged only with separate, explicit human approval given after the release PR exists and identifying that PR
+- [ ] Earlier release requests are not treated as merge approval, and the agent stops after opening the PR to report its URL and check status
+
+## Build & Lint
+
+- [ ] `bun run build` succeeds
+- [ ] No TypeScript errors
+- [ ] Code is formatted consistently
+- [ ] No unused imports or variables
+
+## Commit Quality
+
+- [ ] Commit message is descriptive with context
+- [ ] Changes are logically grouped
+- [ ] No unrelated changes mixed in

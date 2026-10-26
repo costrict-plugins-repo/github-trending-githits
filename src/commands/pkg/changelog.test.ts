@@ -1,0 +1,458 @@
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import {
+  PackageIntelligenceTargetNotFoundError,
+  PackageIntelligenceVersionNotFoundError,
+} from "@githits/core-internal";
+import { Command } from "commander";
+import {
+  createMockPackageIntelligenceService,
+  defaultChangelogReport,
+} from "../../services/test-helpers.js";
+import {
+  type PkgChangelogCommandDependencies,
+  pkgChangelogAction,
+  registerPkgChangelogCommand,
+} from "./changelog.js";
+
+describe("pkg changelog help", () => {
+  it("describes latest mode without promising order and marks --from exclusive", () => {
+    const command = registerPkgChangelogCommand(new Command().command("pkg"));
+    const help = command.helpInformation().replace(/\s+/g, " ");
+
+    expect(help).toContain("all parsed release-note statements");
+    expect(help).toContain("--changes <view>");
+    expect(help).toContain("important (actionable + should know)");
+    expect(help).toContain("ignored with --verbatim and --no-body");
+    expect(help).toContain("Package-only");
+    expect(help).toContain("Exclusive start of version range");
+    expect(help).toContain("Inclusive end of range / latest-mode cap");
+    expect(help).toContain("from excluded, to included");
+    expect(help).not.toContain("closed interval");
+    expect(help).toContain("Latest-mode or upper-cap entry count");
+    expect(help).toContain("npm:express@5.2.1");
+    expect(help).not.toContain("--repo-url");
+    expect(help).not.toContain("--git-ref");
+    expect(help).not.toContain("ten most recent entries");
+  });
+});
+
+describe("pkgChangelogAction", () => {
+  const mcpUrl = "https://mcp.githits.com";
+
+  function createDeps(
+    overrides: Partial<PkgChangelogCommandDependencies> = {},
+  ): PkgChangelogCommandDependencies {
+    return {
+      packageIntelligenceService: createMockPackageIntelligenceService(),
+      codeNavigationUrl: "https://pkgseer.dev",
+      hasValidToken: true,
+      mcpUrl,
+      ...overrides,
+    };
+  }
+
+  it("renders the default summary + one-liner entries via stdout.write", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgChangelogAction("npm:express", {}, createDeps());
+
+    const combined = writes.join("");
+    expect(combined).toContain("npm:express");
+    expect(combined).toContain("Changes (classified by agent)");
+    expect(combined).toContain("2 releases");
+    expect(combined).toContain("5.2.1");
+    // The default retains statement wording without raw note duplication.
+    expect(combined).not.toContain("## Patch");
+    expect(combined).toContain("* fixed a thing");
+    expect(combined).not.toContain("[no impact identified]");
+    expect(combined).not.toContain("use --verbose");
+    writeSpy.mockRestore();
+  });
+
+  it("expands bodies fully under --verbose (no truncation footer)", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    // Use a body that exceeds the default cap — under --verbose it
+    // should render in full with no truncation footer.
+    const longBody = Array.from({ length: 25 }, (_, i) => `line ${i + 1}`).join(
+      "\n",
+    );
+    const longReport = {
+      package: { name: "big-pkg", registry: "npm", limit: 10 },
+      source: "releases",
+      entries: [
+        {
+          version: "1.0.0",
+          normalizedVersion: "1.0.0",
+          publishedAt: "2026-01-01T00:00:00Z",
+          htmlUrl: "https://example.com",
+          body: longBody,
+        },
+      ],
+    };
+    await pkgChangelogAction(
+      "npm:big-pkg",
+      { verbose: true },
+      createDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageChangelog: mock(() => Promise.resolve(longReport)),
+        }),
+      }),
+    );
+
+    const combined = writes.join("");
+    expect(combined).toContain("line 1");
+    expect(combined).toContain("line 25");
+    expect(combined).not.toContain("use --verbose");
+    expect(combined).not.toContain("more line");
+    writeSpy.mockRestore();
+  });
+
+  it("emits the JSON envelope when --json is set", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await pkgChangelogAction("npm:express", { json: true }, createDeps());
+
+    const output = logSpy.mock.calls[0]?.[0] as string;
+    const payload = JSON.parse(output);
+    expect(payload.registry).toBe("npm");
+    expect(payload.name).toBe("express");
+    expect(payload.source).toBe("releases");
+    expect(payload.mode).toBe("latest");
+    expect(payload.entries.count).toBe(2);
+    expect(payload.entries.items[0].body).toBeUndefined();
+    expect(payload.statements.items[0].fullText).toBe("- fixed a thing");
+    logSpy.mockRestore();
+  });
+
+  it("emits JSON version entries without source when no changelog source is available", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    await pkgChangelogAction(
+      "npm:express",
+      { json: true },
+      createDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageChangelog: mock(() =>
+            Promise.resolve({
+              ...defaultChangelogReport,
+              source: undefined,
+              entries: [defaultChangelogReport.entries[0]!],
+            }),
+          ),
+        }),
+      }),
+    );
+
+    const output = logSpy.mock.calls[0]?.[0] as string;
+    const payload = JSON.parse(output);
+    expect(payload.source).toBeUndefined();
+    expect(payload.entries.count).toBe(1);
+    expect(payload.entries.items[0].version).toBe("5.2.1");
+    logSpy.mockRestore();
+  });
+
+  it("drops body fields in JSON when --no-body is set", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+
+    // Commander's --no-body => body: false in the action options.
+    await pkgChangelogAction(
+      "npm:express",
+      { json: true, body: false },
+      createDeps(),
+    );
+
+    const output = logSpy.mock.calls[0]?.[0] as string;
+    const payload = JSON.parse(output);
+    for (const item of payload.entries.items) {
+      expect(item.body).toBeUndefined();
+    }
+    // Other fields preserved
+    expect(payload.entries.items[0].version).toBe("5.2.1");
+    expect(payload.entries.items[0].publishedAt).toBe("2026-01-15T12:00:00Z");
+    logSpy.mockRestore();
+  });
+
+  it("sends spec addressing on the wire (uppercase registry, packageName)", async () => {
+    const packageChangelog = mock(() =>
+      Promise.resolve(defaultChangelogReport),
+    );
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgChangelogAction(
+      "npm:express",
+      {},
+      createDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageChangelog,
+        }),
+      }),
+    );
+
+    const calls = packageChangelog.mock.calls as unknown as Array<
+      [{ registry?: string; packageName?: string; version?: string }]
+    >;
+    expect(calls[0]?.[0]?.registry).toBe("NPM");
+    expect(calls[0]?.[0]?.packageName).toBe("express");
+    expect(calls[0]?.[0]?.version).toBeUndefined();
+    writeSpy.mockRestore();
+  });
+
+  it("sends an exact pin as version", async () => {
+    const packageChangelog = mock(() =>
+      Promise.resolve({
+        ...defaultChangelogReport,
+        entries: [
+          { ...defaultChangelogReport.entries[0]!, hasChangelog: true },
+        ],
+      }),
+    );
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(
+      (() => true) as typeof process.stdout.write,
+    );
+
+    await pkgChangelogAction(
+      "npm:express@5.2.1",
+      {},
+      createDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageChangelog,
+        }),
+      }),
+    );
+
+    const calls = packageChangelog.mock.calls as unknown as Array<
+      [{ version?: string; fromVersion?: string }]
+    >;
+    expect(calls[0]?.[0]?.version).toBe("5.2.1");
+    expect(calls[0]?.[0]?.fromVersion).toBeUndefined();
+    writeSpy.mockRestore();
+  });
+
+  it("rejects a repository target before service access", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+    const packageChangelog = mock(() =>
+      Promise.resolve(defaultChangelogReport),
+    );
+
+    try {
+      await pkgChangelogAction(
+        "github:expressjs/express",
+        {},
+        createDeps({
+          packageIntelligenceService: createMockPackageIntelligenceService({
+            packageChangelog,
+          }),
+        }),
+      );
+    } catch {
+      /* expected */
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("package-only");
+    expect(packageChangelog).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects --from + --limit together", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction(
+        "npm:express",
+        { from: "4.0.0", limit: "10" },
+        createDeps(),
+      );
+    } catch {
+      /* expected */
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("latest-mode");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects non-numeric --limit input", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction("npm:express", { limit: "abc" }, createDeps());
+    } catch {
+      /* expected */
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("integer");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects --no-body + --verbose with an actionable hint", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction(
+        "npm:express",
+        { body: false, verbose: true },
+        createDeps(),
+      );
+    } catch {
+      /* expected */
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("--no-body");
+    expect(msg).toContain("--verbose");
+    expect(msg).toContain("cannot be combined");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("rejects tag-style --from versions", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction("npm:express", { from: "v4.0.0" }, createDeps());
+    } catch {
+      /* expected */
+    }
+
+    const msg = errorSpy.mock.calls[0]?.[0] as string;
+    expect(msg).toContain("git tag");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("renders empty timeline selections as success", async () => {
+    const writes: string[] = [];
+    const writeSpy = spyOn(process.stdout, "write").mockImplementation(((
+      chunk: string | Uint8Array,
+    ) => {
+      writes.push(
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      );
+      return true;
+    }) as typeof process.stdout.write);
+
+    await pkgChangelogAction(
+      "npm:express@9.0.0..9.1.0",
+      {},
+      createDeps({
+        packageIntelligenceService: createMockPackageIntelligenceService({
+          packageChangelog: mock(() =>
+            Promise.resolve({
+              ...defaultChangelogReport,
+              source: undefined,
+              entries: [],
+            }),
+          ),
+        }),
+      }),
+    );
+
+    const combined = writes.join("");
+    expect(combined).toContain("No releases in this selection.");
+    writeSpy.mockRestore();
+  });
+
+  it("preserves VERSION_NOT_FOUND prose without recovery suggestions", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction(
+        "npm:express",
+        { from: "99.0.0" },
+        createDeps({
+          packageIntelligenceService: createMockPackageIntelligenceService({
+            packageChangelog: mock(() =>
+              Promise.reject(
+                new PackageIntelligenceVersionNotFoundError(
+                  "No matching version found",
+                  "npm:express",
+                  "99.0.0",
+                  undefined,
+                ),
+              ),
+            ),
+          }),
+        }),
+      );
+    } catch {
+      /* expected */
+    }
+
+    const output = errorSpy.mock.calls[0]?.[0] as string;
+    expect(output).toContain("No matching version found");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+
+  it("routes generic PackageIntelligenceTargetNotFoundError as NOT_FOUND", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+
+    try {
+      await pkgChangelogAction(
+        "npm:does-not-exist",
+        { json: true },
+        createDeps({
+          packageIntelligenceService: createMockPackageIntelligenceService({
+            packageChangelog: mock(() =>
+              Promise.reject(
+                new PackageIntelligenceTargetNotFoundError("Package not found"),
+              ),
+            ),
+          }),
+        }),
+      );
+    } catch {
+      /* expected */
+    }
+
+    const payload = JSON.parse(errorSpy.mock.calls[0]?.[0] as string);
+    expect(payload.code).toBe("NOT_FOUND");
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+  });
+});

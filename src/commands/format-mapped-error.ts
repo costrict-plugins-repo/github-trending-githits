@@ -1,0 +1,120 @@
+import {
+  formatMappedErrorText,
+  hasRetryGuidance,
+  type MappedError,
+  withVersionRefRecovery,
+} from "@githits/mcp/internal";
+
+const CLI_AUTH_ERROR_MESSAGE =
+  "Authentication required. Run `githits login` to authenticate.";
+const CLI_LOCAL_AUTH_REMEDIATION =
+  "Run `githits login` to authenticate or set GITHITS_API_TOKEN.";
+const CLI_SERVER_AUTH_REMEDIATION =
+  "Re-authenticate with `githits login` or update GITHITS_API_TOKEN if set. If this persists, contact support@githits.com.";
+const CLI_TERMS_ERROR_MESSAGE =
+  "Terms acceptance required. Run `githits settings terms accept`, then retry.";
+const CLI_TERMS_ACTION = "githits settings terms accept";
+
+interface CliErrorPayload {
+  error: string;
+  code: string;
+  retryable?: boolean;
+  details?: MappedError["details"] | Record<string, unknown>;
+}
+
+export function formatMappedErrorForTerminal(mapped: MappedError): string {
+  if (mapped.code === "VERSION_NOT_FOUND" || mapped.code === "REF_NOT_FOUND") {
+    return formatMappedErrorText(mapped, {
+      width: process.stderr.columns,
+      recovery: { syntax: "cli", argv: process.argv.slice(2) },
+    });
+  }
+  if (mapped.code === "TERMS_ACCEPTANCE_REQUIRED") {
+    return CLI_TERMS_ERROR_MESSAGE;
+  }
+  if (mapped.code === "AUTH_REQUIRED") {
+    if (
+      mapped.message === "Authentication required." &&
+      mapped.details?.authSource === undefined
+    ) {
+      return CLI_AUTH_ERROR_MESSAGE;
+    }
+    return `${mapped.message} ${authRemediation(mapped)}`;
+  }
+  if (mapped.code === "RATE_LIMITED") {
+    if (mapped.retryable !== true || hasRetryGuidance(mapped.message)) {
+      return appendBackendHint(mapped, mapped.message);
+    }
+    const retryAfterSeconds = mapped.details?.retryAfterSeconds;
+    if (
+      typeof retryAfterSeconds === "number" &&
+      Number.isFinite(retryAfterSeconds) &&
+      retryAfterSeconds > 0
+    ) {
+      const seconds = Math.ceil(retryAfterSeconds);
+      const unit = seconds === 1 ? "second" : "seconds";
+      return appendBackendHint(
+        mapped,
+        `${mapped.message} Try again in ${seconds} ${unit}.`,
+      );
+    }
+    return appendBackendHint(mapped, `${mapped.message} Try again shortly.`);
+  }
+  if (mapped.code === "TIMEOUT") {
+    if (mapped.retryable !== true || hasRetryGuidance(mapped.message)) {
+      return appendBackendHint(mapped, mapped.message);
+    }
+    return appendBackendHint(mapped, `${mapped.message} Try again.`);
+  }
+  if (mapped.code !== "UPDATE_REQUIRED") {
+    return appendBackendHint(mapped, mapped.message);
+  }
+  const detail = mapped.details ?? {};
+  const updateCommand =
+    typeof detail.updateCommand === "string"
+      ? detail.updateCommand
+      : "npm i -g githits@latest";
+  return [mapped.message, "", "Update with:", `  ${updateCommand}`].join("\n");
+}
+
+/** Append a backend hint consistently for generic and code-navigation CLI errors. */
+export function appendBackendHint(mapped: MappedError, text: string): string {
+  const hint = mapped.details?.hint;
+  if (!hint || text.includes(hint)) return text;
+  return `${text}\n  hint: ${hint.replaceAll("\n", "\n    ")}`;
+}
+
+function authRemediation(mapped: MappedError): string {
+  return mapped.details?.authSource === "server"
+    ? CLI_SERVER_AUTH_REMEDIATION
+    : CLI_LOCAL_AUTH_REMEDIATION;
+}
+
+export function buildCliMappedErrorPayload(
+  mapped: MappedError,
+  argv: readonly string[] = process.argv.slice(2),
+): CliErrorPayload {
+  mapped = withVersionRefRecovery(mapped, { syntax: "cli", argv });
+  const details =
+    mapped.code === "TERMS_ACCEPTANCE_REQUIRED"
+      ? { action: CLI_TERMS_ACTION, ...(mapped.details ?? {}) }
+      : mapped.details;
+  return {
+    error:
+      mapped.code === "TERMS_ACCEPTANCE_REQUIRED"
+        ? CLI_TERMS_ERROR_MESSAGE
+        : mapped.message,
+    code: mapped.code,
+    retryable: mapped.retryable ?? false,
+    ...(details ? { details } : {}),
+  };
+}
+
+export function formatCliMappedError(
+  mapped: MappedError,
+  json: boolean,
+): string {
+  return json
+    ? JSON.stringify(buildCliMappedErrorPayload(mapped))
+    : formatMappedErrorForTerminal(mapped);
+}

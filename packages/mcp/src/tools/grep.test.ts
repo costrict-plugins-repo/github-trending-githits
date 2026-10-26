@@ -1,0 +1,485 @@
+import { describe, expect, it, mock } from "bun:test";
+import type {
+  GrepParams,
+  GrepResult,
+  GrepService,
+} from "@githits/core-internal";
+import {
+  AuthenticationError,
+  GrepGraphQLError,
+  parseGrepResult,
+} from "@githits/core-internal";
+import { z } from "zod";
+import mixedPage from "../shared/fixtures/grep-text/mixed-100.json";
+import { createGrepTool, type GrepArgs } from "./grep.js";
+import { CODE_GREP_GUARDRAIL } from "./guardrails.js";
+
+const emptyPage: GrepResult = {
+  indexingEstimates: [],
+  pathWarnings: [],
+  hits: [],
+  targets: [],
+  unavailableTargets: [],
+  traversal: "COMPLETE",
+  nextCursor: null,
+  totalMatches: 0,
+};
+
+function service(
+  grep: (params: GrepParams) => Promise<GrepResult> = async () => emptyPage,
+): GrepService {
+  return { grep: mock(grep) };
+}
+
+function payload(text: string): Record<string, unknown> {
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+describe("unified MCP grep", () => {
+  it("uses original request operands for retryable resolved-source failures", async () => {
+    const page: GrepResult = {
+      ...emptyPage,
+      traversal: "FAILED",
+      targets: [
+        {
+          ...parseGrepResult(mixedPage).targets[0]!,
+          requestedInputIndices: [1],
+          readiness: "NOT_AVAILABLE",
+          traversal: "FAILED",
+          retryable: true,
+        },
+      ],
+    };
+    const tool = createGrepTool(service(async () => page));
+    const result = await tool.handler({
+      targets: [{ target: "npm:healthy" }, { target: "npm:requested" }],
+      pattern: "router",
+    });
+    const recovery = result.content[0]!.text.split("Follow-up:\n")[1]!;
+    expect(recovery).toContain(
+      "Repeat the same pattern and options for:\n    npm:requested",
+    );
+    expect(recovery).toContain("Omit cursor to start a new search.");
+    expect(recovery).not.toMatch(/healthy|github|wait_timeout_ms/);
+  });
+
+  it.each([
+    { name: "omitted", format: undefined },
+    { name: "text", format: "text" as const },
+    { name: "json", format: "json" as const },
+  ])("formats authentication failures when format is $name", async (mode) => {
+    const grep = mock(async (_params: GrepParams): Promise<GrepResult> => {
+      throw new AuthenticationError("The host token was rejected.", "server");
+    });
+    const tool = createGrepTool(service(grep));
+    const result = await tool.handler({
+      targets: [{ target: "npm:express" }],
+      pattern: "router",
+      ...(mode.format === undefined ? {} : { format: mode.format }),
+    });
+    const content = result.content[0]?.text ?? "";
+
+    expect(grep).toHaveBeenCalledTimes(1);
+    expect(result.isError).toBe(true);
+    if (mode.format === "json") {
+      expect(payload(content)).toEqual({
+        error: "The host token was rejected.",
+        code: "AUTH_REQUIRED",
+        retryable: false,
+        details: {
+          authSource: "server",
+          action:
+            "Re-authenticate with `githits login` or update GITHITS_API_TOKEN if set. If this persists, contact support@githits.com.",
+        },
+      });
+      return;
+    }
+
+    expect(content).toContain("The host token was rejected.");
+    expect(content).toContain(
+      "Re-authenticate with `githits login` or update GITHITS_API_TOKEN if set.",
+    );
+    expect(content).toContain("contact support@githits.com.");
+    expect(content).not.toContain('"code":"AUTH_REQUIRED"');
+  });
+
+  it("advertises a standalone selection sentence, migration route, guardrail, and independent controls", () => {
+    const tool = createGrepTool(service());
+    const firstSentence = `${tool.description.split(".")[0]}.`;
+    const first80 = tool.description.slice(0, 80);
+    const inputSchema = z.toJSONSchema(z.object(tool.schema), { io: "input" });
+
+    expect(tool.name).toBe("grep");
+    expect(tool.annotations).toEqual({
+      readOnlyHint: true,
+      openWorldHint: true,
+      destructiveHint: false,
+    });
+    expect(firstSentence).toBe(
+      "Find regex or literal matches across source and documentation.",
+    );
+    expect(firstSentence.length).toBeLessThanOrEqual(79);
+    expect(first80).not.toContain("code_grep");
+    expect(tool.description).toContain("Replaces code_grep.");
+    expect(tool.description).toContain(CODE_GREP_GUARDRAIL);
+    expect(Object.keys(tool.schema)).toEqual([
+      "targets",
+      "pattern",
+      "pattern_type",
+      "ignore_case",
+      "context_lines_before",
+      "context_lines_after",
+      "max_matches",
+      "cursor",
+      "wait_timeout_ms",
+      "format",
+    ]);
+    expect(inputSchema.required).toEqual(["targets", "pattern"]);
+    expect(inputSchema.properties?.targets).toMatchObject({
+      minItems: 1,
+      maxItems: 20,
+    });
+    expect(tool.description).toContain("packages include selected hosted docs");
+    expect(tool.schema.targets?.description).toContain("ordered");
+    expect(tool.schema.pattern?.description).toContain("RE2 regex");
+    expect(tool.schema.ignore_case?.description).toContain("case-sensitive");
+    expect(tool.schema.cursor?.description).toContain("same ordered targets");
+    expect(tool.schema.format?.description).toContain("grouped matches");
+    expect(tool.schema.pattern?.description).toContain(
+      "No lookaround or backreferences",
+    );
+    expect(tool.description).not.toContain("githits code grep");
+    expect(inputSchema.properties?.format).toMatchObject({ default: "text" });
+  });
+
+  it("normalizes omitted defaults, explicit false, and empty site selectors before one service call", async () => {
+    const grep = mock(async (_params: GrepParams) => emptyPage);
+    const tool = createGrepTool(service(grep));
+    const result = await tool.handler({
+      targets: [
+        { target: "npm:express", path_selectors: [] },
+        { target: "site:expressjs.com/en/5x", path_selectors: [] },
+      ],
+      pattern: "router",
+      ignore_case: false,
+      context_lines_before: 0,
+      wait_timeout_ms: 0,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toBe("No matches found.");
+    expect(grep).toHaveBeenCalledTimes(1);
+    expect(grep).toHaveBeenCalledWith({
+      targets: [
+        { target: "npm:express", corpus: "ALL", allowUnscoped: true },
+        { target: "site:expressjs.com/en/5x" },
+      ],
+      pattern: "router",
+      patternType: "REGEX",
+      caseSensitive: true,
+      contextLinesBefore: 0,
+      contextLinesAfter: 0,
+      waitTimeoutMs: 0,
+      includeDetailedFields: false,
+    });
+  });
+
+  it("forwards explicit controls and returns the complete projected JSON page", async () => {
+    const page = parseGrepResult(mixedPage);
+    const grep = mock(async (_params: GrepParams) => page);
+    const tool = createGrepTool(service(grep));
+    const args: GrepArgs = {
+      targets: [
+        {
+          target: "github:expressjs/express@main",
+          corpus: "source",
+          path_selectors: [{ kind: "exact", value: "lib/express.js" }],
+        },
+        { target: "site:expressjs.com" },
+      ],
+      pattern: "router",
+      pattern_type: "literal",
+      ignore_case: true,
+      context_lines_before: 1,
+      context_lines_after: 2,
+      max_matches: 100,
+      cursor: "opaque-page-two",
+      format: "json",
+    };
+    const result = await tool.handler(args);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload(result.content[0]!.text)).toEqual(
+      JSON.parse(JSON.stringify(page)),
+    );
+    expect(grep).toHaveBeenCalledWith({
+      targets: [
+        {
+          target: "github:expressjs/express@main",
+          corpus: "SOURCE",
+          allowUnscoped: true,
+          pathSelectors: [{ kind: "EXACT", value: "lib/express.js" }],
+        },
+        { target: "site:expressjs.com" },
+      ],
+      pattern: "router",
+      patternType: "LITERAL",
+      caseSensitive: false,
+      contextLinesBefore: 1,
+      contextLinesAfter: 2,
+      maxMatches: 100,
+      cursor: "opaque-page-two",
+      includeDetailedFields: true,
+      waitTimeoutMs: 0,
+    });
+    expect((payload(result.content[0]!.text).hits as unknown[]).length).toBe(
+      page.hits.length,
+    );
+  });
+
+  it("uses the shared grouped text with exact read guidance and continuation", async () => {
+    const page = parseGrepResult(mixedPage);
+    const tool = createGrepTool(service(async () => page));
+    const result = await tool.handler({
+      targets: [{ target: "npm:express" }],
+      pattern: "router",
+    });
+    const text = result.content[0]?.text ?? "";
+
+    expect(text).toContain("Files: read target=$target path=$path");
+    expect(text).toContain("Pages: read target=$url");
+    expect(text).toContain("Sources:");
+    expect(text).toContain('cursor="');
+    expect(text).not.toContain("githits read");
+  });
+
+  it("maps an invalid site corpus before calling the service", async () => {
+    const grep = mock(async (_params: GrepParams) => emptyPage);
+    const tool = createGrepTool(service(grep));
+    const result = await tool.handler({
+      targets: [{ target: "site:expressjs.com", corpus: "source" }],
+      pattern: "router",
+      format: "json",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(payload(result.content[0]!.text)).toMatchObject({
+      code: "INVALID_ARGUMENT",
+      retryable: false,
+    });
+    expect(grep).not.toHaveBeenCalled();
+  });
+
+  it("gives a preparation-wait action for a retryable indexing error", async () => {
+    const tool = createGrepTool(
+      service(async () => {
+        throw new GrepGraphQLError("not ready", {
+          code: "GREP_TARGET_PREPARATION_REQUIRED",
+          retryable: true,
+          target_issues: [{ input_index: 0, reason: "repository_indexing" }],
+        });
+      }),
+    );
+    const result = await tool.handler({
+      targets: [{ target: "npm:express" }],
+      pattern: "router",
+      format: "json",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(payload(result.content[0]!.text)).toMatchObject({
+      code: "INDEXING",
+      retryable: true,
+      details: {
+        targetIssues: [{ input_index: 0, reason: "repository_indexing" }],
+        action: expect.stringContaining("wait_timeout_ms"),
+      },
+    });
+  });
+
+  it("propagates caller cancellation instead of returning a service error", async () => {
+    const controller = new AbortController();
+    const cancellation = new DOMException("aborted", "AbortError");
+    const tool = createGrepTool(
+      service(async () => {
+        controller.abort();
+        throw cancellation;
+      }),
+    );
+
+    await expect(
+      tool.handler(
+        { targets: [{ target: "npm:express" }], pattern: "router" },
+        { signal: controller.signal },
+      ),
+    ).rejects.toBe(cancellation);
+  });
+  it.each([
+    ["repository_indexing", "INDEXING", true, "job"],
+    ["documentation_publishing", "INDEXING", true, "job"],
+    ["documentation_discovery", "INDEXING", true, undefined],
+    ["site_v6_required", "INDEXING", true, undefined],
+    ["starting_url_pending", "INDEXING", true, undefined],
+    ["repository_not_found", "NOT_FOUND", false, undefined],
+    ["repository_ref_not_found", "REF_NOT_FOUND", false, undefined],
+    ["package_version_not_found", "VERSION_NOT_FOUND", false, undefined],
+    ["repository_ref_ambiguous", "INVALID_ARGUMENT", false, undefined],
+    ["repository_legally_blocked", "UNRESOLVABLE", false, undefined],
+    ["repository_unavailable", "BACKEND_ERROR", true, "job"],
+    ["future_reason", "UNRESOLVABLE", true, undefined],
+    ["future_reason", "INDEXING", true, "job"],
+  ] as const)(
+    "emits %s as %s in MCP JSON",
+    async (reason, code, retryable, progress_ref) => {
+      const issues = [
+        {
+          input_index: 0,
+          target: "npm:x",
+          reason,
+          retryable,
+          ...(progress_ref ? { progress_ref } : {}),
+        },
+      ];
+      const tool = createGrepTool(
+        service(async () => {
+          throw new GrepGraphQLError("Backend diagnostic.", {
+            code: "GREP_TARGET_PREPARATION_REQUIRED",
+            retryable,
+            target_issues: issues,
+          });
+        }),
+      );
+      const result = await tool.handler({
+        targets: [{ target: "npm:x" }],
+        pattern: "router",
+        format: "json",
+      });
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0]!.text);
+      expect(body).toMatchObject({
+        error: "Backend diagnostic.",
+        code,
+        retryable,
+        details: {
+          graphqlCode: "GREP_TARGET_PREPARATION_REQUIRED",
+          targetIssues: issues,
+        },
+      });
+      expect((body.details.action ?? "").includes("wait_timeout_ms")).toBe(
+        code === "INDEXING" && retryable,
+      );
+    },
+  );
+
+  it("emits the terminal blocker for mixed progress and missing targets in MCP JSON", async () => {
+    const issues = [
+      { input_index: 0, reason: "repository_indexing", retryable: true },
+      { input_index: 1, reason: "repository_not_found", retryable: false },
+    ];
+    const tool = createGrepTool(
+      service(async () => {
+        throw new GrepGraphQLError("Mixed blockers", {
+          code: "GREP_TARGET_PREPARATION_REQUIRED",
+          retryable: false,
+          target_issues: issues,
+        });
+      }),
+    );
+    const result = await tool.handler({
+      targets: [{ target: "npm:a" }, { target: "npm:b" }],
+      pattern: "router",
+      format: "json",
+    });
+    const body = JSON.parse(result.content[0]!.text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({
+      code: "NOT_FOUND",
+      retryable: false,
+      details: { targetIssues: issues },
+    });
+    expect(body.details.hint).toContain("repository was not found");
+    expect(body.details.hint).not.toContain("repository_not_found");
+    expect(body.details.action).toBeUndefined();
+  });
+
+  it.each(["package_version_not_found", "repository_ref_not_found"] as const)(
+    "retains additional blockers and path facts for %s in text",
+    async (reason) => {
+      const issues = [
+        {
+          input_index: 0,
+          target: "npm:a",
+          reason,
+          retryable: false,
+          file_path: "lib/a.js",
+        },
+        {
+          input_index: 1,
+          target: "npm:b",
+          reason: "repository_not_found",
+          retryable: false,
+        },
+      ];
+      const tool = createGrepTool(
+        service(async () => {
+          throw new GrepGraphQLError("First target diagnostic.", {
+            code: "GREP_TARGET_PREPARATION_REQUIRED",
+            retryable: false,
+            target_issues: issues,
+          });
+        }),
+      );
+      const result = await tool.handler({
+        targets: [{ target: "npm:a" }, { target: "npm:b" }],
+        pattern: "router",
+      });
+      const text = result.content[0]!.text.replace(/\s+/g, " ");
+      expect(result.isError).toBe(true);
+      expect(text).toContain("First target diagnostic.");
+      expect(text).toContain("npm:a: path lib/a.js");
+      expect(text).toContain("npm:b: repository was not found");
+      expect(text).not.toMatch(/repository_not_found|wait_timeout_ms/);
+    },
+  );
+  it.each([
+    ["repository_indexing", "repository is being indexed"],
+    ["documentation_publishing", "documentation is being prepared"],
+    ["documentation_discovery", "documentation sources are being discovered"],
+    [
+      "site_v6_required",
+      "documentation site requires a publication format update",
+    ],
+    ["starting_url_pending", "requested documentation URL is being prepared"],
+  ] as const)(
+    "retains the pending target and %s reason in text",
+    async (reason, copy) => {
+      const issues = [
+        {
+          input_index: 0,
+          target: "npm:x",
+          reason,
+          retryable: true,
+          message: "Preparation is pending.",
+        },
+      ];
+      const tool = createGrepTool(
+        service(async () => {
+          throw new GrepGraphQLError("Preparation is pending.", {
+            code: "GREP_TARGET_PREPARATION_REQUIRED",
+            retryable: true,
+            target_issues: issues,
+          });
+        }),
+      );
+      const result = await tool.handler({
+        targets: [{ target: "npm:x" }],
+        pattern: "router",
+      });
+      const text = result.content[0]!.text.replace(/\s+/g, " ");
+      expect(result.isError).toBe(true);
+      expect(text).toContain(`npm:x: ${copy}`);
+      expect(text).toContain("wait_timeout_ms");
+      expect(text).not.toContain(reason);
+    },
+  );
+});
