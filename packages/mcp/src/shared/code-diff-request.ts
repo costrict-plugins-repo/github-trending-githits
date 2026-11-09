@@ -1,0 +1,409 @@
+import type {
+  CodeDiffParams,
+  CodeNavigationTarget,
+} from "@githits/core-internal";
+import { parseCodeNavigationTargetSpec } from "./code-navigation-target.js";
+import { InvalidPackageSpecError, KNOWN_REGISTRIES } from "./package-spec.js";
+import { LegacyRepositoryRefError } from "./repository-target.js";
+
+export type CodeDiffView = "patch" | "stat" | "name-only" | "name-status";
+
+export interface CodeDiffRequestInput {
+  target?: string;
+  repoUrl?: string;
+  range: string;
+  view?: CodeDiffView;
+  pathGlob?: string;
+  maxFiles?: number;
+  maxPatchBytes?: number;
+}
+
+export type CodeDiffMcpTarget = string;
+
+export interface CodeDiffMcpRequestInput {
+  target: CodeDiffMcpTarget;
+  from: string;
+  to: string;
+  view?: CodeDiffView;
+  pathGlob?: string;
+  maxFiles?: number;
+  maxPatchBytes?: number;
+}
+
+export interface CodeDiffRequestBuildResult {
+  params: CodeDiffParams;
+  view: CodeDiffView;
+}
+
+const VIEW_TO_MODE: Record<CodeDiffView, CodeDiffParams["mode"]> = {
+  patch: "patches",
+  stat: "stats",
+  "name-only": "inventory",
+  "name-status": "inventory",
+};
+
+const MAX_PATH_GLOB_BYTES = 1024;
+export const CODE_DIFF_MAX_FILES_MIN = 1;
+export const CODE_DIFF_MAX_FILES_MAX = 300;
+export const CODE_DIFF_MAX_PATCH_BYTES_MIN = 1024;
+export const CODE_DIFF_MAX_PATCH_BYTES_MAX = 2_097_152;
+
+export function buildCodeDiffParams(
+  input: CodeDiffRequestInput,
+): CodeDiffRequestBuildResult {
+  const target = buildTarget(input);
+  const { from, to } = parseRange(input.range);
+  return buildCodeDiffParamsFromParts(target, from, to, input);
+}
+
+/** Build CodeDiff params from MCP's separate endpoints and compact target. */
+export function buildCodeDiffMcpParams(
+  input: CodeDiffMcpRequestInput,
+): CodeDiffRequestBuildResult {
+  const target = buildMcpTarget(input.target);
+  const from = normaliseMcpEndpoint(input.from, "from");
+  const to = normaliseMcpEndpoint(input.to, "to");
+  return buildCodeDiffParamsFromParts(target, from, to, input);
+}
+
+function buildCodeDiffParamsFromParts(
+  target: CodeDiffParams["target"],
+  from: string,
+  to: string,
+  input: Pick<
+    CodeDiffRequestInput,
+    "view" | "pathGlob" | "maxFiles" | "maxPatchBytes"
+  >,
+): CodeDiffRequestBuildResult {
+  const view = normaliseView(input.view);
+  const pathGlob = normalisePathGlob(input.pathGlob);
+  const maxFiles = normaliseIntegerOption(
+    input.maxFiles,
+    "Maximum files",
+    CODE_DIFF_MAX_FILES_MIN,
+    CODE_DIFF_MAX_FILES_MAX,
+  );
+  const maxPatchBytes = normaliseIntegerOption(
+    input.maxPatchBytes,
+    "Maximum patch bytes",
+    CODE_DIFF_MAX_PATCH_BYTES_MIN,
+    CODE_DIFF_MAX_PATCH_BYTES_MAX,
+  );
+
+  if (maxPatchBytes !== undefined && view !== "patch") {
+    throw invalid(
+      "The maximum patch byte limit is valid only when the view is patch.",
+    );
+  }
+
+  const options = buildOptions({ maxFiles, maxPatchBytes, pathGlob });
+  const params: CodeDiffParams = {
+    target,
+    from,
+    to,
+    mode: VIEW_TO_MODE[view],
+  };
+  if (options !== undefined) params.options = options;
+
+  return { params, view };
+}
+
+function buildTarget(input: CodeDiffRequestInput): CodeDiffParams["target"] {
+  const hasTarget = input.target !== undefined;
+  const hasRepoUrl = input.repoUrl !== undefined;
+
+  if (hasTarget && hasRepoUrl) {
+    throw invalid("Provide either `target` or `repoUrl`, not both.");
+  }
+  if (!hasTarget && !hasRepoUrl) {
+    throw invalid("Provide exactly one of `target` or `repoUrl`.");
+  }
+
+  const raw = hasTarget ? input.target : input.repoUrl;
+  if (typeof raw !== "string") {
+    throw invalid("Diff target must be a string.");
+  }
+
+  return buildTargetFromRaw(raw, hasTarget ? "target" : "repoUrl");
+}
+
+function buildMcpTarget(raw: CodeDiffMcpTarget): CodeDiffParams["target"] {
+  return buildTargetFromRaw(raw, "mcpTarget");
+}
+
+type CodeDiffTargetSource = "target" | "mcpTarget" | "repoUrl";
+
+function buildTargetFromRaw(
+  raw: string,
+  source: CodeDiffTargetSource,
+): CodeDiffParams["target"] {
+  const parsed = parseTarget(raw);
+  if ((source === "target" || source === "mcpTarget") && parsed.version) {
+    throw invalid(
+      source === "target"
+        ? "Package targets must not include a version; put both versions in `range`."
+        : "Package targets must not include a version; put both versions in the comparison endpoints.",
+    );
+  }
+  if (parsed.gitRef !== undefined) {
+    throw invalid(
+      source === "target" || source === "repoUrl"
+        ? "Repository targets must not include a ref; put both refs in `range`."
+        : "Repository targets must not include a ref; put both refs in the comparison endpoints.",
+    );
+  }
+
+  const hasPackageKeys =
+    Object.hasOwn(parsed, "registry") || Object.hasOwn(parsed, "packageName");
+  const hasRepoKey = Object.hasOwn(parsed, "repoUrl");
+  if (source === "repoUrl" && hasPackageKeys) {
+    throw invalid(
+      "Repository target must identify a repository, not a package.",
+    );
+  }
+  if (hasPackageKeys && hasRepoKey) {
+    throw invalid("Diff target cannot combine package and repository keys.");
+  }
+  if (hasPackageKeys) {
+    if (
+      !Object.hasOwn(parsed, "registry") ||
+      !Object.hasOwn(parsed, "packageName") ||
+      parsed.registry === undefined ||
+      parsed.packageName === undefined
+    ) {
+      throw invalid("Diff package target must include a registry and name.");
+    }
+    return {
+      registry: parsed.registry,
+      packageName: parsed.packageName,
+    };
+  }
+  if (hasRepoKey && parsed.repoUrl !== undefined) {
+    return { repoUrl: parsed.repoUrl };
+  }
+  throw invalid("Diff target must be a package or repository target.");
+}
+
+function parseTarget(raw: string): CodeNavigationTarget {
+  try {
+    return parseCodeNavigationTargetSpec(raw);
+  } catch (error) {
+    if (error instanceof LegacyRepositoryRefError) {
+      throw invalid(error.message);
+    }
+    throw invalid(
+      `Invalid Diff target. Expected an unversioned package target \`<registry>:<name>\` (for example \`npm:express\`; supported registries: ${KNOWN_REGISTRIES.join(", ")}) or an unversioned repository target (for example \`github:expressjs/express\`, \`codeberg:owner/repo\`, \`gitlab:group/subgroup/project\`, or \`launchpad:~owner/+git/repo\` (\`lp:PROJECT\` also accepted)).`,
+    );
+  }
+}
+
+function parseRange(raw: string): { from: string; to: string } {
+  if (typeof raw !== "string") {
+    throw invalid("Diff range must be a string in the form `from..to`.");
+  }
+  const range = raw.trim();
+  if (range.includes("...")) {
+    throw invalid("Diff range must use one `from..to` separator, not `...`.");
+  }
+
+  const separator = range.indexOf("..");
+  if (separator === -1 || range.indexOf("..", separator + 2) !== -1) {
+    throw invalid("Diff range must contain exactly one `from..to` separator.");
+  }
+
+  const from = range.slice(0, separator).trim();
+  const to = range.slice(separator + 2).trim();
+  if (!from || !to) {
+    throw invalid("Diff range endpoints must not be empty.");
+  }
+  return { from, to };
+}
+
+function normaliseMcpEndpoint(raw: string, name: "from" | "to"): string {
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw invalid(`Diff ${name} endpoint must not be empty.`);
+  }
+  return raw.trim();
+}
+
+function normaliseView(raw: CodeDiffView | undefined): CodeDiffView {
+  if (raw === undefined) return "patch";
+  if (typeof raw === "string" && Object.hasOwn(VIEW_TO_MODE, raw)) {
+    return raw;
+  }
+  throw invalid("Diff view must be patch, stat, name-only, or name-status.");
+}
+
+function normalisePathGlob(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") {
+    throw invalid("Path glob must be a string when supplied.");
+  }
+
+  const pathGlob = raw;
+  if (pathGlob.length === 0) {
+    throw invalid("Path glob must not be empty when supplied.");
+  }
+  if (hasInvalidUtf16(pathGlob)) {
+    throw invalid("Path glob must be valid UTF-8.");
+  }
+  if (new TextEncoder().encode(pathGlob).byteLength > MAX_PATH_GLOB_BYTES) {
+    throw invalid(
+      `Path glob must be at most ${MAX_PATH_GLOB_BYTES} UTF-8 bytes.`,
+    );
+  }
+
+  validatePathGlobGrammar(pathGlob);
+  return pathGlob;
+}
+
+interface GlobToken {
+  char: string;
+  escaped: boolean;
+}
+
+function validatePathGlobGrammar(pathGlob: string): void {
+  if (
+    pathGlob === ":" ||
+    pathGlob.startsWith(":(") ||
+    pathGlob.startsWith(":/") ||
+    pathGlob.startsWith(":!") ||
+    pathGlob.startsWith(":^")
+  ) {
+    throw invalid(
+      "Path glob does not support Git pathspec magic; pass one bounded glob.",
+    );
+  }
+
+  const components: GlobToken[][] = [];
+  let component: GlobToken[] = [];
+  const characters = Array.from(pathGlob);
+
+  for (let index = 0; index < characters.length; index += 1) {
+    const character = characters[index];
+    if (character === undefined) break;
+    if (character === "/") {
+      addGlobComponent(components, component);
+      component = [];
+      continue;
+    }
+    if (character === "\\") {
+      const escaped = characters[index + 1];
+      if (escaped === undefined || escaped === "/") {
+        throw invalid(
+          "Path glob backslashes must escape one following non-slash character.",
+        );
+      }
+      component.push({ char: escaped, escaped: true });
+      index += 1;
+      continue;
+    }
+    if (
+      character === "[" ||
+      character === "]" ||
+      character === "{" ||
+      character === "}" ||
+      character === "!"
+    ) {
+      throw invalid(
+        "Path glob does not support unescaped brackets, braces, or `!`.",
+      );
+    }
+    component.push({ char: character, escaped: false });
+  }
+  addGlobComponent(components, component);
+
+  for (const tokens of components) {
+    const isGlobstar =
+      tokens.length === 2 &&
+      tokens.every(({ char, escaped }) => char === "*" && !escaped);
+    if (isGlobstar) continue;
+
+    let previous: GlobToken | undefined;
+    for (const token of tokens) {
+      if (
+        previous?.char === "*" &&
+        !previous.escaped &&
+        token.char === "*" &&
+        !token.escaped
+      ) {
+        throw invalid(
+          "Path glob allows adjacent stars only as an exact `**` component.",
+        );
+      }
+      previous = token;
+    }
+  }
+}
+
+function addGlobComponent(
+  components: GlobToken[][],
+  component: GlobToken[],
+): void {
+  if (component.length === 0) {
+    throw invalid(
+      "Path glob must use non-empty repository-relative components.",
+    );
+  }
+  const literal = component.map(({ char }) => char).join("");
+  if (literal === "." || literal === "..") {
+    throw invalid("Path glob must not contain `.` or `..` components.");
+  }
+  components.push(component);
+}
+
+function hasInvalidUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1;
+        continue;
+      }
+      return true;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+function normaliseIntegerOption(
+  value: number | undefined,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw invalid(
+      `${name} must be an integer from ${minimum} through ${maximum}.`,
+    );
+  }
+  return value;
+}
+
+function buildOptions(input: {
+  maxFiles: number | undefined;
+  maxPatchBytes: number | undefined;
+  pathGlob: string | undefined;
+}): CodeDiffParams["options"] {
+  if (
+    input.maxFiles === undefined &&
+    input.maxPatchBytes === undefined &&
+    input.pathGlob === undefined
+  ) {
+    return undefined;
+  }
+  const options: NonNullable<CodeDiffParams["options"]> = {};
+  if (input.maxFiles !== undefined) options.maxFiles = input.maxFiles;
+  if (input.maxPatchBytes !== undefined) {
+    options.maxPatchBytes = input.maxPatchBytes;
+  }
+  if (input.pathGlob !== undefined) options.pathGlob = input.pathGlob;
+  return options;
+}
+
+function invalid(message: string): InvalidPackageSpecError {
+  return new InvalidPackageSpecError(message);
+}

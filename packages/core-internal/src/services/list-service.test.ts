@@ -1,0 +1,1531 @@
+import { describe, expect, it, mock } from "bun:test";
+import { ClientUpdateRequiredError } from "./client-update-required-error.js";
+import {
+  ListAccessError,
+  ListBackendError,
+  ListGraphQLError,
+  ListNetworkError,
+  ListServiceImpl,
+  MalformedListResponseError,
+} from "./list-service.js";
+import type { ServiceDiagnostics } from "./runtime-diagnostics.js";
+import { createMockTokenProvider } from "./test-helpers.js";
+
+const ENDPOINT = "https://pkgseer.dev";
+
+interface SelectionTree {
+  [field: string]:
+    | SelectionTree
+    | { __directive: string; __selection?: SelectionTree }
+    | null;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function successBody(
+  list: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    data: {
+      list: {
+        indexingEstimates: [],
+        inventoryKind: "SOURCE",
+        requestedTarget: "npm:express@5.2.1",
+        canonicalTarget: "npm:express@5.2.1",
+        entries: [],
+        hasMore: false,
+        nextCursor: null,
+        indexedVersion: "5.2.1",
+        codeIndexState: "CURRENT",
+        indexingStatus: "COMPLETED",
+        indexingRef: null,
+        inventoryState: null,
+        crawlStatus: null,
+        coverageState: null,
+        coverageReason: null,
+        preparation: null,
+        ...list,
+      },
+    },
+  };
+}
+
+function parseListSelection(query: string): SelectionTree {
+  const operationIndex = query.indexOf("\n  list(");
+  if (operationIndex < 0) throw new Error("Missing Query.list field");
+  const argsStart = query.indexOf("(", operationIndex);
+  let depth = 0;
+  let argsEnd = -1;
+  for (let index = argsStart; index < query.length; index += 1) {
+    if (query[index] === "(") depth += 1;
+    if (query[index] === ")") depth -= 1;
+    if (depth === 0) {
+      argsEnd = index;
+      break;
+    }
+  }
+  if (argsEnd < 0) throw new Error("Unclosed Query.list arguments");
+  const selectionStart = query.indexOf("{", argsEnd);
+  if (selectionStart < 0) throw new Error("Missing Query.list selection");
+
+  depth = 0;
+  let selectionEnd = -1;
+  for (let index = selectionStart; index < query.length; index += 1) {
+    if (query[index] === "{") depth += 1;
+    if (query[index] === "}") depth -= 1;
+    if (depth === 0) {
+      selectionEnd = index + 1;
+      break;
+    }
+  }
+  if (selectionEnd < 0) throw new Error("Unclosed Query.list selection");
+
+  const tokens =
+    query
+      .slice(selectionStart, selectionEnd)
+      .match(
+        /@[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|[{}():!]/g,
+      ) ?? [];
+  if (tokens.length === 0) throw new Error("Empty Query.list selection");
+  let cursor = 0;
+
+  function parseSet(): SelectionTree {
+    if (tokens[cursor] !== "{") throw new Error("Expected selection set");
+    cursor += 1;
+    const selection: SelectionTree = {};
+    while (tokens[cursor] !== "}") {
+      const field = tokens[cursor];
+      if (!field || field.startsWith("@")) {
+        throw new Error("Expected a selected field");
+      }
+      cursor += 1;
+
+      if (tokens[cursor] === ":") {
+        cursor += 1;
+        const sourceField = tokens[cursor];
+        if (!sourceField || sourceField.startsWith("@")) {
+          throw new Error("Expected aliased source field");
+        }
+        cursor += 1;
+      }
+
+      let directive: string | undefined;
+      if (tokens[cursor]?.startsWith("@")) {
+        const directiveName = tokens[cursor];
+        cursor += 1;
+        if (tokens[cursor] !== "(") throw new Error("Expected directive args");
+        cursor += 1;
+        const directiveArgs: string[] = [];
+        let argsDepth = 1;
+        while (argsDepth > 0) {
+          const token = tokens[cursor];
+          if (!token) throw new Error("Unclosed directive arguments");
+          cursor += 1;
+          if (token === "(") argsDepth += 1;
+          if (token === ")") {
+            argsDepth -= 1;
+            if (argsDepth === 0) break;
+          }
+          directiveArgs.push(token);
+        }
+        directive = `${directiveName}(${directiveArgs.join("")})`;
+      }
+
+      const childSelection = tokens[cursor] === "{" ? parseSet() : undefined;
+      selection[field] = directive
+        ? {
+            __directive: directive,
+            ...(childSelection ? { __selection: childSelection } : {}),
+          }
+        : (childSelection ?? null);
+    }
+    cursor += 1;
+    return selection;
+  }
+
+  return parseSet();
+}
+
+function readRequest(fetchFn: ReturnType<typeof mock>): {
+  query: string;
+  variables: Record<string, unknown>;
+} {
+  const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+  return JSON.parse(String(init.body)) as {
+    query: string;
+    variables: Record<string, unknown>;
+  };
+}
+
+function asFetchFn<T extends (...args: never[]) => unknown>(
+  fn: T,
+): typeof fetch {
+  return fn as unknown as typeof fetch;
+}
+
+function diagnosticRuntime(area: string): ServiceDiagnostics {
+  return {
+    withOperation: <T>(_name: string, operation: () => Promise<T>) =>
+      operation(),
+    isEnabled: (candidate: string) => candidate === area,
+    debug: () => undefined,
+  };
+}
+
+describe("ListServiceImpl", () => {
+  it("retains nonempty uniform timing through compact list decoding", async () => {
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(
+        mock(() =>
+          Promise.resolve(
+            jsonResponse(
+              successBody({
+                indexingEstimates: [
+                  {
+                    kind: "REPOSITORY",
+                    targets: ["npm:express"],
+                    repositoryUrl: null,
+                    commitSha: null,
+                    unavailableReason: null,
+                    estimate: {
+                      lowerSeconds: 38,
+                      upperSeconds: 57,
+                      elapsedSeconds: 4,
+                      sampleCount: 9,
+                      source: "same_repository_refs",
+                    },
+                  },
+                ],
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    const parsed = await service.list({
+      target: "npm:express",
+      includeDetailedFields: false,
+    });
+    expect(parsed.indexingEstimates).toEqual([
+      {
+        kind: "REPOSITORY",
+        targets: ["npm:express"],
+        repositoryUrl: undefined,
+        commitSha: undefined,
+        unavailableReason: undefined,
+        estimate: {
+          lowerSeconds: 38,
+          upperSeconds: 57,
+          elapsedSeconds: 4,
+          sampleCount: 9,
+          source: "same_repository_refs",
+        },
+      },
+    ]);
+  });
+  it("compact wire projection omits detailed entry fields", async () => {
+    const fetchFn = mock((_url: string, _init?: RequestInit) =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            requestedTarget: " npm:express@5.2.1 ",
+            entries: [
+              {
+                kind: "FILE",
+                path: "src/index.ts",
+              },
+              {
+                kind: "DIRECTORY",
+                path: "src",
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: " npm:express@5.2.1 ",
+      paths: [],
+      recursive: false,
+      fileTypes: [],
+      languages: ["TypeScript"],
+      intents: [],
+      limit: 0,
+      after: "",
+      waitTimeoutMs: 0,
+      includeDetailedFields: false,
+      includeTargetProvenance: false,
+      includeReadActions: false,
+    });
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const request = readRequest(fetchFn);
+    expect(request.variables).toEqual({
+      target: " npm:express@5.2.1 ",
+      paths: [],
+      recursive: false,
+      fileTypes: [],
+      languages: ["TypeScript"],
+      intents: [],
+      limit: 0,
+      after: "",
+      waitTimeoutMs: 0,
+      includeDetailedFields: false,
+      includeTargetProvenance: false,
+      includeReadActions: false,
+    });
+    expect(request.query).toContain("query List(");
+    expect(request.query).toContain("list(");
+    expect(request.query).not.toContain("listRepoFiles");
+    expect(request.query).not.toMatch(
+      /^\s+(content|body|snippet|sections)\s*$/m,
+    );
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result.entries[0]).toEqual({
+      kind: "FILE",
+      path: "src/index.ts",
+    });
+    expect(result.entries[0]?.read).toBeUndefined();
+    expect(result.canonicalTarget).toBe("npm:express@5.2.1");
+    expect(result.entries[1]).toEqual({ kind: "DIRECTORY", path: "src" });
+  });
+
+  it("list provenance wire selects minimal identities and preserves dates and nulls", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            targetResolution: {
+              requested: {
+                kind: "git_branch",
+                gitRef: null,
+                releaseCorrespondence: null,
+              },
+              resolvedRequested: {
+                repoUrl: null,
+                gitRef: "main",
+                commitSha: "requested-full-sha",
+                committedAt: null,
+                releaseCorrespondence: "manifest_matched",
+              },
+              served: {
+                repoUrl: "https://github.com/acme/project",
+                gitRef: "main",
+                commitSha: "served-full-sha",
+                committedAt: "2025-04-03T02:01:00.123+05:30",
+                releaseCorrespondence: "future_state",
+              },
+              freshness: "stale",
+              freshnessReason: "ref_moved",
+            },
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "github:acme/project@main",
+      includeDetailedFields: false,
+      includeTargetProvenance: true,
+    });
+    const request = readRequest(fetchFn);
+
+    expect(request.variables).toEqual({
+      target: "github:acme/project@main",
+      includeDetailedFields: false,
+      includeTargetProvenance: true,
+      includeReadActions: false,
+      waitTimeoutMs: 30_000,
+    });
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result.targetResolution).toEqual({
+      requested: {
+        kind: "git_branch",
+        gitRef: null,
+        releaseCorrespondence: null,
+      },
+      resolvedRequested: {
+        repoUrl: null,
+        gitRef: "main",
+        commitSha: "requested-full-sha",
+        committedAt: null,
+        releaseCorrespondence: "manifest_matched",
+      },
+      served: {
+        repoUrl: "https://github.com/acme/project",
+        gitRef: "main",
+        commitSha: "served-full-sha",
+        committedAt: "2025-04-03T02:01:00.123+05:30",
+        releaseCorrespondence: "future_state",
+      },
+      freshness: "stale",
+      freshnessReason: "ref_moved",
+    });
+    expect(result.targetResolution?.requested?.repoUrl).toBeUndefined();
+    expect(
+      result.targetResolution?.resolvedRequested?.registry,
+    ).toBeUndefined();
+    expect(result.targetResolution?.indexingRef).toBeUndefined();
+    expect(result.targetResolution?.availableVersions).toBeUndefined();
+    expect(result.targetResolution?.availableRefs).toBeUndefined();
+    expect(result.targetResolution?.suggestedRefs).toBeUndefined();
+  });
+
+  it("compact unresolved requested identity selects and projects repository and package labels", async () => {
+    const cases = [
+      {
+        target: "github:owner/repo@missing",
+        requested: {
+          kind: "git_branch",
+          repoUrl: "https://github.com/owner/repo",
+          gitRef: "missing",
+        },
+      },
+      {
+        target: "npm:example@missing",
+        requested: {
+          kind: "package_exact_version",
+          registry: "npm",
+          packageName: "example",
+          version: "missing",
+          gitRef: null,
+        },
+      },
+    ];
+
+    for (const { target, requested } of cases) {
+      const fetchFn = mock(() =>
+        Promise.resolve(
+          jsonResponse(
+            successBody({
+              requestedTarget: target,
+              canonicalTarget: target,
+              targetResolution: {
+                requested,
+                resolvedRequested: null,
+                served: null,
+                freshness: "unavailable",
+                freshnessReason: null,
+              },
+            }),
+          ),
+        ),
+      );
+      const service = new ListServiceImpl(
+        ENDPOINT,
+        createMockTokenProvider(),
+        asFetchFn(fetchFn),
+      );
+
+      const result = await service.list({
+        target,
+        includeDetailedFields: false,
+        includeTargetProvenance: true,
+      });
+      const request = readRequest(fetchFn);
+
+      expect(request.variables).toEqual({
+        target,
+        includeDetailedFields: false,
+        includeTargetProvenance: true,
+        includeReadActions: false,
+        waitTimeoutMs: 30_000,
+      });
+      expect(parseListSelection(request.query)).toEqual(
+        expectedListSelection(),
+      );
+      expect(result.targetResolution).toEqual({
+        requested,
+        resolvedRequested: null,
+        served: null,
+        freshness: "unavailable",
+        freshnessReason: null,
+      });
+    }
+  });
+
+  it("list provenance wire omits provenance for default compact calls", async () => {
+    const fetchFn = mock(() => Promise.resolve(jsonResponse(successBody())));
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "github:acme/project@main",
+      includeDetailedFields: false,
+    });
+    const request = readRequest(fetchFn);
+
+    expect(request.variables).toEqual({
+      target: "github:acme/project@main",
+      includeDetailedFields: false,
+      includeTargetProvenance: false,
+      includeReadActions: false,
+      waitTimeoutMs: 30_000,
+    });
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result.targetResolution).toBeUndefined();
+  });
+
+  it("list provenance wire keeps detailed provenance when explicitly disabled", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            targetResolution: {
+              requested: {
+                kind: "git_tag",
+                registry: null,
+                packageName: null,
+                version: null,
+                repoUrl: "https://github.com/acme/project",
+                gitRef: "v1.0.0",
+                commitSha: "requested-sha",
+              },
+              resolvedRequested: {
+                kind: "git_tag",
+                registry: null,
+                packageName: null,
+                version: null,
+                repoUrl: "https://github.com/acme/project",
+                gitRef: "v1.0.0",
+                commitSha: "requested-sha",
+                committedAt: "2025-01-02T03:04:05Z",
+              },
+              served: {
+                kind: "git_tag",
+                registry: null,
+                packageName: null,
+                version: null,
+                repoUrl: "https://github.com/acme/project",
+                gitRef: "v1.0.0",
+                commitSha: "served-sha",
+                committedAt: null,
+              },
+              freshness: "current",
+              freshnessReason: "exact_current",
+              indexingRef: null,
+              availableVersions: [],
+              availableRefs: [],
+              suggestedRefs: [],
+            },
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "github:acme/project@v1.0.0",
+      includeDetailedFields: true,
+      includeTargetProvenance: false,
+    });
+    const request = readRequest(fetchFn);
+
+    expect(request.variables).toEqual({
+      target: "github:acme/project@v1.0.0",
+      includeDetailedFields: true,
+      includeTargetProvenance: true,
+      includeReadActions: true,
+      waitTimeoutMs: 30_000,
+    });
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result.targetResolution?.resolvedRequested?.committedAt).toBe(
+      "2025-01-02T03:04:05Z",
+    );
+    expect(result.targetResolution?.served?.committedAt).toBeNull();
+    expect(result.targetResolution?.requested?.repoUrl).toBe(
+      "https://github.com/acme/project",
+    );
+    expect(result.targetResolution?.indexingRef).toBeNull();
+    expect(result.targetResolution?.availableVersions).toEqual([]);
+    expect(result.targetResolution?.availableRefs).toEqual([]);
+    expect(result.targetResolution?.suggestedRefs).toEqual([]);
+  });
+
+  it("compact site projection selects logical read actions without other details", async () => {
+    const actionTarget = 'site:docs.example.test/guide?q=%2F&title="API"';
+    const actionPath = 'api/路径%2Fguide?lang=é&title="routing"';
+    const fetchFn = mock((_url: string, _init?: RequestInit) =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            inventoryKind: "SITE",
+            requestedTarget: "site:docs.example.test",
+            canonicalTarget: "site:docs.example.test",
+            entries: [
+              {
+                kind: "PAGE",
+                path: "docs.example.test/guide/",
+                read: {
+                  target: actionTarget,
+                  path: actionPath,
+                },
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "site:docs.example.test",
+      includeDetailedFields: false,
+      includeReadActions: true,
+    });
+
+    const request = readRequest(fetchFn);
+    expect(request.variables).toEqual({
+      target: "site:docs.example.test",
+      includeDetailedFields: false,
+      includeTargetProvenance: false,
+      includeReadActions: true,
+      waitTimeoutMs: 30_000,
+    });
+    expect(request.query).toContain(
+      "read: readTarget @include(if: $includeReadActions)",
+    );
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result.entries[0]).toEqual({
+      kind: "PAGE",
+      path: "docs.example.test/guide/",
+      read: {
+        target: actionTarget,
+        path: actionPath,
+      },
+    });
+  });
+
+  it("accepts an explicit null selected read action", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            entries: [
+              { kind: "PAGE", path: "docs.example.test/guide/", read: null },
+            ],
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "site:docs.example.test",
+      includeDetailedFields: false,
+      includeReadActions: true,
+    });
+
+    expect(result.entries[0]?.read).toBeNull();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: "compact read-action projection",
+      options: { includeDetailedFields: false, includeReadActions: true },
+    },
+    {
+      name: "detailed projection",
+      options: { includeDetailedFields: true },
+    },
+  ])("rejects a missing read action in the $name", async ({ options }) => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            entries: [{ kind: "PAGE", path: "docs.example.test/guide/" }],
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    await expect(
+      service.list({ target: "site:docs.example.test", ...options }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: "empty target",
+      read: { target: "", path: null },
+    },
+    {
+      name: "missing path",
+      read: { target: "site:docs.example.test/guide" },
+    },
+  ])("rejects selected read actions with $name", async ({ read }) => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            entries: [{ kind: "PAGE", path: "docs.example.test/guide/", read }],
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    await expect(
+      service.list({
+        target: "site:docs.example.test",
+        includeDetailedFields: false,
+        includeReadActions: true,
+      }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("wire projection parses detailed resolution and site lifecycle fields", async () => {
+    let capturedBody = "";
+    const fetchFn = mock((_url: string, init?: RequestInit) => {
+      capturedBody = String(init?.body);
+      return Promise.resolve(
+        jsonResponse(
+          successBody({
+            inventoryKind: "SITE",
+            requestedTarget: "site:docs.example.test",
+            canonicalTarget: null,
+            entries: [
+              {
+                kind: "PAGE",
+                path: "docs.example.test/api%2Fv1",
+                title: "API",
+                language: null,
+                fileType: null,
+                intent: null,
+                byteSize: null,
+                lineCount: null,
+                contentHash: null,
+                read: {
+                  target: "site:docs.example.test",
+                  path: "api%2Fv1?lang=en",
+                },
+                browse: {
+                  target: "site:docs.example.test",
+                  paths: ["docs.example.test/api%2Fv1"],
+                },
+              },
+            ],
+            hasMore: true,
+            nextCursor: " opaque/cursor= ",
+            indexedVersion: null,
+            resolution: {
+              requestedVersion: null,
+              requestedRef: null,
+              resolvedRef: null,
+              commitSha: null,
+            },
+            targetResolution: null,
+            codeIndexState: null,
+            indexingStatus: null,
+            indexingRef: null,
+            availableVersions: null,
+            indexingEstimate: null,
+            inventoryState: "AVAILABLE",
+            crawlStatus: "RUNNING",
+            coverageState: "PARTIAL",
+            coverageReason: "refresh_pending",
+            preparation: {
+              selected: 2,
+              enqueued: 1,
+              activeJobs: [
+                { mode: "incremental_recrawl", state: "RUNNING" },
+                { mode: null, state: "QUEUED" },
+              ],
+              awaited: [{ mode: null, outcome: "TIMEOUT" }],
+            },
+          }),
+        ),
+      );
+    });
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "site:docs.example.test",
+      includeDetailedFields: true,
+    });
+    const request = JSON.parse(capturedBody) as {
+      query: string;
+      variables: Record<string, unknown>;
+    };
+
+    expect(request.variables).toEqual({
+      target: "site:docs.example.test",
+      includeDetailedFields: true,
+      includeTargetProvenance: true,
+      includeReadActions: true,
+      waitTimeoutMs: 30_000,
+    });
+    expect(parseListSelection(request.query)).toEqual(expectedListSelection());
+    expect(result).toMatchObject({
+      inventoryKind: "SITE",
+      requestedTarget: "site:docs.example.test",
+      hasMore: true,
+      nextCursor: " opaque/cursor= ",
+      inventoryState: "AVAILABLE",
+      crawlStatus: "RUNNING",
+      coverageState: "PARTIAL",
+      coverageReason: "refresh_pending",
+      preparation: {
+        selected: 2,
+        enqueued: 1,
+        activeJobs: [
+          { mode: "incremental_recrawl", state: "RUNNING" },
+          { mode: null, state: "QUEUED" },
+        ],
+        awaited: [{ mode: null, outcome: "TIMEOUT" }],
+      },
+      entries: [
+        {
+          kind: "PAGE",
+          path: "docs.example.test/api%2Fv1",
+          title: "API",
+          read: {
+            target: "site:docs.example.test",
+            path: "api%2Fv1?lang=en",
+          },
+          browse: {
+            target: "site:docs.example.test",
+            paths: ["docs.example.test/api%2Fv1"],
+          },
+        },
+      ],
+    });
+    expect(result.canonicalTarget).toBeNull();
+    expect(result.entries[0]?.read).toEqual({
+      target: "site:docs.example.test",
+      path: "api%2Fv1?lang=en",
+    });
+    expect(result.entries[0]?.language).toBeNull();
+    expect(result.entries[0]?.contentHash).toBeNull();
+    expect(result.indexingStatus).toBeNull();
+    expect(result.indexingRef).toBeNull();
+    expect(result.resolution).toEqual({
+      requestedVersion: null,
+      requestedRef: null,
+      resolvedRef: null,
+      commitSha: null,
+    });
+    expect(result.availableVersions).toBeNull();
+    expect(result.indexingEstimate).toBeNull();
+    expect(result.preparation?.awaited[0]?.mode).toBeNull();
+  });
+
+  it.each([
+    "COMPLETED",
+    "DISCARDED",
+    "CANCELLED",
+    "TIMEOUT",
+    "FAILED",
+    "SUPERSEDED",
+  ])(
+    "preserves exact awaited %s in compact and detailed results",
+    async (outcome) => {
+      for (const includeDetailedFields of [false, true]) {
+        let capturedQuery = "";
+        const awaited = [
+          { mode: null, outcome },
+          { mode: "incremental_recrawl", outcome },
+        ];
+        const fetchFn = mock((_url: string, init?: RequestInit) => {
+          capturedQuery = (JSON.parse(String(init?.body)) as { query: string })
+            .query;
+          return Promise.resolve(
+            jsonResponse(
+              successBody({
+                inventoryKind: "SITE",
+                preparation: {
+                  selected: 2,
+                  enqueued: 0,
+                  activeJobs: [],
+                  awaited,
+                },
+              }),
+            ),
+          );
+        });
+        const service = new ListServiceImpl(
+          ENDPOINT,
+          createMockTokenProvider(),
+          asFetchFn(fetchFn),
+        );
+        const result = await service.list({
+          target: "site:docs.example.test",
+          includeDetailedFields,
+        });
+
+        expect(capturedQuery).toMatch(
+          /awaited\s*\{\s*mode\s+outcome:\s*status\s*\}/,
+        );
+        expect(parseListSelection(capturedQuery)).toEqual(
+          expectedListSelection(),
+        );
+        expect(result.preparation?.awaited).toEqual(awaited);
+        expect(fetchFn).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+
+  it("rejects an unknown exact awaited outcome without retry", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            preparation: {
+              selected: 1,
+              enqueued: 0,
+              activeJobs: [],
+              awaited: [{ mode: null, outcome: "UNKNOWN" }],
+            },
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+    await expect(
+      service.list({
+        target: "site:docs.example.test",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("wire projection rejects hasMore without a nonempty cursor", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(successBody({ hasMore: true, nextCursor: "" })),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    await expect(
+      service.list({
+        target: "github:expressjs/express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("wire projection returns detailed source resolution and indexing metadata", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(
+          successBody({
+            resolution: {
+              requestedVersion: "^5.2",
+              requestedRef: null,
+              resolvedRef: "v5.2.1",
+              commitSha: "abc123",
+            },
+            targetResolution: {
+              requested: {
+                kind: "package_exact_version",
+                registry: "npm",
+                packageName: "express",
+                version: "5.2.1",
+                repoUrl: null,
+                gitRef: null,
+                commitSha: null,
+              },
+              resolvedRequested: null,
+              served: {
+                kind: "package_exact_version",
+                registry: "npm",
+                packageName: "express",
+                version: "5.2.1",
+                repoUrl: "https://github.com/expressjs/express",
+                gitRef: "v5.2.1",
+                commitSha: "abc123",
+              },
+              freshness: "current",
+              freshnessReason: "exact_current",
+              indexingRef: null,
+              availableVersions: [{ version: "5.2.1", ref: "v5.2.1" }],
+              availableRefs: [{ version: null, ref: "v5.2.1" }],
+              suggestedRefs: [{ version: null, ref: "v5.2.2" }],
+            },
+            availableVersions: [{ version: "5.2.1", ref: "v5.2.1" }],
+            indexingEstimate: {
+              lowerSeconds: 3,
+              upperSeconds: 8,
+              elapsedSeconds: 1,
+              sampleCount: 5,
+              source: "same_repository_refs",
+            },
+          }),
+        ),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+
+    const result = await service.list({
+      target: "npm:express@5.2.1",
+      includeDetailedFields: true,
+    });
+    expect(result.resolution).toEqual({
+      requestedVersion: "^5.2",
+      requestedRef: null,
+      resolvedRef: "v5.2.1",
+      commitSha: "abc123",
+    });
+    expect(result.targetResolution).toEqual({
+      requested: {
+        kind: "package_exact_version",
+        registry: "npm",
+        packageName: "express",
+        version: "5.2.1",
+        repoUrl: null,
+        gitRef: null,
+        commitSha: null,
+      },
+      resolvedRequested: null,
+      served: {
+        kind: "package_exact_version",
+        registry: "npm",
+        packageName: "express",
+        version: "5.2.1",
+        repoUrl: "https://github.com/expressjs/express",
+        gitRef: "v5.2.1",
+        commitSha: "abc123",
+      },
+      freshness: "current",
+      freshnessReason: "exact_current",
+      indexingRef: null,
+      availableVersions: [{ version: "5.2.1", ref: "v5.2.1" }],
+      availableRefs: [{ version: null, ref: "v5.2.1" }],
+      suggestedRefs: [{ version: null, ref: "v5.2.2" }],
+    });
+    expect(result.indexingEstimate).toEqual({
+      lowerSeconds: 3,
+      upperSeconds: 8,
+      elapsedSeconds: 1,
+      sampleCount: 5,
+      source: "same_repository_refs",
+    });
+  });
+
+  it("GraphQL errors preserve scope recovery fields and generic metadata", async () => {
+    const responses = [
+      {
+        message: "Package scope could not be certified",
+        extensions: {
+          code: "SOURCE_INVENTORY_SCOPE_UNAVAILABLE",
+          retryable: false,
+          repo_url: "https://github.com/expressjs/express",
+          commit_sha: "abc123",
+          indexing_ref: "idx-1",
+          hint: "Use repository scope only if acceptable.",
+        },
+      },
+      {
+        message: "Package scope could not be certified",
+        extensions: {
+          code: "SOURCE_INVENTORY_SCOPE_UNAVAILABLE",
+          retryable: true,
+        },
+      },
+      {
+        message: "Package scope could not be certified",
+        extensions: {
+          code: "SOURCE_INVENTORY_SCOPE_UNAVAILABLE",
+          retryable: false,
+          repo_url: "https://github.com/expressjs/express",
+        },
+      },
+      {
+        message: "Still indexing",
+        extensions: {
+          code: "PACKAGE_INDEXING",
+          retryable: true,
+          indexing_ref: "idx-2",
+        },
+      },
+      {
+        message: "Unclassified failure",
+        extensions: { code: "INTERNAL_ERROR", retryable: true },
+      },
+    ];
+
+    for (const error of responses) {
+      const fetchFn = mock(() =>
+        Promise.resolve(jsonResponse({ errors: [error] })),
+      );
+      const service = new ListServiceImpl(
+        ENDPOINT,
+        createMockTokenProvider(),
+        asFetchFn(fetchFn),
+      );
+      let thrown: unknown;
+      try {
+        await service.list({
+          target: "npm:express",
+          includeDetailedFields: false,
+        });
+      } catch (errorValue) {
+        thrown = errorValue;
+      }
+      expect(thrown).toBeInstanceOf(ListGraphQLError);
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      const request = readRequest(fetchFn);
+      expect(request.query).not.toContain("listRepoFiles");
+      expect(request.variables.target).toBe("npm:express");
+      if (error.extensions?.code === "SOURCE_INVENTORY_SCOPE_UNAVAILABLE") {
+        const graphQLError = thrown as ListGraphQLError;
+        expect(graphQLError.message).toBe(error.message);
+        expect(graphQLError.code).toBe("SOURCE_INVENTORY_SCOPE_UNAVAILABLE");
+        expect(graphQLError.retryable).toBe(error.extensions.retryable);
+        if (typeof error.extensions.repo_url === "string") {
+          expect(graphQLError.repoUrl).toBe(error.extensions.repo_url);
+          expect(graphQLError.commitSha).toBe(
+            typeof error.extensions.commit_sha === "string"
+              ? error.extensions.commit_sha
+              : undefined,
+          );
+        } else {
+          expect(graphQLError.repoUrl).toBeUndefined();
+          expect(graphQLError.commitSha).toBeUndefined();
+        }
+        expect(graphQLError.indexingRef).toBe(
+          error.extensions.indexing_ref ?? undefined,
+        );
+        expect(graphQLError.hint).toBe(error.extensions.hint ?? undefined);
+      } else {
+        const graphQLError = thrown as ListGraphQLError;
+        expect(graphQLError.code).toBe(error.extensions.code);
+        expect(graphQLError.retryable).toBe(error.extensions.retryable);
+        expect(graphQLError.indexingRef).toBe(
+          error.extensions.indexing_ref ?? undefined,
+        );
+      }
+    }
+  });
+
+  it("service failures refresh authentication and classify transport, HTTP, schema, and malformed responses", async () => {
+    const getToken = mock(() => Promise.resolve("initial-token"));
+    const forceRefresh = mock(() => Promise.resolve("refreshed-token"));
+    const authHeaders: string[] = [];
+    const authFetch = mock((_url: string, init?: RequestInit) => {
+      authHeaders.push(new Headers(init?.headers).get("Authorization") ?? "");
+      if (authFetch.mock.calls.length === 1) {
+        return Promise.resolve(
+          jsonResponse({
+            errors: [
+              {
+                message: "Unauthorized",
+                extensions: { code: "UNAUTHORIZED" },
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(jsonResponse(successBody()));
+    });
+    const authService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider({ getToken, forceRefresh }),
+      asFetchFn(authFetch),
+    );
+    await authService.list({
+      target: "npm:express",
+      includeDetailedFields: false,
+    });
+    expect(getToken).toHaveBeenCalledTimes(1);
+    expect(forceRefresh).toHaveBeenCalledTimes(1);
+    expect(authFetch).toHaveBeenCalledTimes(2);
+    expect(authHeaders).toEqual([
+      "Bearer initial-token",
+      "Bearer refreshed-token",
+    ]);
+
+    const httpAuthRefresh = mock(() => Promise.resolve("http-refreshed-token"));
+    const httpAuthFetch = mock(() =>
+      Promise.resolve(
+        httpAuthFetch.mock.calls.length === 1
+          ? jsonResponse({}, 401)
+          : jsonResponse(successBody()),
+      ),
+    );
+    const httpAuthService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider({ forceRefresh: httpAuthRefresh }),
+      asFetchFn(httpAuthFetch),
+    );
+    await httpAuthService.list({
+      target: "npm:express",
+      includeDetailedFields: false,
+    });
+    expect(httpAuthRefresh).toHaveBeenCalledTimes(1);
+    expect(httpAuthFetch).toHaveBeenCalledTimes(2);
+
+    const transportService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.reject(new Error("socket down")))),
+    );
+    await expect(
+      transportService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(ListNetworkError);
+
+    const deniedService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.resolve(jsonResponse({}, 403)))),
+    );
+    await expect(
+      deniedService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(ListAccessError);
+
+    const backendService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.resolve(jsonResponse({}, 502)))),
+    );
+    await expect(
+      backendService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toMatchObject({
+      constructor: ListBackendError,
+      status: 502,
+    });
+
+    const schemaMessage = 'Cannot query field "list" on type "Query".';
+    const schemaResponse = {
+      errors: [
+        {
+          message: schemaMessage,
+          extensions: { code: "GRAPHQL_VALIDATION_FAILED" },
+        },
+      ],
+    };
+    const safeSchemaService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.resolve(jsonResponse(schemaResponse)))),
+    );
+    let safeSchemaError: unknown;
+    try {
+      await safeSchemaService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      });
+    } catch (error) {
+      safeSchemaError = error;
+    }
+    expect(safeSchemaError).toBeInstanceOf(ListBackendError);
+    expect((safeSchemaError as Error).message).not.toContain(schemaMessage);
+    expect((safeSchemaError as Error).message).toContain(
+      "Backend protocol mismatch",
+    );
+
+    const wireSchemaService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.resolve(jsonResponse(schemaResponse)))),
+      { diagnostics: diagnosticRuntime("code-nav-wire") },
+    );
+    await expect(
+      wireSchemaService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toMatchObject({ message: schemaMessage });
+
+    const updateService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(
+        mock(() =>
+          Promise.resolve(
+            jsonResponse({
+              errors: [
+                {
+                  message: "Update required",
+                  extensions: { code: "CLIENT_UPDATE_REQUIRED" },
+                },
+              ],
+            }),
+          ),
+        ),
+      ),
+      { clientVersion: "1.2.3" },
+    );
+    await expect(
+      updateService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(ClientUpdateRequiredError);
+
+    const malformedService = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(mock(() => Promise.resolve(jsonResponse({ data: null })))),
+    );
+    await expect(
+      malformedService.list({
+        target: "npm:express",
+        includeDetailedFields: false,
+      }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+  });
+
+  it("service failures reject empty nextCursor when hasMore is true", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse(successBody({ hasMore: true, nextCursor: null })),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+    await expect(
+      service.list({ target: "npm:express", includeDetailedFields: false }),
+    ).rejects.toBeInstanceOf(MalformedListResponseError);
+  });
+});
+
+function expectedListSelection(): SelectionTree {
+  const includeDetailed = "@include(if:$includeDetailedFields)";
+  const includeTargetProvenance = "@include(if:$includeTargetProvenance)";
+  const includeReadActions = "@include(if:$includeReadActions)";
+  const detailed = (selection?: SelectionTree) => ({
+    __directive: includeDetailed,
+    ...(selection ? { __selection: selection } : {}),
+  });
+  const requestedIdentity = {
+    kind: null,
+    gitRef: null,
+    registry: null,
+    packageName: null,
+    version: null,
+    repoUrl: null,
+    commitSha: detailed(),
+    releaseCorrespondence: null,
+  };
+  const servedIdentity = {
+    repoUrl: null,
+    gitRef: null,
+    commitSha: null,
+    committedAt: null,
+    releaseCorrespondence: null,
+    kind: detailed(),
+    registry: null,
+    packageName: null,
+    version: null,
+  };
+  return {
+    indexingEstimates: {
+      kind: null,
+      targets: null,
+      repositoryUrl: null,
+      commitSha: null,
+      unavailableReason: null,
+      estimate: {
+        lowerSeconds: null,
+        upperSeconds: null,
+        elapsedSeconds: null,
+        sampleCount: null,
+        source: null,
+      },
+    },
+    inventoryKind: null,
+    requestedTarget: null,
+    canonicalTarget: null,
+    entries: {
+      kind: null,
+      path: null,
+      title: detailed(),
+      language: detailed(),
+      fileType: detailed(),
+      intent: detailed(),
+      byteSize: detailed(),
+      lineCount: detailed(),
+      contentHash: detailed(),
+      read: {
+        __directive: includeReadActions,
+        __selection: { target: null, path: null },
+      },
+      browse: detailed({ target: null, paths: null }),
+    },
+    hasMore: null,
+    nextCursor: null,
+    indexedVersion: null,
+    resolution: detailed({
+      requestedVersion: null,
+      requestedRef: null,
+      resolvedRef: null,
+      commitSha: null,
+    }),
+    targetResolution: {
+      __directive: includeTargetProvenance,
+      __selection: {
+        requested: requestedIdentity,
+        resolvedRequested: servedIdentity,
+        served: servedIdentity,
+        freshness: null,
+        freshnessReason: null,
+        indexingRef: detailed(),
+        availableVersions: detailed({ version: null, ref: null }),
+        availableRefs: detailed({ version: null, ref: null }),
+        suggestedRefs: detailed({ version: null, ref: null }),
+      },
+    },
+    codeIndexState: null,
+    indexingStatus: null,
+    indexingRef: null,
+    availableVersions: detailed({ version: null, ref: null }),
+    indexingEstimate: detailed({
+      lowerSeconds: null,
+      upperSeconds: null,
+      elapsedSeconds: null,
+      sampleCount: null,
+      source: null,
+    }),
+    inventoryState: null,
+    crawlStatus: null,
+    coverageState: null,
+    coverageReason: null,
+    preparation: {
+      selected: null,
+      enqueued: null,
+      activeJobs: { mode: null, state: null },
+      awaited: { mode: null, outcome: null },
+    },
+  };
+}
+
+describe("list zero-wait indexing metadata", () => {
+  it("preserves singular duration and requested/ref alternatives from GraphQL errors without new selections", async () => {
+    const fetchFn = mock(() =>
+      Promise.resolve(
+        jsonResponse({
+          errors: [
+            {
+              message: "Still indexing",
+              extensions: {
+                code: "PACKAGE_INDEXING",
+                retryable: true,
+                repo_url: "https://github.com/expressjs/express",
+                package: "npm:express",
+                indexing_ref: "opaque-progress",
+                estimated_indexing_duration: {
+                  lower_seconds: 33,
+                  upper_seconds: 85,
+                  elapsed_seconds: 4,
+                  sample_count: 7,
+                  source: "same_repository_refs",
+                },
+                available_versions: [{ version: "1.0.2", ref: "v1.0.2" }],
+                hint: "Use an indexed ref if suitable.",
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    const service = new ListServiceImpl(
+      ENDPOINT,
+      createMockTokenProvider(),
+      asFetchFn(fetchFn),
+    );
+    let failure: unknown;
+    try {
+      await service.list({
+        target: "npm:express@1.0.3",
+        waitTimeoutMs: 0,
+        includeDetailedFields: false,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(ListGraphQLError);
+    const error = failure as ListGraphQLError;
+    expect(error.indexingMetadata).toEqual({
+      indexingEstimate: {
+        lowerSeconds: 33,
+        upperSeconds: 85,
+        elapsedSeconds: 4,
+        sampleCount: 7,
+        source: "same_repository_refs",
+      },
+      availableVersions: [{ version: "1.0.2", ref: "v1.0.2" }],
+      package: "npm:express",
+    });
+    expect(error.repoUrl).toBe("https://github.com/expressjs/express");
+    expect(error.hint).toBe("Use an indexed ref if suitable.");
+    expect(readRequest(fetchFn).variables.waitTimeoutMs).toBe(0);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+});

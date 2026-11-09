@@ -1,0 +1,203 @@
+import type { PackageIntelligenceService } from "@githits/core-internal";
+import {
+  buildPackageDependenciesParams,
+  buildPackageDependenciesSuccessPayload,
+  formatPackageDependenciesTerminal,
+  InvalidPackageSpecError,
+  parsePackageSpec,
+  requireAuth,
+  SUPPORTED_DEPS_REGISTRIES_LIST,
+  shouldUseColors,
+} from "@githits/mcp/internal";
+import type { Command } from "commander";
+import { createContainer } from "../../container.js";
+import { mapPackageIntelligenceErrorForCli } from "../../shared/cli-error-diagnostics.js";
+import {
+  buildCliMappedErrorPayload,
+  formatMappedErrorForTerminal,
+} from "../format-mapped-error.js";
+
+export interface PkgDepsCommandOptions {
+  lifecycle?: string;
+  depth?: string;
+  verbose?: boolean;
+  issues?: boolean;
+  json?: boolean;
+}
+
+export interface PkgDepsCommandDependencies {
+  packageIntelligenceService: PackageIntelligenceService | undefined;
+  codeNavigationUrl: string | undefined;
+  hasValidToken: boolean;
+  mcpUrl: string;
+}
+
+/**
+ * Core `pkg deps` action. Accepts `<spec>[@<version>]`. The
+ * `--lifecycle` filter is server-side (filters `dependencyGroups`
+ * only) and implies the groups view. `--lifecycle all` renders the
+ * structured view without filtering. `--depth N` opts into the
+ * transitive block and caps traversal to that depth. `--issues` opts into
+ * dependency issue analysis without exposing the transitive block unless
+ * `--depth` is also supplied.
+ */
+export async function pkgDepsAction(
+  spec: string,
+  options: PkgDepsCommandOptions,
+  deps: PkgDepsCommandDependencies,
+): Promise<void> {
+  try {
+    requireAuth(deps);
+  } catch (error) {
+    if (options.json) handlePkgDepsCommandError(error, true);
+    throw error;
+  }
+
+  try {
+    if (!deps.codeNavigationUrl || !deps.packageIntelligenceService) {
+      throw new InvalidPackageSpecError(
+        "Package intelligence is not configured for this environment.",
+      );
+    }
+
+    const parsed = parsePackageSpec(spec);
+
+    const userDepth = resolveDepth(options);
+    const includeIssues = options.issues;
+    const includeTransitiveOutput = userDepth !== undefined;
+    // Always fetch the transitive DAG on the wire — even in plain
+    // mode we need it to resolve the concrete version for each
+    // direct dep (`name@version` in display), and for `--verbose`
+    // to annotate per-entry importer provenance. When the user
+    // didn't request transitive output or issue analysis, cap at depth 1
+    // so the payload stays lean.
+    const wireIncludeTransitive = true;
+    const wireMaxDepth =
+      includeTransitiveOutput || includeIssues === true ? userDepth : 1;
+
+    const { params, canonicalLifecycles } = buildPackageDependenciesParams({
+      registry: parsed.registry,
+      packageName: parsed.name,
+      version: parsed.version,
+      lifecycle: options.lifecycle,
+      includeTransitive: wireIncludeTransitive,
+      maxDepth: wireMaxDepth,
+      includeIssues,
+    });
+    const showGroups = canonicalLifecycles.some((entry) => entry !== "runtime");
+    const needsGroupsForTextHint = options.json !== true;
+
+    const report = await deps.packageIntelligenceService.packageDependencies({
+      ...params,
+      includeTransitiveDetails: includeTransitiveOutput,
+      includeGroups: showGroups || needsGroupsForTextHint,
+    });
+
+    if (options.json) {
+      const payload = buildPackageDependenciesSuccessPayload(report, {
+        requestedVersion: params.version,
+        canonicalLifecycles,
+        includeTransitive: includeTransitiveOutput,
+        maxDepth: userDepth,
+        // Tie `--verbose` to JSON richness too: agents reading the
+        // envelope see the same detail as the terminal's verbose
+        // output. Default `--json` keeps the payload lean (~4×
+        // smaller on large graphs like jest).
+        includeImporters: options.verbose ?? false,
+        includeIssues,
+      });
+      console.log(JSON.stringify(payload));
+      return;
+    }
+
+    const output = formatPackageDependenciesTerminal(report, {
+      verbose: options.verbose,
+      useColors: shouldUseColors(),
+      requestedVersion: params.version,
+      canonicalLifecycles:
+        canonicalLifecycles.length > 0 ? canonicalLifecycles : undefined,
+      includeTransitive: includeTransitiveOutput,
+      maxDepth: userDepth,
+      showGroups,
+      includeIssues,
+      issuesDetailHint: "Use --verbose for complete issue details.",
+      terminalWidth: process.stdout.columns,
+    });
+    process.stdout.write(output);
+  } catch (error) {
+    handlePkgDepsCommandError(error, options.json ?? false);
+  }
+}
+
+function resolveDepth(options: PkgDepsCommandOptions): number | undefined {
+  const raw = options.depth;
+  if (raw === undefined) return undefined;
+  // Require the raw string to be an exact integer. `parseInt` would
+  // silently truncate `3.5 → 3` or `5abc → 5`; on a public CLI that
+  // silently corrupts caller intent rather than surfacing the typo.
+  if (!/^-?\d+$/.test(raw.trim())) {
+    throw new InvalidPackageSpecError(
+      `--depth expects an integer between 1 and 10. Got '${raw}'.`,
+    );
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return parsed;
+}
+
+function handlePkgDepsCommandError(error: unknown, json: boolean): never {
+  const mapped = mapPackageIntelligenceErrorForCli(error);
+
+  if (json) {
+    console.error(JSON.stringify(buildCliMappedErrorPayload(mapped)));
+    process.exit(1);
+  }
+
+  console.error(formatMappedErrorForTerminal(mapped));
+  process.exit(1);
+}
+
+const PKG_DEPS_DESCRIPTION = `Analyze package dependencies. By default shows the flat list of
+direct runtime dependencies. Use --lifecycle all for the structured view
+(dev / peer / build / optional, plus registry-specific feature / TFM
+groups). Runtime group rows include resolved versions when available.
+--depth opts into aggregate edge / unique-package counts, conflict detection,
+and circular-dependency flags capped to that traversal depth.
+--issues computes deprecated, outdated, duplicate, and conflict analysis across
+the resolved dependency graph. Use --verbose for complete issue details.
+
+Package spec: <registry>:<name>[@<version>]. Supported registries:
+${SUPPORTED_DEPS_REGISTRIES_LIST}. Omit @<version> for the latest release. Exact Go versions may include or omit their canonical lowercase \`v\`; the backend receives the \`v\`-prefixed form. Other leading-\`v\` tag-style inputs are rejected except Swift.`;
+
+export function registerPkgDepsCommand(pkgCommand: Command): Command {
+  return pkgCommand
+    .command("deps")
+    .summary("Analyze dependencies for a package")
+    .description(PKG_DEPS_DESCRIPTION)
+    .argument("<spec>", "Package spec, e.g. npm:express or npm:express@4.18.0")
+    .option(
+      "-l, --lifecycle <phases>",
+      "Dependency lifecycle breadth (runtime, development, build, peer, optional, all; comma-separated for multi-select except all).",
+    )
+    .option(
+      "--depth <n>",
+      "Show transitive output and cap traversal depth (1-10). Omit for direct dependencies only.",
+    )
+    .option(
+      "--issues",
+      "Compute deprecated, outdated, duplicate, and conflict analysis across the resolved dependency graph.",
+    )
+    .option(
+      "-v, --verbose",
+      "Show complete group metadata, issue rows, and conflict importer details",
+    )
+    .option("--json", "Emit the lean JSON envelope")
+    .action(async (spec: string, options: PkgDepsCommandOptions) => {
+      const deps = await createContainer();
+      await pkgDepsAction(spec, options, {
+        packageIntelligenceService: deps.packageIntelligenceService,
+        codeNavigationUrl: deps.codeNavigationUrl,
+        hasValidToken: deps.hasValidToken,
+        mcpUrl: deps.mcpUrl,
+      });
+    });
+}

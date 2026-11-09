@@ -1,0 +1,467 @@
+import { describe, expect, it } from "bun:test";
+import { colors } from "./colors.js";
+import type { UnifiedSearchHitPresentation } from "./unified-search-response.js";
+import { renderUnifiedSearchSuccess } from "./unified-search-text.js";
+
+const sha = "0123456789abcdef0123456789abcdef01234567";
+
+function semanticHit(): UnifiedSearchHitPresentation {
+  return {
+    type: "repository_code",
+    target: "npm:pkg@1.2.3",
+    readTarget: {
+      target: "npm:pkg@1.2.3",
+      path: "src/client.ts",
+      startLine: 120,
+      endLine: 165,
+    },
+    title: "send",
+    followUp: "DO NOT PRINT THIS COMMAND",
+    locator: { filePath: "src/client.ts", startLine: 1, endLine: 9 },
+    repositoryEvidence: {
+      semanticContext: {
+        scopeChainTruncated: false,
+        scopes: [
+          {
+            name: "Client",
+            qualifiedPath: "Client",
+            kind: "class",
+            parentQualifiedPath: null,
+            declarationStartLine: 20,
+            declarationEndLine: 620,
+            parameterNames: [],
+            returnType: null,
+            symbolRef: "outer-ref",
+          },
+          {
+            name: "send",
+            qualifiedPath: "Client.send",
+            kind: "method",
+            parentQualifiedPath: "Client",
+            declarationStartLine: 120,
+            declarationEndLine: 165,
+            parameterNames: ["request"],
+            returnType: "Response",
+            symbolRef: "inner-ref",
+          },
+        ],
+        preferredRead: {
+          targetLabel: "npm:pkg@1.2.3",
+          registry: "npm",
+          packageName: "pkg",
+          version: "1.2.3",
+          repoUrl: "https://github.com/owner/monorepo",
+          commitSha: sha,
+          gitRef: sha,
+          requestedRef: "main",
+          filePath: "src/client.ts",
+          repositoryFilePath: "packages/pkg/src/client.ts",
+          startLine: 120,
+          endLine: 165,
+        },
+      },
+      matchedSource: {
+        startLine: 142,
+        endLine: 145,
+        matchLine: 143,
+        rangeKind: "match_window",
+        matchSpansTruncated: false,
+        linesOmittedBefore: false,
+        linesOmittedAfter: false,
+        lines: [
+          {
+            lineNumber: 142,
+            text: "    const response = await transport(request);",
+            highlights: [],
+            prefixTruncated: false,
+            suffixTruncated: false,
+          },
+          {
+            lineNumber: 143,
+            text: "    return response;",
+            highlights: [[11, 19]],
+            prefixTruncated: false,
+            suffixTruncated: false,
+          },
+          {
+            lineNumber: 145,
+            text: "",
+            highlights: [],
+            prefixTruncated: false,
+            suffixTruncated: false,
+          },
+        ],
+      },
+    },
+  };
+}
+
+function render(
+  hit: UnifiedSearchHitPresentation,
+  useColors = false,
+  rawQuery = "response",
+): string {
+  return renderUnifiedSearchSuccess(
+    {
+      query: { raw: rawQuery },
+      completed: true,
+      partialResults: false,
+      hasMore: false,
+      results: [hit],
+    },
+    { width: 40, useColors },
+  );
+}
+
+describe("semantic search text", () => {
+  it("omits unverified code titles with and without semantic scopes", () => {
+    for (const title of ["r", "layer"]) {
+      const hit = semanticHit();
+      hit.title = title;
+      expect(render(hit)).not.toContain(` - ${title}`);
+      expect(render(hit)).not.toMatch(new RegExp(`^\\s+${title}$`, "m"));
+      hit.repositoryEvidence!.semanticContext = null;
+      expect(render(hit)).not.toContain(` - ${title}`);
+      expect(render(hit)).not.toMatch(new RegExp(`^\\s+${title}$`, "m"));
+    }
+  });
+
+  it("preserves repository documentation headings", () => {
+    const hit = semanticHit();
+    hit.type = "repository_doc";
+    hit.title = "Session storage";
+    expect(render(hit)).toContain("Session storage");
+  });
+
+  it("renders readable scopes and literal numbered source without a read command", () => {
+    const text = render(semanticHit());
+    expect(text).toContain(
+      "[1] npm:pkg@1.2.3 src/client.ts:142-145 [repo code]",
+    );
+    expect(text).toContain("  - class Client | lines 20-620");
+    expect(text).toContain("    - method Client.send | lines 120-165");
+    expect(text).toContain(
+      "  142 |     const response = await transport(request);",
+    );
+    expect(text).toContain("> 143 |     return response;");
+    expect(text).toContain("  145 | ");
+    expect(text).not.toContain("144 |");
+    expect(text).not.toContain("LEGACY SUMMARY CONTEXT");
+    expect(text).not.toContain("DO NOT PRINT");
+    expect(text).not.toContain("Read context");
+    expect(text).not.toContain("outer-ref");
+    expect(text).not.toContain("wrong-relative-path");
+  });
+
+  it("uses singular line for a single-line declaration", () => {
+    const hit = semanticHit();
+    hit.repositoryEvidence!.semanticContext!.scopes[1]!.declarationEndLine =
+      120;
+    expect(render(hit)).toContain("    - method Client.send | line 120");
+    expect(render(hit)).toContain("  - class Client | lines 20-620");
+  });
+
+  it("preserves repository producer attribution without exposing the served read action", () => {
+    const hit = semanticHit();
+    const read = hit.repositoryEvidence!.semanticContext!.preferredRead;
+    hit.readTarget = {
+      target: `github:owner/monorepo@${sha}`,
+      path: "packages/pkg/src/client.ts",
+      startLine: 120,
+      endLine: 165,
+    };
+    hit.target = "github:owner/monorepo@main";
+    hit.locator.filePath = "packages/pkg/src/client.ts";
+    read.registry = null;
+    read.packageName = null;
+    read.version = null;
+    expect(render(hit)).toContain(
+      "github:owner/monorepo@main packages/pkg/src/client.ts:142-145",
+    );
+    expect(render(hit).split("\n\nRead:")[0]).not.toContain("read target=");
+  });
+
+  it.each(["github:owner/monorepo@main", "owner/monorepo@main"])(
+    "preserves producer header %s while omitting the served read action",
+    (targetLabel) => {
+      const hit = semanticHit();
+      const read = hit.repositoryEvidence!.semanticContext!.preferredRead;
+      hit.readTarget = {
+        target: `github:owner/monorepo@${sha}`,
+        path: "packages/pkg/src/client.ts",
+        startLine: 120,
+        endLine: 165,
+      };
+      hit.target = targetLabel;
+      hit.locator.filePath = "packages/pkg/src/client.ts";
+      read.targetLabel = targetLabel;
+      read.version = sha;
+      const text = render(hit);
+      expect(text).toContain(
+        `${targetLabel} packages/pkg/src/client.ts:142-145`,
+      );
+      expect(text.split("\n\nRead:")[0]).not.toContain("read target=");
+      expect(text).not.toContain("npm:pkg");
+      expect(text).not.toContain("#main");
+    },
+  );
+
+  it("renders nullable semantic and source branches independently", () => {
+    const sourceOnly = semanticHit();
+    sourceOnly.repositoryEvidence!.semanticContext = null;
+    expect(render(sourceOnly)).toContain("> 143 |     return response;");
+    expect(render(sourceOnly)).not.toContain("class Client");
+    const scopesOnly = semanticHit();
+    scopesOnly.repositoryEvidence!.matchedSource = null;
+    expect(render(scopesOnly)).toContain(
+      "src/client.ts:120-165 [repo code, candidate]",
+    );
+    expect(render(scopesOnly)).not.toContain("- method Client.send");
+    expect(render(scopesOnly)).not.toContain("LEGACY SUMMARY CONTEXT");
+    expect(render(scopesOnly)).not.toContain("Snippet unavailable");
+    const neither = semanticHit();
+    neither.repositoryEvidence = null;
+    expect(render(neither)).toContain("Snippet unavailable");
+    expect(render(neither)).not.toContain("LEGACY SUMMARY CONTEXT");
+  });
+
+  it("keeps scope gaps, source crops, and grapheme highlights distinct", () => {
+    const hit = semanticHit();
+    hit.repositoryEvidence!.semanticContext!.scopeChainTruncated = true;
+    const source = hit.repositoryEvidence!.matchedSource!;
+    source.linesOmittedBefore = true;
+    source.linesOmittedAfter = true;
+    source.matchSpansTruncated = true;
+    source.lines = [
+      {
+        lineNumber: 143,
+        text: "e\u0301👩‍💻 hit",
+        highlights: [[3, 6]],
+        prefixTruncated: true,
+        suffixTruncated: true,
+      },
+    ];
+    const plain = render(hit);
+    const colored = render(hit, true);
+    expect(plain).toContain("... outer scopes omitted");
+    expect(plain.indexOf("... outer scopes omitted")).toBeLessThan(
+      plain.indexOf("- class Client"),
+    );
+    expect(plain).toContain("... lines omitted before");
+    expect(plain).toContain("> 143 | ...e\u0301👩‍💻 hit...");
+    expect(plain).toContain("... lines omitted after");
+    expect(plain).toContain("Some matches are not highlighted");
+    expect(colored).toContain(
+      `e\u0301👩‍💻 ${colors.bold}${colors.yellow}hit${colors.reset}`,
+    );
+    expect(
+      colored.replace(
+        new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"),
+        "",
+      ),
+    ).toBe(plain);
+  });
+
+  it("renders crawled preview while symbol navigation has no source body", () => {
+    const hit = semanticHit();
+    hit.type = "documentation_page";
+    hit.repositoryEvidence = null;
+    hit.title = "Independent title";
+    hit.documentationPreview = {
+      text: "Current documentation preview",
+      highlights: [],
+    };
+    expect(render(hit)).toContain("Current documentation preview");
+    hit.type = "repository_symbol";
+    hit.documentationPreview = null;
+    expect(render(hit)).not.toContain("Current documentation preview");
+  });
+});
+
+describe("v31 search presentation", () => {
+  it("keeps path-only candidates to a file header", () => {
+    const hit = semanticHit();
+    hit.repositoryEvidence!.bm25MatchFields = ["FILE_PATH"];
+    hit.repositoryEvidence!.matchedSource = null;
+    const text = render(hit);
+    expect(text).toContain(
+      "src/client.ts:120-165 [repo code, candidate; indexed: path]",
+    );
+    expect(text).not.toContain("send");
+    expect(text).not.toContain("return response");
+    expect(text).not.toContain("Snippet unavailable");
+    expect(text.split("\n\nRead:")[0]!.split("\n")).toHaveLength(3);
+    hit.type = "repository_doc";
+    hit.title = "Arbitrary heading";
+    expect(render(hit)).toContain(
+      "src/client.ts:120-165 [repo doc, candidate; indexed: path]",
+    );
+    expect(render(hit)).not.toContain("Arbitrary heading");
+  });
+
+  it.each([
+    { fields: null },
+    { fields: ["FILE_PATH"] },
+    { fields: ["FILE_PATH", "SOURCE_IDENTIFIER"] },
+  ] as const)(
+    "keeps proven source independent of indexed provenance %j without captions",
+    ({ fields }) => {
+      const hit = semanticHit();
+      hit.repositoryEvidence!.bm25MatchFields =
+        fields === null ? null : [...fields];
+      const text = render(hit);
+      expect(text).toContain("src/client.ts:142-145 [repo code]");
+      expect(text).toContain("> 143 |     return response;");
+      expect(text).not.toContain("path match");
+      expect(text).not.toContain("Matched source");
+      expect(text).not.toContain("Indexed matches");
+    },
+  );
+
+  it.each([
+    { fields: null, label: "candidate" },
+    { fields: ["SOURCE_IDENTIFIER"], label: "candidate; indexed: identifiers" },
+    {
+      fields: ["FILE_PATH", "DOCUMENTATION"],
+      label: "candidate; indexed: path/docs",
+    },
+  ] as const)(
+    "keeps unproven source out of candidate header for provenance %j",
+    ({ fields, label }) => {
+      const hit = semanticHit();
+      hit.repositoryEvidence!.bm25MatchFields =
+        fields === null ? null : [...fields];
+      hit.repositoryEvidence!.matchedSource = null;
+      const text = render(hit);
+      expect(text).toContain(`src/client.ts:120-165 [repo code, ${label}]`);
+      expect(text).not.toContain("LEGACY SUMMARY CONTEXT");
+      expect(text).not.toContain("- method Client.send");
+      expect(text).not.toContain("return response");
+      expect(text).not.toContain("> 143 |");
+      expect(text).not.toContain("src/client.ts:1-9");
+      expect(text).not.toContain("src/client.ts:1-9");
+    },
+  );
+
+  it("shows only literal query fragments visible in contributing fields", () => {
+    const hit = semanticHit();
+    hit.title = "responseHandler";
+    hit.repositoryEvidence!.matchedSource = null;
+    hit.repositoryEvidence!.bm25MatchFields = [
+      "SYMBOL_NAME",
+      "SOURCE_IDENTIFIER",
+    ];
+    const text = render(hit);
+    expect(text).toContain("[repo code, candidate; visible terms: response]");
+    expect(text).not.toContain("responseHandler");
+    expect(text).not.toContain("Indexed query terms");
+    hit.repositoryEvidence!.bm25MatchFields = ["SOURCE_IDENTIFIER"];
+    expect(render(hit)).not.toContain("responseHandler");
+    expect(render(hit)).toContain(
+      "[repo code, candidate; indexed: identifiers]",
+    );
+  });
+
+  it("does not parse query syntax into claimed visible terms", () => {
+    const hit = semanticHit();
+    hit.title = "clear auth";
+    hit.repositoryEvidence!.matchedSource = null;
+    hit.repositoryEvidence!.bm25MatchFields = ["SYMBOL_NAME"];
+    const text = render(hit, false, "clear OR auth");
+    expect(text).toContain("[repo code, candidate; indexed: name]");
+    expect(text).not.toContain("visible terms");
+  });
+
+  it("checks the producer preview path independently of an associated action", () => {
+    const hit = semanticHit();
+    hit.repositoryEvidence!.matchedSource = null;
+    hit.repositoryEvidence!.bm25MatchFields = ["FILE_PATH"];
+    hit.readTarget = { ...hit.readTarget!, path: "wrong-relative-path.ts" };
+    const text = render(hit, false, "wrongRelative");
+    expect(text).toContain(
+      "src/client.ts:120-165 [repo code, candidate; indexed: path]",
+    );
+    expect(text).not.toContain("visible terms");
+  });
+
+  it("keeps the candidate file header without proven source", () => {
+    const hit = semanticHit();
+    hit.repositoryEvidence!.matchedSource = null;
+    expect(render(hit)).toContain(
+      "src/client.ts:120-165 [repo code, candidate]",
+    );
+    expect(render(hit)).not.toContain("Snippet unavailable");
+  });
+
+  it("keeps explicit symbol coordinates when repository evidence has no matched source", () => {
+    const hit = semanticHit();
+    hit.type = "repository_symbol";
+    hit.repositoryEvidence!.matchedSource = null;
+    expect(render(hit)).toContain("src/client.ts:1-9 [repo symbol]");
+  });
+
+  it("marks an older injected service hit without evidence as unavailable", () => {
+    const hit = semanticHit();
+    delete hit.repositoryEvidence;
+    expect(render(hit)).toContain("Snippet unavailable");
+  });
+
+  it("uses matched bounds for proven source", () => {
+    const hit = semanticHit();
+    expect(render(hit)).toContain("src/client.ts:142-145");
+  });
+
+  it.each(["## é👩‍💻", "é👩‍💻\n======"])(
+    "converts preview graphemes before trimming a duplicate heading: %s",
+    (heading) => {
+      const hit = semanticHit();
+      hit.type = "documentation_page";
+      hit.title = "é👩‍💻";
+      hit.repositoryEvidence = null;
+      const preview = `${heading}\n\né👩‍💻 target after`;
+      const segmenter = new Intl.Segmenter(undefined, {
+        granularity: "grapheme",
+      });
+      const start = [
+        ...segmenter.segment(preview.slice(0, preview.indexOf("target"))),
+      ].length;
+      hit.documentationPreview = {
+        text: preview,
+        highlights: [[start, start + 6]],
+      };
+      const plain = render(hit);
+      const colored = render(hit, true);
+      expect(plain).toContain("  é👩‍💻 target after");
+      expect(plain).not.toContain("LEGACY SUMMARY CONTEXT");
+      expect(plain).not.toContain("======");
+      expect(colored).toContain(
+        `é👩‍💻 ${colors.bold}${colors.yellow}target${colors.reset} after`,
+      );
+      expect(Bun.stripANSI(colored)).toBe(plain);
+    },
+  );
+
+  it("wraps a preview highlight across lines and preserves empty highlight lists", () => {
+    const hit = semanticHit();
+    hit.type = "documentation_page";
+    hit.repositoryEvidence = null;
+    hit.title = "Heading";
+    hit.documentationPreview = {
+      text: `🙂 ${"matched ".repeat(10).trim()}`,
+      highlights: [[2, 81]],
+    };
+    const colored = render(hit, true);
+    expect(
+      colored
+        .split("\n")
+        .filter((line) => line.includes(`${colors.yellow}matched`)).length,
+    ).toBeGreaterThan(1);
+    hit.documentationPreview.highlights = [];
+    const plain = render(hit);
+    expect(plain).toContain("🙂 matched");
+    expect(plain).not.toContain("LEGACY SUMMARY CONTEXT");
+    hit.documentationPreview = null;
+    expect(render(hit)).not.toContain("LEGACY SUMMARY CONTEXT");
+    expect(render(hit)).not.toContain("Snippet unavailable");
+  });
+});

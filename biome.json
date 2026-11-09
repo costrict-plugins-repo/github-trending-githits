@@ -1,0 +1,54 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "files": {
+    "includes": [
+      "**/*.ts",
+      "**/*.json",
+      "**/*.yml",
+      "**/*.yaml",
+      "!.agent-eval",
+      "!dist",
+      "!**/dist",
+      "!node_modules"
+    ],
+    "ignoreUnknown": true
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "linter": {
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "patterns": [
+              {
+                "group": ["**/services/index.js"],
+                "message": "Import from the defining service module instead of the services barrel."
+              },
+              {
+                "group": ["**/shared/index.js"],
+                "message": "Import from the defining shared module instead of the shared barrel."
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,1691 @@
+/**
+ * Line-oriented text renderer for unified `search` MCP responses.
+ *
+ * Designed for agent context efficiency: matched source with semantic scope
+ * coordinates and no JSON scaffolding. This is the tool's default response
+ * format — programmatic / parity callers opt into the structured
+ * JSON envelope by passing `format: "json"`.
+ *
+ * Compact punctuation and line-oriented output keep the response easy to scan
+ * across terminal and agent clients.
+ *
+ * `text-v1` names the compact representation, not an exact-prose compatibility
+ * boundary. Its lifecycle, ordering, action, and hit-anatomy invariants are
+ * covered by structural tests in `unified-search-text.test.ts`; JSON remains
+ * the stable structured boundary for programmatic callers.
+ */
+
+import { colors, dim, highlight, highlightRanges } from "./colors.js";
+import { renderPreparationSection } from "./indexing-estimates-text.js";
+import type { MappedError } from "./mapped-error.js";
+import { formatMappedErrorText } from "./mapped-error-text.js";
+import { renderReadTarget } from "./read-target-text.js";
+import { parseRepositoryTargetSpec } from "./repository-target.js";
+import {
+  appendSearchGrepFooter,
+  footerAction,
+  footerProse,
+} from "./search-grep-output-text.js";
+import {
+  formatProvenanceRow,
+  formatRequestedIndexingExplanation,
+  formatRequestedProvenance,
+  renderSourceSection,
+} from "./source-provenance-text.js";
+import { buildSourceCorrespondenceNotes } from "./target-resolution.js";
+import { wrapTerminalProse } from "./terminal-text.js";
+import {
+  projectUnifiedSearchPresentation,
+  targetDisplayFamilyKey,
+  type UnifiedSearchAction,
+  type UnifiedSearchPresentation,
+  type UnifiedSearchSourceEntry,
+  type UnifiedSearchSourceGroup,
+  type UnifiedSearchSourceKind,
+  type UnifiedSearchTargetGroup,
+  type UnifiedSearchTargetRecovery,
+  type UnifiedSearchTerminalReason,
+  type UnifiedSearchTrustLimit,
+  type UnifiedSearchWarning,
+} from "./unified-search-presentation.js";
+import type {
+  UnifiedSearchCompletedPresentation,
+  UnifiedSearchErrorPayload,
+  UnifiedSearchHitPresentation,
+  UnifiedSearchIncompletePresentation,
+} from "./unified-search-response.js";
+
+const DEFAULT_TEXT_WIDTH = 80;
+
+type SearchSuccessPayload =
+  | UnifiedSearchCompletedPresentation
+  | UnifiedSearchIncompletePresentation;
+
+/** Render a successful unified-search payload as line-oriented text. */
+export function renderUnifiedSearchSuccess(
+  payload: SearchSuccessPayload,
+  options: UnifiedSearchTextOptions = {},
+): string {
+  return renderUnifiedSearchPresentationText(
+    projectUnifiedSearchPresentation(payload),
+    payload,
+    options,
+  );
+}
+
+export interface UnifiedSearchTextOptions {
+  /** Apply terminal emphasis; false keeps the MCP/CLI wording plain. */
+  useColors?: boolean;
+  /** Surface-native syntax for search continuation actions. */
+  actionSyntax?: "mcp" | "cli";
+  /** Full output width, including indentation. Defaults to 80 columns. */
+  width?: number;
+}
+
+export interface UnifiedSearchTextResult {
+  results: UnifiedSearchHitPresentation[];
+  nextOffset?: number;
+}
+
+/** Render the shared semantic projection while callers supply only result anatomy. */
+export function renderUnifiedSearchPresentationText(
+  presentation: UnifiedSearchPresentation,
+  result: UnifiedSearchTextResult,
+  options: UnifiedSearchTextOptions = {},
+): string {
+  const settings = normalizeTextOptions(options);
+  const lines = wrapTerminalProse(
+    formatPresentationOutcome(presentation, result.results),
+    settings.width,
+  ).map((line) => styleOutcome(line, presentation, settings.useColors));
+  const notice = formatPresentationNotice(presentation);
+  if (notice) lines.push(...wrapTerminalProse(notice, settings.width));
+  appendPresentationContext(lines, presentation, settings);
+
+  if (result.results.length > 0) {
+    lines.push("");
+    appendUnifiedSearchHits(
+      lines,
+      result.results,
+      identifierQueryFragments(presentation.query?.raw),
+      settings,
+    );
+  }
+
+  appendPresentationAction(lines, presentation, result, settings);
+  return lines.join("\n");
+}
+
+interface NormalizedTextOptions {
+  useColors: boolean;
+  actionSyntax: "mcp" | "cli";
+  width: number;
+}
+
+function normalizeTextOptions(
+  options: UnifiedSearchTextOptions,
+): NormalizedTextOptions {
+  return {
+    useColors: options.useColors ?? false,
+    actionSyntax: options.actionSyntax ?? "mcp",
+    width:
+      typeof options.width === "number" && Number.isFinite(options.width)
+        ? Math.max(20, Math.floor(options.width))
+        : DEFAULT_TEXT_WIDTH,
+  };
+}
+
+function formatPresentationOutcome(
+  presentation: UnifiedSearchPresentation,
+  results: UnifiedSearchHitPresentation[],
+): string {
+  if (!results.length) {
+    if (presentation.hasMore) return "No results on this page.";
+    if (presentation.lifecycle.kind === "active")
+      return "No results available yet.";
+    return presentation.availability.hasSnapshot
+      ? "No results found."
+      : "No result snapshot available.";
+  }
+  const counts = new Map<string, number>();
+  for (const result of results) {
+    const label =
+      result.type === "repository_code"
+        ? "code result"
+        : result.type === "documentation_page"
+          ? "documentation result"
+          : result.type === "repository_doc"
+            ? "repository documentation result"
+            : result.type === "repository_symbol"
+              ? "symbol result"
+              : "result";
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const parts = [...counts].map(
+    ([label, count]) => `${count} ${label}${count === 1 ? "" : "s"}`,
+  );
+  const last = parts.pop();
+  return `Found ${parts.length ? `${parts.join(", ")} and ` : ""}${last}.`;
+}
+
+/** Emit a notice only when source/preparation sections cannot convey the fact. */
+function formatPresentationNotice(
+  presentation: UnifiedSearchPresentation,
+): string | undefined {
+  const scopeExplanation =
+    Boolean(presentation.indexingEstimates?.length) ||
+    presentation.targetGroups.some(
+      (group) =>
+        group.recovery ||
+        group.sources.some((source) =>
+          source.entries.some((entry) => entry.state !== "searched"),
+        ) ||
+        group.trustLimits.some(
+          (limit) =>
+            ["source", "coverage", "stale", "provisional"].includes(
+              limit.kind,
+            ) ||
+            (limit.kind === "repository_snapshot" &&
+              (limit.requestedCommitDiffers || limit.indexingRequestedRef)),
+        ),
+    );
+  const incomplete =
+    presentation.availability.partialResults && !scopeExplanation;
+  const lifecycle = presentation.lifecycle;
+  const state =
+    lifecycle.kind === "terminal"
+      ? lifecycle.status === "FAILED"
+        ? "Search failed"
+        : lifecycle.status === "TIMEOUT"
+          ? "Search timed out"
+          : "Search was deferred"
+      : lifecycle.kind === "unknown"
+        ? "Search status is unknown"
+        : lifecycle.kind === "active" && !scopeExplanation && !incomplete
+          ? lifecycle.status === "INDEXING"
+            ? "Requested sources are still indexing"
+            : lifecycle.status === "PENDING"
+              ? "Search is preparing requested sources"
+              : "Search is still running"
+          : undefined;
+  if (state)
+    return `${state}${incomplete ? "; these results do not cover the full request" : ""}.`;
+  return incomplete
+    ? "These results do not cover the full request."
+    : undefined;
+}
+
+function styleOutcome(
+  value: string,
+  presentation: UnifiedSearchPresentation,
+  useColors: boolean,
+): string {
+  if (!useColors) return value;
+  if (
+    presentation.lifecycle.kind === "active" ||
+    (presentation.lifecycle.kind === "terminal" &&
+      presentation.lifecycle.status !== "FAILED")
+  ) {
+    return `${colors.bold}${colors.yellow}${value}${colors.reset}`;
+  }
+  if (
+    presentation.lifecycle.kind === "terminal" &&
+    presentation.lifecycle.status === "FAILED"
+  ) {
+    return `${colors.bold}${colors.red}${value}${colors.reset}`;
+  }
+  return `${colors.bold}${value}${colors.reset}`;
+}
+
+function appendPresentationContext(
+  lines: string[],
+  presentation: UnifiedSearchPresentation,
+  options: NormalizedTextOptions,
+): void {
+  const sources = presentation.provenance.flatMap((record) => record.sources);
+  if (sources.length)
+    lines.push("", ...renderSourceSection(sources, { width: options.width }));
+  const historical = presentation.lifecycle.kind !== "active";
+  const indexedAlternatives = presentation.targetGroups.flatMap((group) => {
+    const alternatives = group.alternatives;
+    if (!alternatives?.target || group.recovery) return [];
+    const summary = formatTargetAlternatives({
+      ...alternatives,
+      suggestedRefs: [],
+    });
+    return summary ? [{ target: alternatives.target, summary }] : [];
+  });
+  lines.push(
+    ...renderPreparationSection(presentation.indexingEstimates, {
+      indexedAlternatives,
+      repositoryState: historical ? "indexing when observed" : "indexing",
+      resolutions: presentation.provenance.flatMap((record) =>
+        record.resolution ? [record.resolution] : [],
+      ),
+      width: options.width,
+    }),
+  );
+  const resolutionDetails = [
+    ...new Set(
+      presentation.provenance.flatMap((record) => {
+        return [
+          ...buildSourceCorrespondenceNotes(record.resolution),
+          formatRequestedProvenance(
+            record.resolution,
+            presentation.indexingEstimates,
+          ),
+          formatRequestedIndexingExplanation(
+            record.resolution,
+            presentation.indexingEstimates,
+            historical ? "indexing when observed" : "indexing",
+          ),
+        ].filter((fact): fact is string => Boolean(fact));
+      }),
+    ),
+  ];
+  for (const fact of resolutionDetails)
+    lines.push(...wrapTerminalProse(fact, options.width, "  "));
+  for (const group of presentation.targetGroups) {
+    const renderedSources = presentation.provenance.some(
+      (record) =>
+        record.sources.length &&
+        [
+          group.identity.requested,
+          group.identity.served,
+          group.identity.fresh,
+          ...group.sources.flatMap((source) =>
+            source.entries.flatMap((entry) => [
+              entry.searchTarget,
+              entry.requestedTarget,
+            ]),
+          ),
+        ].includes(record.target),
+    );
+    if (
+      renderedSources &&
+      !group.trustLimits.some(
+        (limit) => limit.kind === "repository_snapshot",
+      ) &&
+      group.identity.fresh &&
+      group.identity.fresh !== group.identity.served &&
+      formatUsingSegment(group)
+    ) {
+      lines.push(
+        ...wrapTerminalProse(
+          `Requested: ${formatProvenanceRow(group.identity.fresh, [historical ? "indexing when observed" : "indexing"])}`,
+          options.width,
+          "  ",
+        ),
+      );
+    }
+    const preparingGroup =
+      presentation.indexingEstimates?.some((entry) =>
+        entry.targets.some((target) =>
+          [
+            group.identity.requested,
+            group.identity.served,
+            group.identity.fresh,
+            ...group.sources.flatMap((source) =>
+              source.entries.flatMap((entry) => [
+                entry.target,
+                entry.searchTarget,
+                ...(entry.targetAliases ?? []),
+              ]),
+            ),
+          ].includes(target),
+        ),
+      ) ?? false;
+    appendPresentationTargetGroup(
+      lines,
+      group,
+      options,
+      renderedSources,
+      preparingGroup,
+      historical,
+      presentation.indexingEstimates?.some((entry) =>
+        entry.targets.includes(group.alternatives?.target ?? ""),
+      ) ?? false,
+    );
+  }
+  appendPresentationWarnings(lines, presentation.warnings, options);
+}
+
+function sourceKindRank(kind: UnifiedSearchSourceKind): number {
+  switch (kind) {
+    case "code":
+      return 0;
+    case "symbols":
+      return 1;
+    case "repository_docs":
+      return 2;
+    case "site_docs":
+      return 3;
+    case "docs":
+      return 4;
+  }
+}
+
+function appendPresentationTargetGroup(
+  lines: string[],
+  group: UnifiedSearchTargetGroup,
+  options: NormalizedTextOptions,
+  renderedSources: boolean,
+  renderedPreparation: boolean,
+  historical: boolean,
+  renderedAlternatives: boolean,
+): void {
+  const identity = `- ${renderedSources || renderedPreparation ? (group.identity.requested ?? formatTargetGroupIdentity(group)) : formatTargetGroupIdentity(group)}`;
+
+  const details: string[] = [];
+  const using = renderedSources ? undefined : formatUsingSegment(group);
+  if (using) details.push(using);
+  const snapshots = group.trustLimits.filter(
+    (limit) => limit.kind === "repository_snapshot",
+  );
+  for (const snapshot of renderedSources ? [] : snapshots) {
+    if (snapshot.requestedCommitDiffers && snapshot.requestedRef) {
+      details.push(
+        `requested ${snapshot.requestedRef} resolves to a different commit${snapshot.requestedCommitDate ? ` (committed ${snapshot.requestedCommitDate})` : ""}${snapshot.indexingRequestedRef === snapshot.requestedRef ? " and is indexing" : ""}`,
+      );
+    }
+    if (
+      snapshot.indexingRequestedRef &&
+      !(
+        snapshot.requestedCommitDiffers &&
+        snapshot.indexingRequestedRef === snapshot.requestedRef
+      )
+    )
+      details.push(`${snapshot.indexingRequestedRef} is indexing`);
+  }
+
+  const searched = renderedSources
+    ? undefined
+    : formatSourceStateSegment(group, "searched");
+  if (searched) details.push(`searched: ${searched}`);
+  const indexing = renderedPreparation
+    ? undefined
+    : formatSourceStateSegment(group, "waiting");
+  if (indexing)
+    details.push(
+      `${historical ? "indexing when observed" : "indexing"}: ${indexing}`,
+    );
+
+  const unavailable = formatUnavailableSegment(group);
+  if (unavailable) details.push(unavailable);
+
+  const available = formatAvailableSegment(group);
+  if (available) details.push(`available: ${available}`);
+
+  if (group.recovery === undefined) {
+    const indexed = formatTargetAlternatives(
+      renderedAlternatives && group.alternatives
+        ? { ...group.alternatives, versions: [], refs: [] }
+        : group.alternatives,
+    );
+    if (indexed) details.push(`indexed: ${indexed}`);
+  }
+
+  const constraints = formatTargetConstraints(group);
+  if (constraints) details.push(constraints);
+
+  if (
+    !renderedSources &&
+    !renderedPreparation &&
+    details.length === 0 &&
+    group.freshnessKind !== undefined
+  ) {
+    details.push(formatTargetStatus(group.freshnessKind));
+  }
+
+  if (
+    details.length ||
+    group.recovery ||
+    (!renderedSources && !renderedPreparation)
+  ) {
+    lines.push("", options.useColors ? highlight(identity, true) : identity);
+  }
+  if (details.length > 0) {
+    lines.push(...wrapHangingText(details.join("; "), "  ", options.width));
+  }
+  if (group.recovery) {
+    const recovery = formatTargetRecovery(group.recovery, group);
+    lines.push(
+      ...wrapHangingText(recovery, "  ", options.width).map((line) =>
+        options.useColors ? `${colors.yellow}${line}${colors.reset}` : line,
+      ),
+    );
+  }
+}
+
+function formatTargetStatus(
+  freshness: NonNullable<UnifiedSearchTargetGroup["freshnessKind"]>,
+): string {
+  switch (freshness) {
+    case "current":
+      return "ready";
+    case "pending":
+      return "pending";
+    case "provisional":
+      return "provisional";
+    case "stale":
+      return "older snapshot";
+    case "indexing":
+      return "indexing";
+  }
+}
+
+function formatUsingSegment(
+  group: UnifiedSearchTargetGroup,
+): string | undefined {
+  const snapshots = group.trustLimits.filter(
+    (limit) => limit.kind === "repository_snapshot",
+  );
+  if (snapshots.length > 0) {
+    return [
+      ...new Set(
+        snapshots.map((snapshot) => {
+          const provenance = [
+            ...(snapshot.servedCommitDate
+              ? [`committed ${snapshot.servedCommitDate}`]
+              : []),
+            ...(snapshot.indexedRef
+              ? [`indexed from ref ${snapshot.indexedRef}`]
+              : []),
+          ];
+          return `commit: ${snapshot.commitTarget}${provenance.length ? ` (${provenance.join(", ")})` : ""}`;
+        }),
+      ),
+    ].join("; ");
+  }
+  const stale = group.trustLimits
+    .filter(
+      (limit): limit is Extract<UnifiedSearchTrustLimit, { kind: "stale" }> =>
+        limit.kind === "stale",
+    )
+    .sort(
+      (left, right) =>
+        Number(Boolean(right.servedTarget)) +
+        Number(Boolean(right.freshTarget)) -
+        Number(Boolean(left.servedTarget)) -
+        Number(Boolean(left.freshTarget)),
+    )[0];
+  const identityIsStale =
+    !stale &&
+    Boolean(group.identity.served) &&
+    (group.freshnessKind === "stale" || group.freshnessKind === "indexing") &&
+    group.identity.served !==
+      (group.identity.fresh ?? group.identity.requested);
+  if (!stale && !identityIsStale) {
+    return group.trustLimits.some((limit) => limit.kind === "provisional")
+      ? "using: provisional snapshot"
+      : undefined;
+  }
+  const served = stale?.servedTarget ?? stale?.target ?? group.identity.served;
+  const fresh = stale?.freshTarget ?? group.identity.fresh;
+  return `using: ${compactRelatedTarget(group.identity.requested, served ?? "older snapshot")}${fresh ? ` while ${compactRelatedTarget(group.identity.requested, fresh)} indexes` : " (older snapshot)"}`;
+}
+
+function formatSourceStateSegment(
+  group: UnifiedSearchTargetGroup,
+  state: UnifiedSearchSourceEntry["state"],
+): string | undefined {
+  const values = group.sources
+    .flatMap((source) =>
+      source.entries
+        .filter((entry) => entry.state === state)
+        .map((entry) => ({
+          rank: sourceKindRank(source.kind),
+          value: formatGroupedSource(source, entry, group.trustLimits),
+        })),
+    )
+    .sort((left, right) => left.rank - right.rank)
+    .map((entry) => entry.value);
+  const unique = [...new Set(values)];
+  return unique.length > 0 ? unique.join(", ") : undefined;
+}
+
+function formatUnavailableSegment(
+  group: UnifiedSearchTargetGroup,
+): string | undefined {
+  const entries = group.sources.flatMap((source) =>
+    source.entries
+      .filter((entry) => entry.state === "unavailable")
+      .map((entry) => ({ source, entry })),
+  );
+  if (entries.length === 0) return undefined;
+  const mixed = group.sources.some((source) =>
+    source.entries.some(
+      (entry) => entry.state === "searched" || entry.state === "waiting",
+    ),
+  );
+  const values = entries
+    .map(({ source, entry }) => {
+      const lane = formatGroupedSource(source, entry, group.trustLimits);
+      const reason = entry.terminalReason;
+      const value = reason
+        ? `${formatTerminalReason(reason, mixed)}: ${lane}`
+        : `unavailable: ${lane}`;
+      return { rank: sourceKindRank(source.kind), value };
+    })
+    .sort((left, right) => left.rank - right.rank)
+    .map((entry) => entry.value);
+  return [...new Set(values)].join("; ");
+}
+
+function formatAvailableSegment(
+  group: UnifiedSearchTargetGroup,
+): string | undefined {
+  const values = group.sources
+    .flatMap((source) =>
+      source.entries
+        .filter((entry) => entry.state === "available_not_searched")
+        .map((entry) => ({
+          rank: sourceKindRank(source.kind),
+          value: formatGroupedSource(source, entry, group.trustLimits),
+        })),
+    )
+    .sort((left, right) => left.rank - right.rank)
+    .map((entry) => entry.value);
+  if (group.recovery === undefined) {
+    values.push(
+      ...group.siteSuggestions.flatMap((suggestion) => suggestion.suggestions),
+    );
+    if (group.siteSuggestions.some((suggestion) => suggestion.truncated)) {
+      values.push("+more");
+    }
+  }
+  const unique = [...new Set(values)];
+  return unique.length > 0 ? unique.join(", ") : undefined;
+}
+
+function formatTerminalReason(
+  reason: UnifiedSearchTerminalReason,
+  mixed: boolean,
+): string {
+  const family = reason.family === "unknown" ? "target" : reason.family;
+  if (reason.kind === "not_found") {
+    return mixed ? "not found" : `${family} not found`;
+  }
+  if (mixed) return "unresolved";
+  if (reason.specificity === "version") return "version unavailable";
+  if (reason.specificity === "ref") return "repository ref unresolved";
+  return `${family} unresolved`;
+}
+
+function formatTargetConstraints(
+  group: UnifiedSearchTargetGroup,
+): string | undefined {
+  const values = group.trustLimits.flatMap((limit) => {
+    if (limit.kind !== "constraint") return [];
+    const label = limit.constraint.replaceAll("_", " ");
+    const source = limit.source ? ` (${limit.source})` : "";
+    return [`${label}${source}: ${limit.values.join(", ")}`];
+  });
+  const unique = [...new Set(values)];
+  return unique.length > 0 ? unique.join("; ") : undefined;
+}
+
+function formatTargetRecovery(
+  recovery: UnifiedSearchTargetRecovery,
+  group: UnifiedSearchTargetGroup,
+): string {
+  if (recovery.kind === "fix") {
+    switch (recovery.family) {
+      case "package":
+        return "Fix: verify registry coordinate/version; use its public repository for repo-wide search.";
+      case "repository":
+        return "Fix: verify public repository/ref.";
+      case "site":
+        return "Fix: verify site host/path.";
+      case "unknown":
+        return "Fix: verify or replace target.";
+    }
+  }
+  if (recovery.additionalTargets.length === 0 && !recovery.truncated) {
+    return `Try: ${recovery.target}`;
+  }
+  const additional = recovery.additionalTargets.map((target) =>
+    compactRelatedTarget(group.identity.requested, target),
+  );
+  const remaining =
+    recovery.category === "version"
+      ? (group.alternatives?.versionsRemaining ?? 0)
+      : recovery.category === "ref"
+        ? (group.alternatives?.refsRemaining ?? 0) +
+          (group.alternatives?.suggestedRefsRemaining ?? 0)
+        : 0;
+  const label =
+    recovery.category === "site" ? "also suggested" : "also indexed";
+  const suffix = [
+    ...additional,
+    ...(remaining > 0
+      ? [`+${remaining}`]
+      : recovery.truncated
+        ? ["+more"]
+        : []),
+  ];
+  return `Try: ${recovery.target} (${label}: ${suffix.join(", ")})`;
+}
+
+function formatGroupedSource(
+  source: UnifiedSearchSourceGroup,
+  entry: UnifiedSearchSourceEntry,
+  trustLimits: UnifiedSearchTrustLimit[],
+): string {
+  const coverage = trustLimits.find(
+    (limit): limit is Extract<UnifiedSearchTrustLimit, { kind: "coverage" }> =>
+      limit.kind === "coverage" &&
+      limit.source === source.kind &&
+      limit.target === entry.target,
+  );
+  const coverageDetails = coverage ? formatCoverageLimit(coverage) : undefined;
+  const identity =
+    source.kind === "code"
+      ? "code"
+      : source.kind === "symbols"
+        ? "symbols"
+        : source.kind === "repository_docs"
+          ? "repository docs"
+          : source.kind === "site_docs"
+            ? `${formatDocumentationSourceIdentity(source, entry)} docs`
+            : "docs";
+  const qualifiers: string[] = [];
+  if (coverageDetails) qualifiers.push(coverageDetails);
+  if (entry.state === "searched" && hasProvisionalTrust(entry, trustLimits)) {
+    qualifiers.push("provisional");
+  }
+  return `${identity}${qualifiers.length > 0 ? ` (${qualifiers.join("; ")})` : ""}`;
+}
+
+function hasProvisionalTrust(
+  entry: UnifiedSearchSourceEntry,
+  trustLimits: UnifiedSearchTrustLimit[],
+): boolean {
+  return trustLimits.some(
+    (limit) =>
+      limit.kind === "provisional" &&
+      (!limit.target ||
+        limit.target === entry.target ||
+        limit.target === entry.searchTarget),
+  );
+}
+
+function formatDocumentationSourceIdentity(
+  group: UnifiedSearchSourceGroup,
+  entry: UnifiedSearchSourceEntry,
+): string {
+  if (group.kind === "repository_docs") {
+    return `${entry.repositoryUrl ?? entry.target}${entry.commitSha ? ` @ ${entry.commitSha}` : ""}`;
+  }
+  if (group.kind === "docs") return entry.target;
+  const siteIdentity = formatDocumentationSiteIdentity(entry.siteUrl);
+  return siteIdentity ?? entry.siteKey ?? entry.target;
+}
+
+function formatCoverageLimit(
+  limit: Extract<UnifiedSearchTrustLimit, { kind: "coverage" }>,
+): string {
+  const details: string[] = [limit.state];
+  if (typeof limit.pagesCrawled === "number") {
+    details.unshift(`${limit.pagesCrawled.toLocaleString("en-US")} pages`);
+  }
+  return details.join("; ");
+}
+
+function formatTargetGroupIdentity(group: UnifiedSearchTargetGroup): string {
+  const primary =
+    group.identity.requested ??
+    group.identity.fresh ??
+    group.identity.served ??
+    "target";
+  if (formatUsingSegment(group)) return primary;
+  const resolved = group.identity.fresh ?? group.identity.served;
+  if (resolved && resolved !== primary) {
+    return `${primary} -> ${compactRelatedTarget(primary, resolved)}`;
+  }
+  return primary;
+}
+
+function compactRelatedTarget(base: string | undefined, value: string): string {
+  if (!base) return value;
+  if (targetDisplayFamilyKey(base) !== targetDisplayFamilyKey(value)) {
+    return value;
+  }
+  try {
+    const repository = parseRepositoryTargetSpec(value);
+    if (repository.gitRef) return repository.gitRef;
+  } catch {
+    /* Continue with package-version extraction. */
+  }
+  const version = value.match(/@([^/@]+)$/)?.[1];
+  if (version) return version;
+  return value;
+}
+
+function formatTargetAlternatives(
+  alternatives: UnifiedSearchTargetGroup["alternatives"],
+): string | undefined {
+  if (!alternatives) return undefined;
+  const categories: string[] = [];
+  if (alternatives.versions.length > 0) {
+    categories.push(
+      `versions ${alternatives.versions.map((entry) => entry.version ?? entry.ref).join(", ")}${formatRemaining(alternatives.versionsRemaining)}`,
+    );
+  }
+  if (alternatives.refs.length > 0) {
+    categories.push(
+      `refs ${alternatives.refs.map((entry) => entry.ref).join(", ")}${formatRemaining(alternatives.refsRemaining)}`,
+    );
+  }
+  if (alternatives.suggestedRefs.length > 0) {
+    categories.push(
+      `suggested refs ${alternatives.suggestedRefs.map((entry) => entry.ref).join(", ")}${formatRemaining(alternatives.suggestedRefsRemaining)}`,
+    );
+  }
+  return categories.length > 0 ? categories.join(", ") : undefined;
+}
+
+function wrapHangingText(
+  text: string,
+  prefix: string,
+  width: number,
+): string[] {
+  return wrapText(text, Math.max(1, width - prefix.length)).map(
+    (line) => `${prefix}${line}`,
+  );
+}
+
+function appendPresentationWarnings(
+  lines: string[],
+  warnings: UnifiedSearchWarning[],
+  options: NormalizedTextOptions,
+): void {
+  if (warnings.length === 0) return;
+  lines.push(
+    options.useColors
+      ? `${colors.bold}${colors.yellow}Warnings:${colors.reset}`
+      : "Warnings:",
+  );
+  for (const warning of warnings) {
+    if (warning.kind === "query")
+      lines.push(
+        options.useColors
+          ? `  - ${colors.yellow}${warning.message}${colors.reset}`
+          : `  - ${warning.message}`,
+      );
+    else {
+      const label = warning.kind.replaceAll("_", " ");
+      const attribution = [warning.source, warning.target]
+        .filter((value): value is string => Boolean(value))
+        .join(" on ");
+      const source = attribution ? ` (${attribution})` : "";
+      const value = `  - ${capitalize(label)}${source}: ${warning.values.join(", ")}`;
+      lines.push(
+        options.useColors ? `${colors.yellow}${value}${colors.reset}` : value,
+      );
+    }
+  }
+}
+
+function formatRemaining(count: number): string {
+  return count > 0 ? ` (+${count} more)` : "";
+}
+
+function appendPresentationAction(
+  lines: string[],
+  presentation: UnifiedSearchPresentation,
+  result: UnifiedSearchTextResult,
+  options: NormalizedTextOptions,
+): void {
+  const action = presentation.action;
+  const useResults = "useResults" in action && action.useResults;
+  const read: string[] = [];
+  const more: string[] = [];
+  const followUp: string[] = [];
+  const prose = (value: string): string[] => footerProse(value, options.width);
+  const operand = (value: string): string =>
+    footerAction(value, options.useColors);
+  const hit = result.results.find((hit) => hit.readTarget);
+  const priorHead = presentation.targetGroups
+    .flatMap((group) => group.trustLimits)
+    .find((limit) => limit.kind === "repository_snapshot" && limit.priorHead);
+  if (hit?.readTarget) {
+    if (useResults) read.push(...prose("Use these results now; example read:"));
+    read.push(operand(renderReadTarget(hit.readTarget, options.actionSyntax)));
+  } else if (useResults) followUp.push(...prose("Use these results now."));
+  if (useResults && priorHead?.kind === "repository_snapshot") {
+    (read.length ? read : followUp).push(
+      ...prose(
+        `For a specific ref, search ${priorHead.commitTarget.replace(/@[^@]+$/, "@<ref>")}.`,
+      ),
+    );
+  }
+  if (presentation.hasMore) {
+    if (typeof result.nextOffset === "number") {
+      more.push(
+        ...prose("Repeat the original search, adding:"),
+        operand(
+          options.actionSyntax === "cli"
+            ? `--offset ${result.nextOffset}`
+            : `offset=${result.nextOffset}`,
+        ),
+      );
+    } else
+      more.push(
+        ...prose("More results are available; repeat the original search."),
+      );
+    if (presentation.lifecycle.kind === "active")
+      more.push(...prose("Results may change while this search is running."));
+  }
+  if (action.kind === "poll") {
+    if (useResults)
+      followUp.push(
+        ...prose(
+          priorHead
+            ? "If you need current HEAD, wait (hits and order may change):"
+            : "If you need updated results, wait (hits and order may change):",
+        ),
+      );
+    followUp.push(
+      operand(
+        options.actionSyntax === "cli"
+          ? `githits search-status ${action.searchRef} --wait ${action.waitTimeoutMs}`
+          : `search_status search_ref=${JSON.stringify(action.searchRef)} wait_timeout_ms=${action.waitTimeoutMs}`,
+      ),
+    );
+  } else if (action.kind === "new_search") {
+    followUp.push(
+      ...prose(
+        useResults
+          ? "For updated results, search again."
+          : "Search again later.",
+      ),
+    );
+  } else if (action.kind === "query_rewrite") {
+    followUp.push(
+      ...prose(
+        `Try: ${action.rewrites.map((rewrite) => formatRewrite(rewrite, options.actionSyntax)).join("; ")}.`,
+      ),
+    );
+  }
+  appendSearchGrepFooter(lines, { read, more, followUp }, options.useColors);
+}
+
+function formatRewrite(
+  rewrite: NonNullable<
+    Extract<UnifiedSearchAction, { kind: "query_rewrite" }>
+  >["rewrites"][number],
+  syntax: "mcp" | "cli",
+): string {
+  switch (rewrite) {
+    case "shorter_or_broader":
+      return "shorten or broaden query";
+    case "remove_filters":
+      return "remove restrictive filters";
+    case "symbol":
+      return syntax === "cli" ? "use --source symbol" : 'use source="symbol"';
+    case "code_grep":
+      return syntax === "cli" ? "use githits grep" : "use grep";
+    case "site_shorter_or_broader":
+      return "shorten or broaden site query";
+  }
+}
+
+function capitalize(value: string): string {
+  return value.length > 0
+    ? `${value[0]?.toUpperCase()}${value.slice(1)}`
+    : value;
+}
+
+/** Render an error envelope as compact text. */
+export function renderUnifiedSearchError(
+  payload: UnifiedSearchErrorPayload,
+): string {
+  return formatMappedErrorText({
+    code: payload.code as MappedError["code"],
+    message: payload.error,
+    retryable: payload.retryable,
+    details: payload.details as MappedError["details"],
+  });
+}
+
+function appendUnifiedSearchHits(
+  lines: string[],
+  hits: UnifiedSearchHitPresentation[],
+  queryFragments: string[],
+  options: NormalizedTextOptions,
+): void {
+  hits.forEach((hit, idx) => {
+    if (idx > 0) lines.push("");
+    appendHit(lines, idx + 1, hit, queryFragments, options);
+  });
+}
+
+function appendHit(
+  lines: string[],
+  index: number,
+  hit: UnifiedSearchHitPresentation,
+  queryFragments: string[],
+  options: NormalizedTextOptions,
+): void {
+  const header = formatHitHeader(hit, queryFragments);
+  const rank = `[${index}] `;
+  const prefix = renderHitHeaderPrefix(header, options.useColors);
+  const title = header.title;
+  const titleFits =
+    title === undefined ||
+    (!title.includes("\n") &&
+      rank.length + header.prefix.length + 3 + title.length <= options.width);
+  if (titleFits) {
+    lines.push(
+      `${rank}${prefix}${title === undefined ? "" : ` - ${highlightRanges(title, header.titleHighlights, options.useColors)}`}`,
+    );
+  } else {
+    lines.push(`${rank}${prefix} -`);
+    lines.push(
+      ...wrapHighlightedText(
+        title,
+        header.titleHighlights,
+        Math.max(1, options.width - 2),
+        options.useColors,
+      ).map((line) => (line.length === 0 ? "" : `  ${line}`)),
+    );
+  }
+
+  if (hit.type === "repository_code" || hit.type === "repository_doc") {
+    appendStructuralEvidence(lines, hit, options);
+    return;
+  }
+  const preview =
+    hit.type === "documentation_page" ? hit.documentationPreview : undefined;
+  const summary = prepareSummary(preview?.text, hit.title);
+  const summaryHighlights = preview
+    ? graphemeHighlightRanges(preview.text, preview.highlights)
+    : undefined;
+  if (summary) {
+    lines.push(
+      ...wrapHighlightedText(
+        summary.text,
+        shiftHighlightRanges(summaryHighlights, summary.offset),
+        Math.max(1, options.width - 2),
+        options.useColors,
+      ).map((line) => (line.length === 0 ? "" : `  ${line}`)),
+    );
+  }
+}
+
+/** Render scope facts only alongside source-exact numbered lines. */
+function appendStructuralEvidence(
+  lines: string[],
+  hit: UnifiedSearchHitPresentation,
+  options: NormalizedTextOptions,
+): void {
+  const evidence = hit.repositoryEvidence;
+  const source = evidence?.matchedSource;
+  if (!source) {
+    if (!evidence) lines.push("  Snippet unavailable");
+    return;
+  }
+  const context = evidence?.semanticContext;
+  if (context) {
+    if (context.scopeChainTruncated) lines.push("  ... outer scopes omitted");
+    context.scopes.forEach((scope, index) => {
+      const prefix = "  ".repeat(index + 1);
+      const lineLabel =
+        scope.declarationStartLine === scope.declarationEndLine
+          ? "line"
+          : "lines";
+      // Kind, identity and source coordinates form one locator, never prose.
+      lines.push(
+        `${prefix}- ${scope.kind} ${scope.qualifiedPath} | ${lineLabel} ${formatBareLineRange(scope.declarationStartLine, scope.declarationEndLine)}`,
+      );
+    });
+  }
+  if (source.linesOmittedBefore) lines.push("  ... lines omitted before");
+  const gutterWidth = String(source.endLine).length;
+  for (const line of source.lines) {
+    const marker = line.highlights.some(([from, to]) => to > from) ? ">" : " ";
+    const text = highlightSourceGraphemes(
+      line.text,
+      line.highlights,
+      options.useColors,
+    );
+    lines.push(
+      `${marker} ${String(line.lineNumber).padStart(gutterWidth)} | ${line.prefixTruncated ? "..." : ""}${text}${line.suffixTruncated ? "..." : ""}`,
+    );
+  }
+  if (source.linesOmittedAfter) lines.push("  ... lines omitted after");
+  if (source.matchSpansTruncated)
+    lines.push("  Some matches are not highlighted");
+}
+
+const sourceGraphemeSegmenter = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+
+/** New source offsets count graphemes; legacy title/summary offsets count JS units. */
+function highlightSourceGraphemes(
+  text: string,
+  ranges: ReadonlyArray<readonly [number, number]>,
+  useColors: boolean,
+): string {
+  if (!useColors || ranges.length === 0) return text;
+  return highlightRanges(text, graphemeHighlightRanges(text, ranges), true);
+}
+
+/** Convert against the original text before heading removal or wrapping. */
+function graphemeHighlightRanges(
+  text: string,
+  ranges: ReadonlyArray<readonly [number, number]>,
+): ReadonlyArray<readonly [number, number]> {
+  if (ranges.length === 0) return ranges;
+  const offsets = Array.from(
+    sourceGraphemeSegmenter.segment(text),
+    (segment) => segment.index,
+  );
+  offsets.push(text.length);
+  return ranges.map(
+    ([from, to]) => [offsets[from], offsets[to]] as readonly [number, number],
+  );
+}
+
+function wrapHighlightedText(
+  text: string,
+  ranges: ReadonlyArray<readonly [number, number]> | undefined,
+  width: number,
+  useColors: boolean,
+): string[] {
+  const output: string[] = [];
+  let lineOffset = 0;
+  for (const sourceLine of text.split("\n")) {
+    const leading = sourceLine.match(/^\s*/)?.[0] ?? "";
+    const content = sourceLine.slice(leading.length);
+    if (content.length === 0) {
+      output.push(leading);
+      lineOffset += sourceLine.length + 1;
+      continue;
+    }
+
+    const continuationMarker =
+      content.match(/^(?:\/\/[!/]?|#|--|\*)\s+/)?.[0] ?? "";
+    let consumed = 0;
+    let isFirstSegment = true;
+    let segmentLeading = leading;
+    let available = Math.max(1, width - segmentLeading.length);
+    while (content.length - consumed > available) {
+      let breakAt = content.lastIndexOf(" ", consumed + available);
+      if (breakAt <= consumed) {
+        breakAt = content.indexOf(" ", consumed + available);
+        if (breakAt < 0) break;
+      }
+      const chunk = content.slice(consumed, breakAt).trimEnd();
+      output.push(
+        highlightWrappedSegment(
+          segmentLeading,
+          chunk,
+          lineOffset + leading.length + consumed,
+          ranges,
+          useColors,
+        ),
+      );
+      consumed = breakAt;
+      while (content[consumed] === " ") consumed += 1;
+      isFirstSegment = false;
+      segmentLeading = `${leading}${continuationMarker}`;
+      available = Math.max(1, width - segmentLeading.length);
+    }
+    output.push(
+      highlightWrappedSegment(
+        isFirstSegment ? leading : segmentLeading,
+        content.slice(consumed),
+        lineOffset + leading.length + consumed,
+        ranges,
+        useColors,
+      ),
+    );
+    lineOffset += sourceLine.length + 1;
+  }
+  return output;
+}
+
+function highlightWrappedSegment(
+  leading: string,
+  content: string,
+  contentOffset: number,
+  ranges: ReadonlyArray<readonly [number, number]> | undefined,
+  useColors: boolean,
+): string {
+  const value = `${leading}${content}`;
+  if (!useColors || !ranges || ranges.length === 0) return value;
+  const localRanges = ranges.flatMap(([from, to]) => {
+    const segmentStart = contentOffset;
+    const segmentEnd = contentOffset + content.length;
+    const overlapStart = Math.max(from, segmentStart);
+    const overlapEnd = Math.min(to, segmentEnd);
+    return overlapStart < overlapEnd
+      ? [
+          [
+            leading.length + overlapStart - segmentStart,
+            leading.length + overlapEnd - segmentStart,
+          ] as const,
+        ]
+      : [];
+  });
+  return highlightRanges(value, localRanges, true);
+}
+
+interface HitHeaderSegment {
+  text: string;
+  style: "plain" | "locator" | "secondary";
+}
+
+interface FormattedHitHeader {
+  prefix: string;
+  segments: HitHeaderSegment[];
+  title?: string;
+  titleHighlights?: ReadonlyArray<readonly [number, number]>;
+}
+
+function formatHitHeader(
+  hit: UnifiedSearchHitPresentation,
+  queryFragments: string[],
+): FormattedHitHeader {
+  const loc = hit.locator;
+  if (hit.type === "documentation_page") {
+    const docsReadTarget =
+      hit.readTarget?.target || "documentation target unavailable";
+    const type = "[docs page]";
+    const target = formatDocumentationTarget(hit);
+    const sourceUrl = formatDocumentationSourceUrl(
+      loc.sourceUrl,
+      docsReadTarget,
+    );
+    const sourceSuffix = sourceUrl ? ` - ${sourceUrl}` : "";
+    return {
+      prefix: `${docsReadTarget} ${type} ${target}${sourceSuffix}`,
+      segments: [
+        { text: docsReadTarget, style: "locator" },
+        { text: " ", style: "plain" },
+        { text: type, style: "secondary" },
+        { text: " ", style: "plain" },
+        { text: target, style: "secondary" },
+        ...(sourceUrl
+          ? ([
+              { text: " - ", style: "plain" },
+              { text: sourceUrl, style: "secondary" },
+            ] satisfies HitHeaderSegment[])
+          : []),
+      ],
+      title: hit.title || "title unavailable",
+      titleHighlights: hit.highlights?.title,
+    };
+  }
+  const evidence = formatRepositoryEvidence(hit);
+  const location = evidence.filePath
+    ? `${evidence.filePath}${formatLineRange(evidence.startLine, evidence.endLine)}`
+    : "location unavailable";
+  const sourceStatus = candidateHeaderStatus(
+    hit,
+    queryFragments,
+    evidence.filePath,
+  );
+  const type = `[${shortType(hit.type)}${sourceStatus}]`;
+  const candidateSymbol = candidateSymbolLabel(hit, evidence);
+  const symbolSuffix = candidateSymbol ? ` - ${candidateSymbol}` : "";
+  const target = hit.target;
+  const title = formatRepositoryHitTitle(
+    hit,
+    evidence.startLine,
+    evidence.endLine,
+  );
+  return {
+    prefix: `${target}${location ? ` ${location}` : ""} ${type}${symbolSuffix}`,
+    segments: [
+      { text: target, style: "locator" },
+      ...(location
+        ? [
+            { text: " ", style: "plain" } as const,
+            { text: location, style: "locator" } as const,
+          ]
+        : []),
+      { text: " ", style: "plain" },
+      { text: type, style: "secondary" },
+      ...(candidateSymbol
+        ? ([
+            { text: " - ", style: "plain" },
+            { text: candidateSymbol, style: "secondary" },
+          ] satisfies HitHeaderSegment[])
+        : []),
+    ],
+    title: title.text,
+    titleHighlights: offsetHighlightRanges(
+      hit.highlights?.title,
+      title.highlightOffset,
+    ),
+  };
+}
+
+/** Field provenance never overrides independently proven source. */
+function isPathOnlyHit(hit: UnifiedSearchHitPresentation): boolean {
+  const evidence = hit.repositoryEvidence;
+  return (
+    (hit.type === "repository_code" || hit.type === "repository_doc") &&
+    !evidence?.matchedSource &&
+    evidence?.bm25MatchFields?.length === 1 &&
+    evidence.bm25MatchFields[0] === "FILE_PATH"
+  );
+}
+
+/** Split only bare identifiers; search syntax has no client-side term contract. */
+function identifierQueryFragments(raw: string | undefined): string[] {
+  if (!raw || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(raw)) return [];
+  return [
+    ...new Set(
+      raw
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+        .split(/[ _$]+/)
+        .filter(Boolean)
+        .map((fragment) => fragment.toLowerCase()),
+    ),
+  ];
+}
+
+const INDEXED_FIELD_SHORT_NAMES = {
+  SYMBOL_NAME: "name",
+  FILE_PATH: "path",
+  DOCUMENTATION: "docs",
+  SOURCE_IDENTIFIER: "identifiers",
+} as const;
+
+/** Visible fragments are literal preview facts, not producer-proven BM25 terms. */
+function candidateHeaderStatus(
+  hit: UnifiedSearchHitPresentation,
+  queryFragments: string[],
+  displayedPath: string | undefined,
+): string {
+  const evidence = hit.repositoryEvidence;
+  if (
+    (hit.type !== "repository_code" && hit.type !== "repository_doc") ||
+    !evidence ||
+    evidence.matchedSource
+  )
+    return "";
+  const fields = evidence.bm25MatchFields;
+  const visibleValues: string[] = [];
+  if (fields?.includes("SYMBOL_NAME") && hit.title)
+    visibleValues.push(hit.title.toLowerCase());
+  if (fields?.includes("FILE_PATH") && displayedPath)
+    visibleValues.push(displayedPath.toLowerCase());
+  const visible = queryFragments.filter((fragment) =>
+    visibleValues.some((value) => value.includes(fragment)),
+  );
+  if (visible.length > 0)
+    return `, candidate; visible terms: ${visible.join(", ")}`;
+  if (fields?.length)
+    return `, candidate; indexed: ${fields.map((field) => INDEXED_FIELD_SHORT_NAMES[field]).join("/")}`;
+  return ", candidate";
+}
+
+interface RepositoryEvidence {
+  filePath?: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+function formatRepositoryEvidence(
+  hit: UnifiedSearchHitPresentation,
+): RepositoryEvidence {
+  const loc = hit.locator;
+  const source = hit.repositoryEvidence?.matchedSource;
+  const preferredRead = hit.repositoryEvidence?.semanticContext?.preferredRead;
+  const candidateRead =
+    (hit.type === "repository_code" || hit.type === "repository_doc") && !source
+      ? preferredRead
+      : undefined;
+  // Without producer-proven source, locator bounds can be fallback read windows.
+  return {
+    filePath: loc.filePath,
+    startLine:
+      source?.startLine ??
+      candidateRead?.startLine ??
+      loc.evidenceRange?.startLine ??
+      loc.startLine,
+    endLine:
+      source?.endLine ??
+      candidateRead?.endLine ??
+      loc.evidenceRange?.endLine ??
+      loc.endLine,
+  };
+}
+
+/** A candidate may name its declaration when the displayed window fits it. */
+function candidateSymbolLabel(
+  hit: UnifiedSearchHitPresentation,
+  location: RepositoryEvidence,
+): string | undefined {
+  if (
+    hit.type !== "repository_code" ||
+    !hit.repositoryEvidence ||
+    hit.repositoryEvidence.matchedSource
+  )
+    return undefined;
+  const symbol = hit.locator.symbolContext;
+  const definition = symbol?.definitionRange;
+  if (
+    !symbol?.kind ||
+    !symbol.qualifiedPath ||
+    !definition ||
+    !location.filePath ||
+    location.startLine === undefined ||
+    location.endLine === undefined ||
+    (definition.filePath !== location.filePath &&
+      definition.repositoryFilePath !== location.filePath) ||
+    definition.startLine > location.startLine ||
+    definition.endLine < location.endLine
+  )
+    return undefined;
+  return `${symbol.kind} ${symbol.qualifiedPath}`;
+}
+
+interface RepositoryHitTitle {
+  text?: string;
+  highlightOffset: number;
+}
+
+function formatRepositoryHitTitle(
+  hit: UnifiedSearchHitPresentation,
+  evidenceStartLine: number | undefined,
+  evidenceEndLine: number | undefined,
+): RepositoryHitTitle {
+  if (isPathOnlyHit(hit)) return { highlightOffset: 0 };
+  if (
+    hit.repositoryEvidence !== undefined &&
+    (hit.type === "repository_code" || hit.type === "repository_doc")
+  ) {
+    const scopes = hit.repositoryEvidence?.semanticContext?.scopes ?? [];
+    const duplicateTitle = scopes.some(
+      (scope) => hit.title === scope.name || hit.title === scope.qualifiedPath,
+    );
+    return {
+      text:
+        hit.type === "repository_code" || duplicateTitle
+          ? undefined
+          : hit.title || undefined,
+      highlightOffset: 0,
+    };
+  }
+  if (hit.type !== "repository_code" && hit.type !== "repository_symbol") {
+    return {
+      text: hit.title || undefined,
+      highlightOffset: 0,
+    };
+  }
+
+  const identity = formatRepositorySymbolIdentity(hit);
+  const context = hit.locator.symbolContext;
+  const definition = context?.definitionRange;
+  const definitionSharesEvidenceFile =
+    definition?.filePath === hit.locator.filePath;
+  const definitionDiffers =
+    definition !== undefined &&
+    definitionSharesEvidenceFile &&
+    (definition.startLine !== evidenceStartLine ||
+      definition.endLine !== evidenceEndLine);
+  const indexed = hit.locator.indexedRange;
+  const indexedDiffers =
+    indexed !== undefined &&
+    (indexed.startLine !== evidenceStartLine ||
+      indexed.endLine !== evidenceEndLine);
+  const kind = context?.kind;
+  const annotation = definition
+    ? definitionDiffers
+      ? formatRangeAnnotation(kind ?? "definition", definition)
+      : kind
+    : indexedDiffers
+      ? formatRangeAnnotation("chunk", indexed)
+      : kind;
+  const text = identity.text
+    ? annotation
+      ? `${identity.text} (${annotation})`
+      : identity.text
+    : annotation;
+
+  return {
+    text,
+    highlightOffset: identity.highlightOffset,
+  };
+}
+
+interface RepositorySymbolIdentity {
+  text?: string;
+  highlightOffset: number;
+}
+
+function formatRepositorySymbolIdentity(
+  hit: UnifiedSearchHitPresentation,
+): RepositorySymbolIdentity {
+  const title = hit.title || undefined;
+  const context = hit.locator.symbolContext;
+  const qualifiedPath = context?.qualifiedPath;
+  const name = context?.name;
+
+  if (!title) {
+    return {
+      text:
+        qualifiedPath && !qualifiedPath.startsWith("<")
+          ? qualifiedPath
+          : undefined,
+      highlightOffset: 0,
+    };
+  }
+
+  if (
+    !qualifiedPath ||
+    !name ||
+    qualifiedPath.startsWith("<") ||
+    !hasQualifiedNameSuffix(qualifiedPath, name)
+  ) {
+    return { text: title, highlightOffset: 0 };
+  }
+
+  const titleSuffix = title.startsWith(name)
+    ? title.slice(name.length)
+    : undefined;
+  if (titleSuffix === undefined || !isSymbolSignatureSuffix(titleSuffix)) {
+    return { text: title, highlightOffset: 0 };
+  }
+
+  return {
+    text: `${qualifiedPath}${titleSuffix}`,
+    highlightOffset: qualifiedPath.length - name.length,
+  };
+}
+
+function isSymbolSignatureSuffix(suffix: string): boolean {
+  return suffix === "" || /^\/\d+$/.test(suffix) || /^\([^\n]*\)$/.test(suffix);
+}
+
+function hasQualifiedNameSuffix(qualifiedPath: string, name: string): boolean {
+  return (
+    qualifiedPath === name ||
+    [".", "::", "#", "/"].some((separator) =>
+      qualifiedPath.endsWith(`${separator}${name}`),
+    )
+  );
+}
+
+function formatRangeAnnotation(
+  label: string,
+  range: { startLine: number; endLine: number },
+): string {
+  const lineLabel = range.startLine === range.endLine ? "line" : "lines";
+  return `${label} at ${lineLabel} ${formatBareLineRange(range.startLine, range.endLine)}`;
+}
+
+function offsetHighlightRanges(
+  ranges: ReadonlyArray<readonly [number, number]> | undefined,
+  offset: number,
+): ReadonlyArray<readonly [number, number]> | undefined {
+  if (!ranges || offset === 0) return ranges;
+  return ranges.map(([from, to]) => [from + offset, to + offset] as const);
+}
+
+function renderHitHeaderPrefix(
+  header: FormattedHitHeader,
+  useColors: boolean,
+): string {
+  return header.segments
+    .map((segment) => {
+      if (!useColors || segment.style === "plain") return segment.text;
+      return segment.style === "locator"
+        ? highlight(segment.text, true)
+        : dim(segment.text, true);
+    })
+    .join("");
+}
+
+function formatDocumentationTarget(hit: UnifiedSearchHitPresentation): string {
+  const { registry, packageName } = hit.locator;
+  if (registry && packageName) {
+    return `${registry.toLowerCase()}:${packageName}`;
+  }
+  return (
+    stripVersionFromTarget(hit.requestedTarget ?? hit.target) ||
+    "target unavailable"
+  );
+}
+
+function formatDocumentationSourceUrl(
+  value: string | undefined,
+  docsReadTarget?: string,
+): string {
+  if (!value) return "source URL unavailable";
+  const sourceUrl = value.replace(/^https?:\/\//, "");
+  const target = docsReadTarget?.replace(/^https?:\/\//, "");
+  if (!target) return sourceUrl;
+  if (sourceUrl === target) return "";
+
+  const fragmentIndex = sourceUrl.indexOf("#");
+  if (fragmentIndex > 0 && sourceUrl.slice(0, fragmentIndex) === target) {
+    return sourceUrl.slice(fragmentIndex);
+  }
+  return sourceUrl;
+}
+
+function stripVersionFromTarget(value: string | undefined): string {
+  if (!value) return "";
+  const atIndex = value.lastIndexOf("@");
+  return atIndex > 0 ? value.slice(0, atIndex) : value;
+}
+
+function shortType(type: string): string {
+  switch (type) {
+    case "repository_code":
+      return "repo code";
+    case "repository_symbol":
+      return "repo symbol";
+    case "repository_doc":
+      return "repo doc";
+    default:
+      return type;
+  }
+}
+
+interface PreparedSummary {
+  text: string;
+  offset: number;
+}
+
+function prepareSummary(
+  summary: string | undefined,
+  title: string | undefined,
+): PreparedSummary | undefined {
+  if (!summary) return undefined;
+  const lines = summary.split("\n");
+  let offset = 0;
+  if (title && normalizeHeading(lines[0]) === normalizeHeading(title)) {
+    offset += (lines[0]?.length ?? 0) + 1;
+    lines.shift();
+    if (lines[0] !== undefined && isSetextUnderline(lines[0])) {
+      offset += lines[0].length + 1;
+      lines.shift();
+    }
+  }
+  const remaining = lines.join("\n");
+  const leadingNewline = remaining.match(/^\n+/)?.[0].length ?? 0;
+  const text = remaining.replace(/^\n+|\n+$/g, "");
+  if (text.trim().length === 0) return undefined;
+  return { text, offset: offset + leadingNewline };
+}
+
+function shiftHighlightRanges(
+  ranges: ReadonlyArray<readonly [number, number]> | undefined,
+  offset: number,
+): ReadonlyArray<readonly [number, number]> | undefined {
+  if (!ranges || offset === 0) return ranges;
+  return ranges.flatMap(([from, to]) => {
+    const shiftedFrom = from - offset;
+    const shiftedTo = to - offset;
+    return shiftedTo > 0
+      ? [[Math.max(0, shiftedFrom), shiftedTo] as const]
+      : [];
+  });
+}
+
+function normalizeHeading(value: string | undefined): string {
+  return (value ?? "").trim().replace(/^#{1,6}\s+/, "");
+}
+
+function isSetextUnderline(value: string): boolean {
+  return /^\s*(?:=+|-+)\s*$/.test(value);
+}
+
+function formatLineRange(start?: number, end?: number): string {
+  if (typeof start !== "number") return "";
+  if (typeof end !== "number" || end === start) return `:${start}`;
+  return `:${start}-${end}`;
+}
+
+function formatBareLineRange(
+  start: number | undefined,
+  end: number | undefined,
+): string {
+  if (typeof start !== "number") return "an unavailable range";
+  if (typeof end !== "number" || end === start) return `${start}`;
+  return `${start}-${end}`;
+}
+
+function formatDocumentationSiteIdentity(
+  value: string | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (!url.host) return undefined;
+    const path = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+    return `${url.host}${path}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function wrapText(text: string, width = DEFAULT_TEXT_WIDTH): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split(/\n/)) {
+    if (paragraph.length === 0) {
+      lines.push("");
+      continue;
+    }
+    let remaining = paragraph.trim();
+    while (remaining.length > width) {
+      let breakAt = remaining.lastIndexOf(" ", width);
+      if (breakAt <= 0) breakAt = remaining.indexOf(" ", width);
+      if (breakAt < 0) breakAt = remaining.length;
+      lines.push(remaining.slice(0, breakAt).trimEnd());
+      remaining = remaining.slice(breakAt).trimStart();
+    }
+    if (remaining.length > 0) lines.push(remaining);
+  }
+  return lines;
+}

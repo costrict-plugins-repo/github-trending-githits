@@ -1,0 +1,37 @@
+export const CLIENT_UPDATE_REQUIRED_REASON = "Backend protocol changed";
+
+export class ClientUpdateRequiredError extends Error {
+  constructor(
+    message: string = `Update required: ${CLIENT_UPDATE_REQUIRED_REASON}`,
+    public readonly reason: string = CLIENT_UPDATE_REQUIRED_REASON,
+    public readonly currentVersion: string | undefined = undefined,
+  ) {
+    super(message);
+    this.name = "ClientUpdateRequiredError";
+  }
+}
+
+export function isClientUpdateRequiredGraphQLError(input: {
+  message?: string;
+  code?: string;
+}): boolean {
+  return input.code === "CLIENT_UPDATE_REQUIRED";
+}
+
+export function isGraphQLSchemaMismatchError(input: {
+  message: string;
+  code?: string;
+}): boolean {
+  if (!isGraphQLSchemaMismatchMessage(input.message)) return false;
+  return (
+    !input.code ||
+    input.code === "GRAPHQL_VALIDATION_FAILED" ||
+    input.code === "BAD_USER_INPUT"
+  );
+}
+
+function isGraphQLSchemaMismatchMessage(message: string): boolean {
+  return /Cannot query field|Field .* does not exist|Unknown argument|Unknown type|Unknown field/i.test(
+    message,
+  );
+}

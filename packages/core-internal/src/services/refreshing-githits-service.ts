@@ -1,0 +1,75 @@
+import { executeWithTokenRefresh } from "./execute-with-token-refresh.js";
+import {
+  type GitHitsService,
+  GitHitsServiceImpl,
+  type GitHitsServiceRequestOptions,
+  type GitHitsServiceRuntimeOptions,
+  isTokenRefreshableError,
+  type SearchParams,
+} from "./githits-service.js";
+import type { TokenProvider } from "./token-provider.js";
+
+/**
+ * Factory function type for creating GitHitsService instances.
+ * Injected for testability.
+ */
+export type ServiceFactory = (apiUrl: string, token: string) => GitHitsService;
+
+/**
+ * GitHitsService decorator that refreshes tokens before each call
+ * and retries once on 401 (token may have expired between check and use).
+ */
+export class RefreshingGitHitsService implements GitHitsService {
+  constructor(
+    private readonly apiUrl: string,
+    private readonly tokenProvider: TokenProvider,
+    private readonly serviceFactory: ServiceFactory | undefined = undefined,
+    private readonly runtime: GitHitsServiceRuntimeOptions = {},
+  ) {}
+
+  async search(
+    params: SearchParams,
+    options?: GitHitsServiceRequestOptions,
+  ): Promise<string> {
+    return this.withTokenRefresh(
+      options
+        ? (service) => service.search(params, options)
+        : (service) => service.search(params),
+      options,
+    );
+  }
+
+  /**
+   * Execute an operation with a fresh token.
+   * On AuthenticationError, force-refresh and retry once.
+   */
+  private async withTokenRefresh<T>(
+    operation: (service: GitHitsService) => Promise<T>,
+    options?: GitHitsServiceRequestOptions,
+  ): Promise<T> {
+    return executeWithTokenRefresh({
+      getToken: () => {
+        options?.signal?.throwIfAborted();
+        return this.tokenProvider.getToken();
+      },
+      forceRefresh: () => {
+        options?.signal?.throwIfAborted();
+        return this.tokenProvider.forceRefresh();
+      },
+      shouldRefresh: isTokenRefreshableError,
+      executeWithToken: async (token) => {
+        options?.signal?.throwIfAborted();
+        const service = this.serviceFactory
+          ? this.serviceFactory(this.apiUrl, token)
+          : new GitHitsServiceImpl(
+              this.apiUrl,
+              token,
+              undefined,
+              undefined,
+              this.runtime,
+            );
+        return operation(service);
+      },
+    });
+  }
+}
